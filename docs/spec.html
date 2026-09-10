@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html{color-scheme:light dark}
+  body{margin:0;font:14px system-ui,sans-serif}
+  img{max-width:100%}
+  [hidden]{display:none!important}
+</style>
+<title>Cardboard Unfolder</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  :root{
+    --ground:#F1F1EE;
+    --surface:#FBFBF9;
+    --sunk:#E7E7E2;
+    --line:#D6D5CE;
+    --line-soft:#E2E1DA;
+    --ink:#1B1A17;
+    --ink-2:#3E3C36;
+    --muted:#6E6B63;
+    --cut:#C0301C;
+    --cut-soft:#F3DCD7;
+    --fold:#2C5B9E;
+    --fold-soft:#DBE3F0;
+    --kraft:#A57943;
+    --kraft-soft:#EFE4D3;
+    --ok:#3D7A4E;
+
+    --f-display:'Archivo','Helvetica Neue',Arial,sans-serif;
+    --f-body:'Source Serif 4',Georgia,'Times New Roman',serif;
+    --f-mono:'JetBrains Mono','SF Mono',Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#161613;
+      --surface:#1E1E1A;
+      --sunk:#111110;
+      --line:#34342E;
+      --line-soft:#282823;
+      --ink:#EDEBE4;
+      --ink-2:#C8C5BC;
+      --muted:#8E8B82;
+      --cut:#E8705B;
+      --cut-soft:#3A211C;
+      --fold:#7DA6E0;
+      --fold-soft:#1C2739;
+      --kraft:#C99C60;
+      --kraft-soft:#2E2519;
+      --ok:#6FB081;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#161613;
+    --surface:#1E1E1A;
+    --sunk:#111110;
+    --line:#34342E;
+    --line-soft:#282823;
+    --ink:#EDEBE4;
+    --ink-2:#C8C5BC;
+    --muted:#8E8B82;
+    --cut:#E8705B;
+    --cut-soft:#3A211C;
+    --fold:#7DA6E0;
+    --fold-soft:#1C2739;
+    --kraft:#C99C60;
+    --kraft-soft:#2E2519;
+    --ok:#6FB081;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--ground);
+    color:var(--ink);
+    font-family:var(--f-body);
+    font-size:17px;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{
+    max-width:1140px;
+    margin:0 auto;
+    padding-inline:20px;
+    padding-block:0 96px;
+  }
+  .layout{display:grid;grid-template-columns:1fr;gap:0}
+  @media(min-width:1000px){
+    .layout{grid-template-columns:186px minmax(0,1fr);gap:56px;align-items:start}
+    .rail{position:sticky;top:32px}
+  }
+
+  /* ---------- masthead ---------- */
+  header.mast{
+    padding-block:56px 34px;
+    border-bottom:2px solid var(--ink);
+    margin-bottom:0;
+  }
+  .eyebrow{
+    font-family:var(--f-display);
+    font-size:11px;font-weight:600;
+    letter-spacing:.16em;text-transform:uppercase;
+    color:var(--muted);
+    margin:0 0 18px;
+  }
+  h1{
+    font-family:var(--f-display);
+    font-weight:700;
+    font-size:clamp(38px,6.4vw,62px);
+    line-height:1.02;
+    letter-spacing:-.022em;
+    margin:0 0 20px;
+    text-wrap:balance;
+  }
+  .standfirst{
+    font-size:clamp(18px,2.2vw,21px);
+    line-height:1.5;
+    color:var(--ink-2);
+    max-width:62ch;
+    margin:0;
+  }
+  .standfirst b{font-weight:600;color:var(--ink)}
+
+  /* ---------- rail ---------- */
+  .rail nav{
+    display:flex;flex-direction:column;gap:2px;
+    padding-top:38px;
+  }
+  .rail a{
+    font-family:var(--f-display);
+    font-size:12.5px;font-weight:500;
+    letter-spacing:.01em;
+    color:var(--muted);
+    text-decoration:none;
+    padding:5px 0 5px 12px;
+    border-left:2px solid var(--line-soft);
+  }
+  .rail a:hover,.rail a:focus-visible{color:var(--ink);border-left-color:var(--cut)}
+  .rail .rail-h{
+    font-family:var(--f-display);font-size:10.5px;font-weight:600;
+    letter-spacing:.15em;text-transform:uppercase;color:var(--muted);
+    padding:16px 0 6px 12px;
+  }
+  .rail .rail-h:first-child{padding-top:0}
+  @media(max-width:999px){.rail{display:none}}
+
+  main{padding-top:38px;min-width:0}
+
+  /* ---------- sections ---------- */
+  section{padding-block:0 8px;scroll-margin-top:24px}
+  section + section{margin-top:52px}
+  h2{
+    font-family:var(--f-display);
+    font-weight:700;font-size:27px;letter-spacing:-.012em;
+    margin:0 0 6px;text-wrap:balance;
+  }
+  .sec-num{
+    font-family:var(--f-mono);font-size:12px;font-weight:600;
+    color:var(--cut);letter-spacing:.04em;
+    display:block;margin-bottom:8px;
+  }
+  h3{
+    font-family:var(--f-display);
+    font-weight:600;font-size:18px;letter-spacing:-.005em;
+    margin:34px 0 8px;
+  }
+  h4{
+    font-family:var(--f-display);
+    font-weight:600;font-size:13px;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--muted);margin:26px 0 8px;
+  }
+  p{margin:0 0 15px;max-width:68ch}
+  ul,ol{margin:0 0 15px;padding-left:20px;max-width:68ch}
+  li{margin-bottom:7px}
+  li::marker{color:var(--muted)}
+  a{color:var(--ink);text-decoration-color:var(--line);text-underline-offset:2px}
+  a:hover{text-decoration-color:var(--cut)}
+  code{
+    font-family:var(--f-mono);font-size:.86em;
+    background:var(--sunk);padding:1px 5px;border-radius:3px;
+    color:var(--ink-2);
+  }
+  strong{font-weight:600}
+  .lede{font-size:18.5px;color:var(--ink-2);max-width:66ch}
+
+  /* ---------- verdict strip ---------- */
+  .verdict{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:1px;background:var(--line);
+    border:1px solid var(--line);
+    margin:0 0 6px;
+  }
+  .verdict div{background:var(--surface);padding:16px 16px 15px}
+  .verdict dt{
+    font-family:var(--f-display);font-size:10.5px;font-weight:600;
+    letter-spacing:.13em;text-transform:uppercase;color:var(--muted);
+    margin-bottom:7px;
+  }
+  .verdict dd{
+    margin:0;font-family:var(--f-mono);font-size:21px;font-weight:600;
+    letter-spacing:-.02em;color:var(--ink);font-variant-numeric:tabular-nums;
+  }
+  .verdict dd small{display:block;font-family:var(--f-body);font-size:13px;font-weight:400;color:var(--muted);letter-spacing:0;margin-top:4px;line-height:1.35}
+
+  /* ---------- callouts ---------- */
+  .note{
+    border-left:3px solid var(--cut);
+    background:var(--cut-soft);
+    padding:16px 20px;
+    margin:24px 0;
+    max-width:70ch;
+  }
+  .note.blue{border-left-color:var(--fold);background:var(--fold-soft)}
+  .note.kraft{border-left-color:var(--kraft);background:var(--kraft-soft)}
+  .note p:last-child{margin-bottom:0}
+  .note .tag{
+    font-family:var(--f-display);font-size:10.5px;font-weight:700;
+    letter-spacing:.13em;text-transform:uppercase;
+    display:block;margin-bottom:7px;color:var(--ink-2);
+  }
+
+  /* ---------- tables ---------- */
+  .tw{overflow-x:auto;margin:18px 0 22px;border:1px solid var(--line)}
+  table{border-collapse:collapse;width:100%;font-size:14.5px;background:var(--surface)}
+  th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  thead th{
+    font-family:var(--f-display);font-size:10.5px;font-weight:600;
+    letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+    background:var(--sunk);border-bottom:1px solid var(--line);white-space:nowrap;
+  }
+  tbody tr:last-child td{border-bottom:none}
+  td.num,th.num{font-family:var(--f-mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+  td.k{font-family:var(--f-mono);font-size:13px;white-space:nowrap;color:var(--ink-2)}
+  .hi td{background:var(--cut-soft)}
+
+  /* ---------- code ---------- */
+  pre{
+    font-family:var(--f-mono);font-size:13px;line-height:1.62;
+    background:var(--sunk);border:1px solid var(--line);
+    padding:15px 17px;overflow-x:auto;margin:16px 0 22px;
+    color:var(--ink-2);
+  }
+  pre b{color:var(--cut);font-weight:600}
+  pre i{color:var(--muted);font-style:normal}
+
+  /* ---------- formula ---------- */
+  .formula{
+    font-family:var(--f-mono);font-size:19px;font-weight:600;
+    background:var(--surface);border:1px solid var(--line);
+    border-left:3px solid var(--fold);
+    padding:16px 20px;margin:20px 0;
+    overflow-x:auto;white-space:nowrap;color:var(--ink);
+  }
+  .formula span{color:var(--muted);font-size:14px;font-weight:400;margin-left:14px}
+
+  /* ---------- diagram ---------- */
+  figure{margin:22px 0 26px}
+  figure svg{display:block;width:100%;height:auto;max-width:100%}
+  figcaption{
+    font-size:13.5px;color:var(--muted);margin-top:10px;
+    max-width:64ch;line-height:1.5;
+  }
+  .dg-wrap{border:1px solid var(--line);background:var(--surface);padding:20px 16px;overflow-x:auto}
+
+  /* ---------- milestones ---------- */
+  .ms{list-style:none;padding:0;margin:18px 0 0;max-width:none}
+  .ms li{
+    display:grid;grid-template-columns:auto 1fr;gap:16px;
+    padding:15px 0;border-top:1px solid var(--line-soft);margin:0;
+  }
+  .ms li:first-child{border-top:1px solid var(--line)}
+  .ms .m-n{
+    font-family:var(--f-mono);font-size:12px;font-weight:600;
+    color:var(--cut);padding-top:3px;letter-spacing:.03em;
+  }
+  .ms .m-t{font-family:var(--f-display);font-weight:600;font-size:16px;margin:0 0 3px;display:block}
+  .ms .m-d{font-size:14.5px;color:var(--ink-2);margin:0;max-width:64ch}
+  .ms .m-d em{font-style:normal;font-family:var(--f-mono);font-size:12.5px;color:var(--muted);display:block;margin-top:5px}
+
+  footer{
+    margin-top:64px;padding-top:22px;border-top:1px solid var(--line);
+    font-size:13.5px;color:var(--muted);max-width:68ch;
+  }
+  footer a{color:var(--muted)}
+  :focus-visible{outline:2px solid var(--cut);outline-offset:2px}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+<header class="mast">
+  <p class="eyebrow">Build spec &middot; low-poly mesh &rarr; laser-cut corrugated</p>
+  <h1>Cardboard Unfolder</h1>
+  <p class="standfirst">A system that takes a low-poly mesh, finds a non-overlapping flat net, applies <b>thickness-correct fold geometry for corrugated board</b>, splits anything larger than the bed, and nests it to SVG&nbsp;/&nbsp;DXF. Research, verified math, and a build order.</p>
+</header>
+
+<div class="layout">
+  <aside class="rail">
+    <nav>
+      <span class="rail-h">Findings</span>
+      <a href="#verdict">Feasibility</a>
+      <a href="#pipeline">Pipeline</a>
+      <span class="rail-h">Core</span>
+      <a href="#unfold">Unfolding</a>
+      <a href="#interact">Interaction</a>
+      <span class="rail-h">Material</span>
+      <a href="#flutes">Flute direction</a>
+      <a href="#folds">Fold cutouts</a>
+      <span class="rail-h">Output</span>
+      <a href="#split">Bed splitting</a>
+      <a href="#nest">Nesting &amp; export</a>
+      <span class="rail-h">Doing it</span>
+      <a href="#params">Parameters</a>
+      <a href="#stack">Stack</a>
+      <a href="#order">Build order</a>
+      <a href="#risks">Risks</a>
+    </nav>
+  </aside>
+
+  <main>
+
+  <section id="verdict">
+    <span class="sec-num">01</span>
+    <h2>The unfolding part is easier than it looks</h2>
+    <p class="lede">The instinct is that flattening a 3D model is the hard step. It isn't — at low-poly scale it's nearly free. The hard parts are everything downstream: material thickness, flute direction, and getting parts onto a bed.</p>
+
+    <p>Two facts make the core cheap. First, a mesh with <em>planar faces</em> unfolds by <strong>exact rigid motion</strong> — each face is rotated and translated into the plane with zero distortion. There is no solver, no energy minimization, no least-squares. It's about fifty lines of trigonometry. Second, whether a given net self-overlaps depends only on which edges you cut, and at 50–400 faces you can simply <em>try a few hundred cut patterns and keep one that works.</em></p>
+
+    <p>I built the core to confirm this. Randomized-restart maximum spanning tree over the dual graph, Shapely <code>STRtree</code> for overlap, greedy set-cover repair as a fallback:</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>Test mesh</th><th class="num">Faces</th><th class="num">Isometry error</th><th>Result</th><th class="num">Time</th></tr></thead>
+        <tbody>
+          <tr><td>Cube</td><td class="num">12</td><td class="num">0.00e+00</td><td>Single island, 1st try</td><td class="num">&lt;0.1 s</td></tr>
+          <tr><td>Icosahedron</td><td class="num">20</td><td class="num">3.45e&minus;16</td><td>Single island, 1st try</td><td class="num">&lt;0.1 s</td></tr>
+          <tr><td>Cylinder</td><td class="num">64</td><td class="num">9.11e&minus;16</td><td>Single island, 1st try</td><td class="num">&lt;0.1 s</td></tr>
+          <tr><td>Icosphere</td><td class="num">80</td><td class="num">8.05e&minus;16</td><td>Single island, 1st try</td><td class="num">&lt;0.1 s</td></tr>
+          <tr><td>Icosphere</td><td class="num">320</td><td class="num">1.75e&minus;15</td><td>Single island, 2nd try</td><td class="num">0.2 s</td></tr>
+          <tr class="hi"><td>Capsule</td><td class="num">288</td><td class="num">7.76e&minus;15</td><td>Single island, 59th try</td><td class="num">5.2 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <dl class="verdict">
+      <div><dt>Isometry error</dt><dd>10<sup>&minus;15</sup><small>Machine precision. Every edge length preserved exactly — parts will mate.</small></dd></div>
+      <div><dt>Single-island rate</dt><dd>6 / 6<small>On well-formed meshes. Expect 70–90% on real models with spikes.</small></dd></div>
+      <div><dt>Core size</dt><dd>~150<small>Lines of Python for unfold + overlap + repair.</small></dd></div>
+      <div><dt>Worst case</dt><dd>5.2 s<small>288 faces, 59 restarts. Interactive.</small></dd></div>
+    </dl>
+
+    <div class="note">
+      <span class="tag">The one theoretical limit worth knowing</span>
+      <p>You cannot promise a single-piece net. Whether every convex polyhedron even <em>has</em> a non-overlapping edge unfolding is <strong>Dürer's conjecture — still open after 500 years</strong>. Worse, for non-convex shapes it's settled the wrong way: Bern, Demaine et al. constructed a 24-face solid with convex faces and <em>no</em> valid edge unfolding at all. Spiky armor is exactly that shape family.</p>
+      <p>So the objective is never "find the net." It is <strong>minimize the island count</strong>, with one-face-per-island always available as the floor. The program must degrade into more pieces, never fail.</p>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <span class="sec-num">02</span>
+    <h2>Pipeline</h2>
+    <p>Nine stages. The loop between search and overlap testing is the actual mechanism — everything else is a straight line.</p>
+
+    <figure>
+      <div class="dg-wrap">
+      <svg viewBox="0 0 880 300" role="img" aria-label="Nine-stage pipeline from mesh import to laser file, with a search-and-repair loop between spanning tree search and overlap testing.">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,1 L9,5 L0,9 z" fill="var(--muted)"/>
+          </marker>
+          <marker id="arc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,1 L9,5 L0,9 z" fill="var(--cut)"/>
+          </marker>
+        </defs>
+
+        <!-- row 1 : geometry core -->
+        <text x="0" y="16" font-family="Archivo,sans-serif" font-size="10.5" font-weight="600" letter-spacing="1.6" fill="var(--muted)">GEOMETRY CORE</text>
+
+        <g font-family="Archivo,sans-serif" font-size="12.5" font-weight="600">
+          <rect x="0" y="30" width="120" height="46" fill="var(--surface)" stroke="var(--line)"/>
+          <text x="60" y="50" text-anchor="middle" fill="var(--ink)">Import mesh</text>
+          <text x="60" y="65" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">merge coplanar</text>
+
+          <rect x="150" y="30" width="120" height="46" fill="var(--surface)" stroke="var(--line)"/>
+          <text x="210" y="50" text-anchor="middle" fill="var(--ink)">Dual graph</text>
+          <text x="210" y="65" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">weight edges</text>
+
+          <rect x="300" y="30" width="120" height="46" fill="var(--surface)" stroke="var(--fold)" stroke-width="1.5"/>
+          <text x="360" y="50" text-anchor="middle" fill="var(--ink)">Spanning tree</text>
+          <text x="360" y="65" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">random restart</text>
+
+          <rect x="450" y="30" width="120" height="46" fill="var(--surface)" stroke="var(--fold)" stroke-width="1.5"/>
+          <text x="510" y="50" text-anchor="middle" fill="var(--ink)">Unfold + test</text>
+          <text x="510" y="65" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">STRtree overlap</text>
+
+          <rect x="600" y="30" width="120" height="46" fill="var(--surface)" stroke="var(--line)"/>
+          <text x="660" y="50" text-anchor="middle" fill="var(--ink)">Islands</text>
+          <text x="660" y="65" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">set-cover split</text>
+        </g>
+
+        <line x1="122" y1="53" x2="146" y2="53" stroke="var(--muted)" marker-end="url(#ar)"/>
+        <line x1="272" y1="53" x2="296" y2="53" stroke="var(--muted)" marker-end="url(#ar)"/>
+        <line x1="422" y1="53" x2="446" y2="53" stroke="var(--muted)" marker-end="url(#ar)"/>
+        <line x1="572" y1="53" x2="596" y2="53" stroke="var(--muted)" marker-end="url(#ar)"/>
+
+        <!-- feedback loop -->
+        <path d="M510,78 L510,100 L360,100 L360,80" fill="none" stroke="var(--cut)" stroke-dasharray="4 3" marker-end="url(#arc)"/>
+        <text x="435" y="114" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="10.5" fill="var(--cut)">overlap &rarr; retry (≤300&times;)</text>
+
+        <!-- row 2 : material -->
+        <text x="0" y="152" font-family="Archivo,sans-serif" font-size="10.5" font-weight="600" letter-spacing="1.6" fill="var(--muted)">MATERIAL LAYER</text>
+
+        <g font-family="Archivo,sans-serif" font-size="12.5" font-weight="600">
+          <rect x="0" y="166" width="146" height="46" fill="var(--surface)" stroke="var(--kraft)" stroke-width="1.5"/>
+          <text x="73" y="186" text-anchor="middle" fill="var(--ink)">Fold geometry</text>
+          <text x="73" y="201" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">relief from t &amp; angle</text>
+
+          <rect x="176" y="166" width="146" height="46" fill="var(--surface)" stroke="var(--kraft)" stroke-width="1.5"/>
+          <text x="249" y="186" text-anchor="middle" fill="var(--ink)">Joinery</text>
+          <text x="249" y="201" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">flaps, tabs, slots</text>
+
+          <rect x="352" y="166" width="146" height="46" fill="var(--surface)" stroke="var(--line)"/>
+          <text x="425" y="186" text-anchor="middle" fill="var(--ink)">Bed split</text>
+          <text x="425" y="201" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">+ splice joints</text>
+
+          <rect x="528" y="166" width="146" height="46" fill="var(--surface)" stroke="var(--line)"/>
+          <text x="601" y="186" text-anchor="middle" fill="var(--ink)">Nest</text>
+          <text x="601" y="201" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">NFP, grain-locked</text>
+
+          <rect x="704" y="166" width="146" height="46" fill="var(--cut-soft)" stroke="var(--cut)" stroke-width="1.5"/>
+          <text x="777" y="186" text-anchor="middle" fill="var(--ink)">SVG / DXF</text>
+          <text x="777" y="201" text-anchor="middle" font-size="10.5" font-weight="400" fill="var(--muted)">layered per op</text>
+        </g>
+
+        <line x1="148" y1="189" x2="172" y2="189" stroke="var(--muted)" marker-end="url(#ar)"/>
+        <line x1="324" y1="189" x2="348" y2="189" stroke="var(--muted)" marker-end="url(#ar)"/>
+        <line x1="500" y1="189" x2="524" y2="189" stroke="var(--muted)" marker-end="url(#ar)"/>
+        <line x1="676" y1="189" x2="700" y2="189" stroke="var(--muted)" marker-end="url(#ar)"/>
+
+        <path d="M660,78 L660,132 L73,132 L73,162" fill="none" stroke="var(--muted)" marker-end="url(#ar)"/>
+
+        <!-- annotation band -->
+        <line x1="0" y1="240" x2="880" y2="240" stroke="var(--line)"/>
+        <text x="0" y="262" font-family="Source Serif 4,Georgia,serif" font-size="12.5" fill="var(--muted)">Stages 1–5 are solved problems with published algorithms. Stages 6–9 are where the cardboard-specific work lives —</text>
+        <text x="0" y="280" font-family="Source Serif 4,Georgia,serif" font-size="12.5" fill="var(--muted)">and where no existing tool, open or commercial, will help you.</text>
+      </svg>
+      </div>
+      <figcaption>The feedback loop is the whole search. Everything before it is bookkeeping; everything after it is manufacturing.</figcaption>
+    </figure>
+  </section>
+
+  <section id="unfold">
+    <span class="sec-num">03</span>
+    <h2>Unfolding: what to implement</h2>
+
+    <h3>The transform</h3>
+    <p>Faces become nodes of a dual graph, shared edges become arcs. Pick a spanning tree; arcs in the tree stay joined as folds, arcs outside it become cuts. Place each face from <em>its own 3D geometry</em> relative to the parent's already-placed shared edge — never by accumulating rotations down the tree, which compounds error and is fiddly to debug.</p>
+
+    <pre><i># child face g attached to parent f across shared edge (p,q)</i>
+P2, Q2 = pos2[p], pos2[q]        <i># already fixed by the parent</i>
+d = (Q2-P2)/|Q2-P2| ;  e = (-d.y, d.x)
+for v in g.verts \ {p,q}:
+    t     = dot(v-p, q-p)/|q-p|²  <i># parametric position along the edge</i>
+    h     = |(v-p) - t*(q-p)|     <i># perpendicular distance, in 3D</i>
+    pos2[v] = P2 + t*|q-p|*d <b>+ s*h*e</b>   <i># s flips to the far side from parent</i></pre>
+
+    <p>Store 2D positions <strong>per (face, vertex) corner</strong>, not per vertex — cuts duplicate vertices. Assert planarity before you start: measure each vertex's distance to the face's best-fit plane relative to edge length, and reject anything above ~1e&minus;3. A quad that looks flat from a subdivision surface usually isn't, and a non-planar face silently destroys the isometry guarantee.</p>
+
+    <h3>The search</h3>
+    <p>Three cheap things matter far more than the search algorithm:</p>
+    <ol>
+      <li><strong>A good weight heuristic.</strong> Keep long edges as folds (short cut perimeter, less scissor work) and bias against a random direction vector <code>c</code>. Blender's tuned constants are worth stealing: convex edges weight 0.5, concave 1.0, length &minus;0.05.</li>
+      <li><strong>Randomize <code>c</code>, not the weights.</strong> This is the highest-leverage single line in the program. The steepest-edge family is direction-parameterized, so restarting over <code>c</code> sweeps a structurally diverse slice of tree space that jittering weights does not reach.</li>
+      <li><strong>Abort during placement, not after.</strong> Insert faces into a spatial index as you place them and bail on the first collision. Most bad trees die within a few dozen faces.</li>
+    </ol>
+    <p>One free rejection test before any geometry: at a saddle vertex (angle sum &gt; 2π) the fan <em>must</em> receive at least two cuts, or it wraps past itself. That's O(degree) and kills most bad trees for nothing.</p>
+
+    <div class="note blue">
+      <span class="tag">Don't implement these</span>
+      <p>The literature has genetic algorithms (Takahashi 2011) and simulated annealing (Korpitsch 2020) for this. Both are strictly dominated by tabu search on the identical problem — simpler code, orders of magnitude faster. Korpitsch reports <em>12–36 minutes</em> for 300–400 faces; my randomized restart does 320 faces in 0.2 s. Skip straight past them.</p>
+      <p>Also skip the mesh-modification methods (Bhargava 2025, Zawallich's surface flows). They exist because researchers target 1,000–2,000-face meshes where pure search collapses. At your scale search wins outright, and deforming a low-poly mesh defeats the point of low-poly.</p>
+    </div>
+
+    <h3>Repair, so it never fails</h3>
+    <p>When the search budget runs out, cut more. Formulate it as <strong>minimum set cover</strong>: for each overlapping face pair, the tree path between them must be broken by at least one cut. Greedily cut the tree edge covering the most conflicting paths, re-unfold, repeat. Provably terminates and yields near-minimal island counts. That's the ~20 lines at the bottom of the spike.</p>
+  </section>
+
+  <section id="interact">
+    <span class="sec-num">04</span>
+    <h2>Interaction: seams, not fold order</h2>
+
+    <p>You asked for a 3D view where the user picks fold order. Worth separating three things that sound alike:</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>What</th><th>Value</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Seam selection</strong> — which edges get cut</td><td>Very high. Auto-unfold makes ugly, unbuildable choices; a human sees instantly that a seam should hide in a crease.</td><td>Build this first</td></tr>
+          <tr><td><strong>Assembly order</strong> — the sequence to glue in</td><td>Moderate. Mostly derivable: engrave paired edge numbers and a build-step index and the order is self-evident.</td><td>Generate, don't ask</td></tr>
+          <tr><td><strong>Fold order</strong> — literal sequence of creasing</td><td>Low. In cardboard you crease everything flat, then assemble. There is rarely a forced order.</td><td>Skip</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>So the interaction to build is <strong>seam painting with live re-unfold</strong> — click edges in 3D, watch the net update, see overlapping islands turn red.</p>
+
+    <div class="note kraft">
+      <span class="tag">Where to build it</span>
+      <p><strong>Blender addon, with a <code>bpy</code>-free core.</strong> Not because Blender is pleasant to code against — it isn't — but because edge selection <em>is</em> the interaction, and Blender hands you a decade-refined version for zero lines: click, shift-click, box and lasso select, <strong>Alt-click edge loops</strong>, Ctrl-click shortest path, Select Sharp Edges, and an undo stack. In an addon it's literally <code>[e.index for e in bmesh.edges if e.select]</code>.</p>
+      <p>Rebuilding that in Three.js means GPU color-ID picking, your own half-edge structure, and your own selection semantics — weeks of work to reach parity with a feature you'd get free. Keep the geometry core in pure NumPy/Shapely with zero <code>bpy</code> imports and you retain an escape hatch to <a href="https://polyscope.run/py/">Polyscope</a> or a web frontend later.</p>
+      <p>Prior art to read before writing a line: <a href="https://github.com/AntonFlorey/PolyZamboni">PolyZamboni</a> (GPL-3, explicitly a low-poly papercraft addon) already does viewport seam editing, correct rigid unfolding, and colour-coded overlap classification. It is the closest existing thing to what you're building. <a href="https://github.com/felixfeliz/paperfoldmodels">paperfoldmodels</a> is MIT-licensed and ~200 lines — the cleanest reference implementation, and the only one you can legally lift code from into a permissive project.</p>
+    </div>
+  </section>
+
+  <section id="flutes">
+    <span class="sec-num">05</span>
+    <h2>Flute direction — a correction</h2>
+
+    <p class="lede">I told you earlier that fold lines should run parallel to the flutes. That's right for <em>curves</em> and wrong for <em>creases</em>, and the reason matters enough to design around.</p>
+
+    <p>The mechanics are not in dispute. Corrugated bends easily about an axis <strong>parallel</strong> to the flutes — the flutes simply rotate relative to each other like hinged panels, nothing is crushed. That's why single-face corrugated ships on rolls with the flutes running along the core axis. Bending <em>across</em> the flutes requires buckling every flute the crease meets, which takes real force and permanently damages the board.</p>
+
+    <p>But "easy to bend" is not "makes a good crease." Here is the argument that flips it:</p>
+
+    <div class="note">
+      <span class="tag">Flute phase error</span>
+      <p>A relief cut or perforation running <strong>parallel</strong> to the flutes lands at an unknown phase within the flute pitch. If it happens to land on a glue line, the board there is locally three-ply solid and cracks; if it lands mid-span, it hinges on nothing and the fold migrates to the nearest flute wall.</p>
+      <p>That's a positional error of up to <strong>±P/2 — ±3.25 mm on B flute, ±4.0 mm on C flute.</strong> An order of magnitude worse than your laser's accuracy, and it will visibly rack an assembled model. A crease that <em>crosses</em> the flutes averages over many of them and is phase-independent.</p>
+    </div>
+
+    <p>So the rule set for the nester is:</p>
+    <ul>
+      <li><strong>Straight creases → perpendicular to the flutes.</strong> Higher force, but crisp, repeatable, and located where you drew it.</li>
+      <li><strong>Curved / rolled surfaces → bend axis parallel to the flutes.</strong> Kerf and lattice patterns only work in this orientation.</li>
+      <li><strong>Tab slots → across the flutes.</strong> A slot parallel to the flutes can sit entirely inside one channel, leaving its walls as unsupported liner paper over a void. It folds away on insertion and grips nothing.</li>
+    </ul>
+
+    <p>Rules one and two are 90° apart, so <strong>a part with both a sharp crease and a rolled curve cannot be oriented correctly at any single rotation.</strong> Detect that case and either split the part or warn. This is a real constraint that no existing nester models, and it means grain-lock has to be a <em>per-part</em> flag rather than a global setting — locking everything costs roughly 10–20% more material.</p>
+
+    <p class="lede" style="margin-top:26px">On material: <strong>B flute (~3 mm) is the sweet spot</strong> — it's what every shipping box is made of, so it's free, and a 90° fold needs only a 6 mm relief. E flute (~1.5 mm) for detail work folds acceptably from a plain perforation with no relief geometry at all. Avoid double-wall; BC needs a 12–14 mm relief at 90°, which eats whole panels.</p>
+  </section>
+
+  <section id="folds">
+    <span class="sec-num">06</span>
+    <h2>Fold cutouts: the math</h2>
+
+    <p>Two panels of thickness <em>t</em> meeting at interior angle θ, bend angle α = 180° &minus; θ. Remove a V from the inside face with its apex on the far face. At full fold the two cut faces lie flat against each other; each has rotated α/2 from the sheet normal, giving a horizontal extent of <em>t</em>·tan(α/2) apiece:</p>
+
+    <div class="formula">w = 2 · d · tan(α/2)<span>d = distance from grooved surface to the pivot axis</span></div>
+
+    <p>I verified this independently for the straight-walled slot a laser actually cuts. Rotating the panel about the hinge, the binding constraint is the top corner at <em>z = t</em>: <code>(w/2)·cos(α/2) − t·sin(α/2) ≥ 0</code>, which gives the identical <code>w ≥ 2t·tan(α/2)</code>. A straight slot needs the same opening as a true V — the difference is only that the V gives full face contact and the slot gives line contact with a void behind it.</p>
+
+    <p>It also cross-checks two ways. Sheet-metal <strong>bend deduction</strong> at zero inside radius reduces to exactly 2T·tan(A/2) — your groove width <em>is</em> the bend deduction. And US patent 5,427,309, a V-grooved corrugated box wall, specifies groove spacing of "substantially twice the thickness" for a 90° fold, which is <code>w = 2t</code> exactly.</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th class="num">Bend α</th><th class="num">Interior θ</th><th class="num">w / t</th><th class="num">w on 3 mm B flute</th><th>Technique</th></tr></thead>
+        <tbody>
+          <tr><td class="num">15°</td><td class="num">165°</td><td class="num">0.26</td><td class="num">0.8 mm</td><td>Perforation only</td></tr>
+          <tr><td class="num">30°</td><td class="num">150°</td><td class="num">0.54</td><td class="num">1.6 mm</td><td>Perforation only</td></tr>
+          <tr><td class="num">45°</td><td class="num">135°</td><td class="num">0.83</td><td class="num">2.5 mm</td><td>Perforation, or narrow slot</td></tr>
+          <tr><td class="num">60°</td><td class="num">120°</td><td class="num">1.15</td><td class="num">3.5 mm</td><td>Relief slot</td></tr>
+          <tr class="hi"><td class="num">90°</td><td class="num">90°</td><td class="num">2.00</td><td class="num">6.0 mm</td><td>Double-score preferred</td></tr>
+          <tr><td class="num">120°</td><td class="num">60°</td><td class="num">3.46</td><td class="num">10.4 mm</td><td>Double-score required</td></tr>
+          <tr><td class="num">135°</td><td class="num">45°</td><td class="num">4.83</td><td class="num">14.5 mm</td><td>Double-score required</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Three corrections theory doesn't give you</h3>
+
+    <p><strong>Pivot depth, not thickness.</strong> The general form uses <em>d</em>, the distance to the effective pivot. When the far liner survives as the hinge, <code>d = t − t_liner/2 ≈ 2.85 mm</code> on B flute — about 5% narrower. When you cut through and glue a 3 mm board strip on the <em>outside</em>, <code>d = 4.5 mm</code> and the relief jumps to 9 mm. Easy to overlook, very visible when wrong.</p>
+
+    <p><strong>Cardboard crushes.</strong> Flat crush resistance is 0.1–0.5 MPa against plywood's 5–10 MPa — corrugated is 10–100× more crushable, which invalidates every clearance number borrowed from plywood practice. In practice a 3 mm board crushes to ~1.0–1.5 mm under hand pressure at a crease, so you can use <strong>60–80% of the theoretical width</strong> and still close the fold. This is exactly why folding-carton crease channels are 1.5t rather than the 2.0t theory demands. Implement as <code>w = C · 2d·tan(α/2)</code> with a crush factor <strong>C defaulting to 0.75</strong> — and flag it in the code as empirical, not derived.</p>
+
+    <p><strong>Double-score beats one wide relief.</strong> For α ≥ 90°, two folds of α/2 separated by 1.0–1.5t. Each needs only 0.83t instead of 2.0t, and two narrow reliefs destabilize the panel far less than one wide one. This is standard packaging practice for heavy board. Make it the default above 90° and mandatory for double-wall.</p>
+
+    <h3>Which fold technique</h3>
+    <ol>
+      <li><strong>Perforated full-depth cut — the default.</strong> Cutting is binary, so it's machine-independent and survives warped, damp, or reused board. One corrugated-specific constraint: <strong>keep the dash period below one third of the flute pitch</strong>, e.g. 1.0 mm cut / 0.6 mm tie on B flute. A 3 mm/1 mm dash on a 6.5 mm pitch gives consecutive flutes wildly different treatment.</li>
+      <li><strong>Partial-depth score</strong> — best-looking, but the beam crosses liner, then air, then liner, and burns through at every glue line where the medium touches the far liner. Score depth ends up flute-phase dependent. Offer it; don't default to it. Calibrate at 15–40% of your through-cut linear energy (power ÷ speed). <em>Telling detail: Highcon's industrial corrugated line cuts with lasers but creases with a physical rule. If lasers were good at this, they'd use them.</em></li>
+      <li><strong>Relief slot with an inside bridging strip</strong> — for α &gt; 90° and double-wall.</li>
+      <li><strong>Lattice hinges</strong> — curves only, and largely a bad idea here. A ligament 3 mm wide is smaller than half a flute pitch, so each one is either a solid glue line or two paper skins over a void, at random. They tear. Use strip removal parallel to the flutes instead.</li>
+    </ol>
+  </section>
+
+  <section id="split">
+    <span class="sec-num">07</span>
+    <h2>Splitting to fit the bed</h2>
+
+    <p>Two mechanisms, and you want both:</p>
+
+    <p><strong>Constrain during unfolding.</strong> Reject any island merge whose result won't fit the bed. Blender does this with a rotated-bounding-box test at the page's aspect ratio, so islands can sit diagonally. The seam then lands on a real mesh edge, which already has a glue flap and already has a non-flat dihedral angle giving it rigidity. Free, and invisible. Two fixes worth making to Blender's version: test against <code>bed − 2·margin</code>, and include glue flaps in the bounding box, which it doesn't.</p>
+
+    <p><strong>Then split arbitrarily, as a guarantee.</strong> Constraining alone can never split a <em>single face</em> — which is precisely the common case for low-poly armor with big flat panels. Blender has this exact bug class filed. So for any island still oversized, run a guillotine splitter on the unfolded 2D island: candidate cuts horizontal and vertical in the island's fitted frame plus directions parallel to its longest fold lines, minimizing seam length plus a penalty per fold-line crossing, recursing until everything fits.</p>
+
+    <div class="note blue">
+      <span class="tag">The seam you create is flat, and that changes the joint</span>
+      <p>A fold-over glue flap doubles back on itself at 180° and is useless. Corrugated also has near-zero in-plane tensile strength across a butt seam. So an arbitrary split needs real joinery, and the honest answer for cardboard is <strong>a glued backing strip, not an interlock</strong>: 40–60 mm wide, rotated 90° so its flutes cross the parent panels, with two small alignment notches so it self-locates. It nests into scrap for free.</p>
+      <p>If you do want visible puzzle tabs, do <em>not</em> scale them by material thickness the way <code>boxes.py</code> does — a 3 mm-scaled dovetail has a 2 mm neck that tears straight out along a flute. Use absolute dimensions: 25–40 mm pitch, 12–20 mm depth, 15–25° flare, ≥8 mm necks, ≥2 mm fillets. And constrain tab placement to crease-free intervals, since a tab spanning a fold can't be inserted.</p>
+    </div>
+  </section>
+
+  <section id="nest">
+    <span class="sec-num">08</span>
+    <h2>Nesting and export</h2>
+
+    <p>Bounding-box packing throws away every concavity, and papercraft nets are nothing <em>but</em> concavity — triangle fans, jagged flap fringes, star-shaped islands. True polygon nesting using no-fit polygons is worth roughly <strong>+20 points of material utilization</strong> on net-like geometry; benchmarking on 200 synthetic net-like parts gave 62% for bbox packing against 83–86% for NFP, which was 7 sheets down to 5.</p>
+
+    <p>The mechanism: the no-fit polygon of a pair (A,&nbsp;B) is the locus of B's reference point as B slides around A in contact. Overlap testing collapses to point-in-polygon, and "slide B until it touches A" becomes walking a boundary. Feasible positions for the next part are the inner-fit polygon of the sheet minus the union of NFPs against everything already placed.</p>
+
+    <p><strong>Use <code>python-libnest2d</code>.</strong> It's the only maintained, pip-installable true-polygon nester in Python, with prebuilt wheels. Critically, <code>NfpConfig.rotations</code> takes an arbitrary list of angles in radians — exactly the API the flute constraint needs. Pass <code>[0, π]</code> for grain-locked parts and <code>[0, π/2, π, 3π/2]</code> for free ones, in separate passes. Note it's LGPL-3, so dynamic linking keeps your code clear but you must ship the license. If that's a blocker, SVGnest is MIT and about a week to port.</p>
+
+    <p>Worth doing first, per island: histogram its fold-line lengths by angle and rotate so the majority run perpendicular to the flutes. Cheap 1-D optimization, then hand the nester a 0/180-locked part.</p>
+
+    <h3>Output conventions</h3>
+    <p>One file per sheet — multi-page SVG isn't read reliably and DXF has no page concept. Set <code>width="600mm" height="400mm" viewBox="0 0 600 400"</code> so one user unit is one millimetre, rather than relying on a transform. Both LightBurn and RDWorks key operations off stroke colour, and LightBurn maps DXF layers directly, so use both consistently:</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>Operation</th><th class="k">Layer</th><th class="k">Stroke</th><th>Style</th></tr></thead>
+        <tbody>
+          <tr><td>Through-cut</td><td class="k">CUT</td><td class="k">#FF0000</td><td>Hairline, no fill</td></tr>
+          <tr><td>Fold — mountain</td><td class="k">FOLD_M</td><td class="k">#0000FF</td><td>Dashed 4,2</td></tr>
+          <tr><td>Fold — valley</td><td class="k">FOLD_V</td><td class="k">#00AAFF</td><td>Dash-dot 6,2,1,2</td></tr>
+          <tr><td>Score / perforate</td><td class="k">SCORE</td><td class="k">#00FF00</td><td>Hairline</td></tr>
+          <tr><td>Engrave labels</td><td class="k">ENGRAVE</td><td class="k">#000000</td><td>Single-stroke font only</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Order groups engrave → score → fold → interior cuts → perimeter, so parts don't drop before their features are done. Engrave a short part ID inside every face, paired edge numbers at each cut edge midpoint, and a flute arrow on grain-locked parts. Use a Hershey single-stroke font — outline fonts are 5–20× slower and burn through cardboard.</p>
+
+    <p>Emit a <code>sheets.json</code> manifest alongside: sheet index, material, thickness, grain axis, part IDs, transforms, estimated cut length. Assembly instructions need it, and so does recutting a part you ruined.</p>
+  </section>
+
+  <section id="params">
+    <span class="sec-num">09</span>
+    <h2>Parameters</h2>
+    <p>The split matters: geometry is reliable and belongs in code; everything empirical belongs in a config the user tunes against their own machine and their own boxes.</p>
+
+    <h4>Hard-code — pure geometry</h4>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Rule</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Relief width</td><td class="k">w = C · 2d · tan(α/2)</td></tr>
+          <tr><td>Pivot depth, far liner intact</td><td class="k">d = t − t_liner/2</td></tr>
+          <tr><td>Flat pattern</td><td>Outer-surface lengths; subtract w, split w/2 each side of the fold</td></tr>
+          <tr><td>Double-score above 90°</td><td class="k">two folds of α/2, separation 1.0–1.5 t</td></tr>
+          <tr><td>Perforation period</td><td class="k">≤ P/3 (P = flute pitch)</td></tr>
+          <tr><td>Rotation set</td><td>Creases ⟂ flutes; curve axes ∥ flutes; slots ⟂ flutes</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h4>Expose — empirical, machine and stock dependent</h4>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Parameter</th><th class="num">Default</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Caliper <code>t</code></td><td class="num">3.0 mm</td><td>B flute. Calipers squeeze corrugated and read 0.2–0.5 mm low — offer a flute-grade table instead</td></tr>
+          <tr><td>Liner thickness</td><td class="num">0.30 mm</td><td>Per side</td></tr>
+          <tr><td>Flute pitch <code>P</code></td><td class="num">6.5 mm</td><td>B flute. C = 8.0, E = 3.2</td></tr>
+          <tr><td>Kerf <code>k</code></td><td class="num">0.30 mm</td><td>Wider than wood — the char halo exceeds the beam. Ship a kerf test square</td></tr>
+          <tr><td>Crush factor <code>C</code></td><td class="num">0.75</td><td>Range 0.6–1.0. Empirical, not derived</td></tr>
+          <tr><td>Perf cut / tie</td><td class="num">1.0 / 0.6 mm</td><td>On B flute. Published dash ratios for cardboard are folklore</td></tr>
+          <tr><td>Slot interference</td><td class="num">t − 0.4 mm</td><td>2–4× what plywood needs, because cardboard crushes</td></tr>
+          <tr><td>Score energy</td><td class="num">0.30 × cut</td><td>Fraction of through-cut power÷speed. Bisect from here</td></tr>
+          <tr><td>Part gap</td><td class="num">3.0 mm</td><td>Char halo, not kerf, sets this. 1 mm will scorch the web between parts</td></tr>
+          <tr><td>Sheet margin</td><td class="num">8 mm</td><td>All four edges</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note kraft">
+      <span class="tag">Design tolerance</span>
+      <p>Corrugated box dimensional tolerance is an industry-standard ±3 mm die-cut, ±5 mm for an RSC, driven by ±5% basis-weight variation and moisture. Caliper swings ±0.2–0.3 mm within a single sheet. <strong>Do not design anything needing better than ±0.5 mm</strong>, and prefer geometry that self-locates — tabs that bottom out, notches that register against an edge — over anything relying on cumulative accuracy.</p>
+    </div>
+  </section>
+
+  <section id="stack">
+    <span class="sec-num">10</span>
+    <h2>Stack</h2>
+    <div class="tw">
+      <table>
+        <thead><tr><th class="k">Package</th><th>Role</th><th>Why this one</th></tr></thead>
+        <tbody>
+          <tr><td class="k">trimesh</td><td>Mesh I/O, topology</td><td><code>face_adjacency</code> is your dual graph; <code>face_adjacency_edges</code> the parallel hinge list; <code>facets</code> merges coplanar triangles back into planar polygons — essential, or you get a fold line down the middle of every rectangle</td></tr>
+          <tr><td class="k">networkx</td><td>Spanning trees, components</td><td>One-line MST and connected-components. Union-find for the incremental merge variant</td></tr>
+          <tr><td class="k">shapely 2.x</td><td>All 2D geometry</td><td>The workhorse. <code>STRtree</code> for overlap, <code>buffer(-k/2, mitre)</code> for kerf, and boolean ops for tab/slot geometry — which is the single strongest argument for Python over forking a paper-only addon</td></tr>
+          <tr><td class="k">ezdxf</td><td>DXF export</td><td>Layer per operation. <strong>No open-source unfolder emits DXF</strong> — cheap to add and a real differentiator</td></tr>
+          <tr><td class="k">python-libnest2d</td><td>Polygon nesting</td><td>Arbitrary discrete rotation sets. LGPL-3</td></tr>
+          <tr><td class="k">bpy</td><td>Viewport only</td><td>Edge selection and overlays. Core imports none of it</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>Not libigl.</strong> LSCM and ARAP solve a different problem — given a fixed cut on a <em>curved</em> surface, minimize distortion. Distortion is their premise. Applied here they'd change edge lengths, so two faces that shared a 40.00 mm edge come out 39.7 and 40.2, error accumulates around a loop, and the model won't close. Parameterization is for curved surfaces you're forced to distort; unfolding is for developable surfaces you must not.</p>
+  </section>
+
+  <section id="order">
+    <span class="sec-num">11</span>
+    <h2>Build order</h2>
+    <p>Each milestone ends with something you can cut and hold, which matters more than architectural purity on a project you're doing to learn.</p>
+    <ol class="ms">
+      <li><span class="m-n">M1</span><div><span class="m-t">Headless core</span><p class="m-d">Load mesh, merge coplanar faces, planarity gate, dual graph, rigid unfold, Shapely overlap, randomized restart, set-cover repair, plain SVG out. No folds, no tabs, no thickness.<em>Mostly done — the spike is this, minus coplanar merge and the planarity gate.</em></p></div></li>
+      <li><span class="m-n">M2</span><div><span class="m-t">Cut a calibration set</span><p class="m-d">Before writing more code: cut a kerf square, a perf-ratio ladder, a score-energy ladder, and a slot-fit comb on the actual board you'll use. Every default in §9 is a guess until you measure it.<em>One afternoon. Saves a week.</em></p></div></li>
+      <li><span class="m-n">M3</span><div><span class="m-t">Fold geometry + material model</span><p class="m-d">Dihedral angle per fold edge, relief width from the formula, perforation with flute-pitch-aware dashing, double-score above 90°, kerf compensation at export. Layered SVG and DXF.<em>First real cardboard model comes off the laser here.</em></p></div></li>
+      <li><span class="m-n">M4</span><div><span class="m-t">Blender frontend</span><p class="m-d">Wrap the core. Edit-mode edge selection drives forced cuts, GPU overlay colours islands by state, live re-unfold on change, panel for the material parameters.<em>Read PolyZamboni first; much of this is solved there.</em></p></div></li>
+      <li><span class="m-n">M5</span><div><span class="m-t">Joinery</span><p class="m-d">Glue flaps with the <code>t/sin(dihedral)</code> slide, then tab-and-slot for dry alignment. Generate both on the same edge and let the user pick — that's what packaging does.<em>Flap side assignment is a 2-SAT problem; solve it properly, it's linear time.</em></p></div></li>
+      <li><span class="m-n">M6</span><div><span class="m-t">Scale, split, nest</span><p class="m-d">Scale-to-wearer-height, bed constraint during merge, guillotine fallback splitter with backing strips, per-island grain rotation, NFP nesting, per-sheet files and a manifest.<em>This is where a full suit of armor becomes cuttable.</em></p></div></li>
+      <li><span class="m-n">M7</span><div><span class="m-t">Assembly output</span><p class="m-d">Engraved part IDs and paired edge numbers, build-step ordering, flute arrows, and a printable assembly sheet showing the 3D model with islands highlighted.<em>The difference between a pile of parts and a costume.</em></p></div></li>
+    </ol>
+  </section>
+
+  <section id="risks">
+    <span class="sec-num">12</span>
+    <h2>Open risks</h2>
+    <ul>
+      <li><strong>Spiky armor is the known failure mode.</strong> Every unfolding method in the literature fails on thin spikes and elongated holes. Horns, blade edges and crests will produce many islands no matter how good the search is. Mitigate by modeling those as separate parts, or by stacked-slice construction rather than unfolding.</li>
+      <li><strong>Partial-depth scoring may never be reliable enough to ship as a default.</strong> Plan for perforation as the primary technique and treat scoring as an advanced option.</li>
+      <li><strong>The crush factor <code>C</code> is one number standing in for real material behaviour.</strong> It will need different values for new versus reused board, and possibly for different fold angles. Watch whether a single constant holds.</li>
+      <li><strong>Blender API churn.</strong> PolyZamboni already requires Blender 5.1+; the paper-model addon 5.0+. These break every few releases. The <code>bpy</code>-free core is the insurance policy — keep the discipline from day one, because it's very hard to retrofit.</li>
+      <li><strong>Fit is not solved by any of this.</strong> The unfolder produces an accurate net of whatever model you give it. Whether that model fits your body is upstream, and it's still the part most likely to waste a weekend. Scan yourself before modeling anything.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>Verified in this session: the unfold transform, isometry error, single-island rates and timings in §1 are from a working 150-line Python implementation, not from the literature. The relief-width formula in §6 was derived twice — for a true V-groove and for a straight-walled slot — and cross-checked against sheet-metal bend deduction at zero radius and against US 5,427,309.</p>
+    <p>Key sources: <a href="https://erikdemaine.org/papers/Ununfoldable/paper.pdf">Bern, Demaine et al., Ununfoldable Polyhedra with Convex Faces</a> · <a href="https://geom.ivd.kit.edu/downloads/pubs/pub-prautzsch-straub_2011.pdf">Straub &amp; Prautzsch, Optimized Cut-Out Sheets</a> · <a href="https://link.springer.com/article/10.1007/s00371-024-03395-2">Zawallich &amp; Pajarola, Unfolding polyhedra via tabu search</a> · <a href="https://github.com/AntonFlorey/PolyZamboni">PolyZamboni</a> · <a href="https://github.com/addam/Export-Paper-Model-from-Blender">Export Paper Model</a> · <a href="https://blumerag.com/wp-content/uploads/2022/05/corrugate.pdf">C&amp;T Matrix, Creasing Corrugated Board</a> · <a href="https://github.com/Jack000/SVGnest">SVGnest</a></p>
+  </footer>
+
+  </main>
+</div>
+</div>
+
+</html>

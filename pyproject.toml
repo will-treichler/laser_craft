@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cardboard-unfolder"
+version = "0.1.0"
+description = "Unfold low-poly meshes into laser-cuttable corrugated cardboard"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "trimesh>=4.0",
+    "networkx>=3.0",
+    "shapely>=2.0",
+    "ezdxf>=1.1",
+]
+
+[project.optional-dependencies]
+preview = ["matplotlib>=3.7"]
+dev = ["pytest>=7.0", "matplotlib>=3.7"]
+
+[project.scripts]
+cardboard-unfolder = "cardboard_unfolder.cli:main"
+
+[tool.setuptools]
+packages = ["cardboard_unfolder"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
