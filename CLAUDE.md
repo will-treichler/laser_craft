@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 81 checks, real Blender API
+python blender/test_addon.py            # 92 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -182,6 +182,25 @@ is invisible to `test_dev.py`, which calls `reload_all()` directly; the
 operator path is covered in `test_addon.py` against `execute.__code__.co_names`,
 because a comment mentioning `self.report` would fool a source-text search.
 
+**A forced cut slits the net; it does not necessarily split an island.**
+The dual graph has cycles, so removing one arc leaves the two faces connected
+through another path. Asserting "cut separates the two faces into different
+islands" passes on a cube and fails on a sphere - the real invariant is that
+the two faces disagree about where the edge sits in the net
+(`cutting an edge slits the net along it`).
+
+**In the UV editor, `edge.select` is the wrong selection.** UV selection lives
+per loop and, with UV Sync Selection off, is entirely separate from the mesh
+selection - so reading `edge.select` from a 2D-view operator acts on stale
+edges or none at all. `bridge.uv_selected_edges` reads the uv layer's
+`select_edge`, and `ops.selected_edges` picks whichever source matches the
+view the user is working in.
+
+**`cbu.repack` rebuilds parts from the islands.** `Part.xform` maps island
+space to the sheet, so re-packing already-packed parts would compose two
+placements and put the net somewhere it is not. Regression:
+`re-packing twice is stable`.
+
 **Blender: seam marks go in mesh attributes, not PropertyGroups.** Edit-mode
 undo records only mesh/bmesh changes, so custom properties set in Edit Mode are
 not restored by Ctrl+Z. Marks in a PropertyGroup work until the first undo,
@@ -298,9 +317,11 @@ Not done, roughly in value order:
    nesting is worth ~+20 points on nets this concave. Blender's own
    `uv.pack_islands(shape_method='CONCAVE', scale=False)` already does this and
    may be enough — see `ops.CBU_OT_pack_uv`.
-2. **2D seam editing.** You can move/rotate islands in the UV editor but
-   re-seaming is 3D-only. PolyZamboni's `operators.py:890` is a working
-   reference for Image-Editor modal plumbing.
+2. **2D seam editing.** Partly done: `cbu.edit_seam` cuts or welds the
+   selected edge from the UV editor and re-unfolds, and `cbu.repack` re-nests
+   on demand. Still click-to-pick only - no modal drag-along-a-path tool.
+   PolyZamboni's `operators.py:890` is a working reference for Image-Editor
+   modal plumbing.
 3. **Live re-unfold** on seam change.
 4. **Splitting a single oversized face.** Bed splitting only cuts along fold
    edges, so one face bigger than the bed still fails. Needs an in-plane cut

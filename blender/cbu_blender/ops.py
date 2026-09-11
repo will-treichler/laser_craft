@@ -41,6 +41,23 @@ def _active_mesh(context):
 
 # --------------------------------------------------------------- marking
 
+def selected_edges(context, bm):
+    """The edges the user means, from whichever view they are working in.
+
+    In the UV editor with sync off the mesh selection is stale and unrelated,
+    so reading edge.select there would silently act on the wrong edges - or on
+    none at all.
+    """
+    sp = getattr(context, "space_data", None)
+    if (sp is not None and getattr(sp, "type", "") == "IMAGE_EDITOR"
+            and not context.scene.tool_settings.use_uv_select_sync):
+        idx = bridge.uv_selected_edges(bm)
+        if idx:
+            bm.edges.ensure_lookup_table()
+            return [bm.edges[i] for i in sorted(idx)]
+    return [e for e in bm.edges if e.select]
+
+
 class CBU_OT_mark(bpy.types.Operator):
     bl_idname = "cbu.mark"
     bl_label = "Mark Edges"
@@ -66,10 +83,9 @@ class CBU_OT_mark(bpy.types.Operator):
         val = {"CUT": bridge.FORCE_CUT, "FOLD": bridge.FORCE_FOLD,
                "AUTO": bridge.AUTO}[self.mode]
         n = 0
-        for e in bm.edges:
-            if e.select:
-                e[lay] = val
-                n += 1
+        for e in selected_edges(context, bm):
+            e[lay] = val
+            n += 1
         bmesh.update_edit_mesh(obj.data)
         if n == 0:
             self.report({"WARNING"}, "no edges selected")
@@ -288,6 +304,84 @@ class CBU_OT_unfold(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CBU_OT_edit_seam(bpy.types.Operator):
+    bl_idname = "cbu.edit_seam"
+    bl_label = "Edit Seam"
+    bl_description = ("Force the selected edge(s) and re-unfold, so the change "
+                      "shows in the net immediately")
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: EnumProperty(items=[
+        ("CUT", "Cut", "Always cut here - splits the island apart"),
+        ("FOLD", "Weld", "Never cut here - joins the two islands into one"),
+    ], default="CUT")
+
+    @classmethod
+    def poll(cls, context):
+        return (context.active_object is not None
+                and context.active_object.type == "MESH"
+                and context.mode == "EDIT_MESH")
+
+    def execute(self, context):
+        r = bpy.ops.cbu.mark(mode=self.mode)
+        if "FINISHED" not in r:
+            self.report({"WARNING"}, "nothing selected in this view")
+            return {"CANCELLED"}
+        return bpy.ops.cbu.unfold()
+
+
+class CBU_OT_repack(bpy.types.Operator):
+    bl_idname = "cbu.repack"
+    bl_label = "Re-pack Sheets"
+    bl_description = ("Run the nesting again on the current islands, without "
+                      "re-unfolding. Useful after editing seams")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.name in _LAST
+
+    def execute(self, context):
+        obj = context.active_object
+        s = context.scene.cbu
+        mat = material_from(s)
+        _, L, _ = _core()
+        pm, islands, _old, _sheets, rep = _LAST[obj.name]
+
+        was_edit = context.mode == "EDIT_MESH"
+        if was_edit:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        try:
+            # Rebuild from the islands rather than re-packing the packed
+            # parts: Part.xform has to map island space to the sheet, and
+            # packing an already-packed part would compose two placements and
+            # put the net somewhere it is not.
+            parts = L.build_parts(islands, mat)
+            sheets, oversized = L.pack(parts, mat)
+            bridge.write_net_uv(obj.data, pm, islands,
+                                scale=bridge.uv_scale(*mat.bed),
+                                placement={p.island_id: p for p in parts},
+                                sheet_height=mat.bed[1])
+            _LAST[obj.name] = (pm, islands, parts, sheets, rep)
+            overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+        except Exception as exc:                       # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
+            return {"CANCELLED"}
+        finally:
+            if was_edit:
+                bpy.ops.object.mode_set(mode="EDIT")
+
+        s.last_sheets = sheets
+        if oversized:
+            self.report({"WARNING"},
+                        f"{sheets} sheet(s), {len(oversized)} part(s) too big")
+        else:
+            self.report({"INFO"}, f"packed onto {sheets} sheet(s)")
+        return {"FINISHED"}
+
+
 class CBU_OT_export(bpy.types.Operator):
     bl_idname = "cbu.export"
     bl_label = "Export Sheets"
@@ -357,7 +451,8 @@ class CBU_OT_pack_uv(bpy.types.Operator):
 PLANAR_TOL = 1e-3      # same gate PolyMesh.check uses
 
 classes = (CBU_OT_mark, CBU_OT_clear_marks, CBU_OT_select_marked,
-           CBU_OT_split_nonplanar, CBU_OT_unfold, CBU_OT_export, CBU_OT_pack_uv)
+           CBU_OT_split_nonplanar, CBU_OT_unfold, CBU_OT_edit_seam,
+           CBU_OT_repack, CBU_OT_export, CBU_OT_pack_uv)
 
 
 def register():

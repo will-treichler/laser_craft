@@ -214,8 +214,31 @@ class CBU_PT_uv(bpy.types.Panel):
         lay.label(text=f'UV layer "{bridge.UV_LAYER}" is the net')
         lay.label(text=f"1 UV unit = {mm:.0f} mm  (bed {s.bed_x:.0f}x{s.bed_y:.0f})")
         lay.prop(s, "show_bed")
-        lay.operator("cbu.pack_uv", icon="UV_ISLANDSEL")
+
+        box = lay.box()
+        box.label(text="Selected edge", icon="EDGESEL")
+        if context.mode != "EDIT_MESH":
+            box.label(text="Enter Edit Mode to pick edges", icon="INFO")
+        else:
+            row = box.row(align=True)
+            row.operator("cbu.edit_seam", text="Cut",
+                         icon="UNLINKED").mode = "CUT"
+            row.operator("cbu.edit_seam", text="Weld",
+                         icon="LINKED").mode = "FOLD"
+            if not context.scene.tool_settings.use_uv_select_sync:
+                box.label(text="reading the UV selection", icon="UV")
+            else:
+                box.label(text="UV sync on: reading the 3D selection",
+                          icon="INFO")
+        box.label(text="Cut splits an island in two;")
+        box.label(text="Weld joins two islands. Both re-unfold.")
+
+        lay.separator()
+        col = lay.column(align=True)
+        col.operator("cbu.repack", icon="MOD_ARRAY")
+        col.operator("cbu.pack_uv", icon="UV_ISLANDSEL")
         lay.operator("cbu.export", icon="EXPORT")
+
         box = lay.box()
         box.label(text="Move and rotate islands freely.", icon="INFO")
         box.label(text="Do NOT scale - that breaks the")

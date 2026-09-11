@@ -286,6 +286,109 @@ _v2, _ = overlay.bed_segments((0.0, 0.0, 1e9, 1e9), 600.0, 400.0, 8.0)
 check(len(_v2) // 16 <= overlay.MAX_TILES,
       f"a runaway net is capped at {overlay.MAX_TILES} tiles")
 
+# ------------------------------------------------ 2D seam editing
+obj = fresh("Seams2D", "ico_sphere", subdivisions=1)
+obj.scale = (0.14,) * 3
+bpy.ops.object.transform_apply(scale=True)
+bpy.ops.cbu.unfold()
+
+
+def _island_of_poly():
+    pm, islands, _p, _s, _r = ops._LAST[obj.name]
+    out = {}
+    for isl in islands:
+        for f in isl.faces:
+            for s in pm.source_faces[f]:
+                out[s] = isl.id
+    return out
+
+
+def _select_only(eidx):
+    if bpy.context.mode != "EDIT_MESH":
+        bpy.ops.object.mode_set(mode="EDIT")
+    _bm = bmesh.from_edit_mesh(obj.data)
+    _bm.edges.ensure_lookup_table()
+    for x in _bm.edges:
+        x.select_set(False)
+    _bm.edges[eidx].select_set(True)
+    bmesh.update_edit_mesh(obj.data)
+
+
+bpy.ops.object.mode_set(mode="EDIT")
+_bm = bmesh.from_edit_mesh(obj.data)
+_bm.edges.ensure_lookup_table()
+_pi = _island_of_poly()
+_target = next(e.index for e in _bm.edges
+               if len(e.link_faces) == 2
+               and _pi.get(e.link_faces[0].index) == _pi.get(e.link_faces[1].index))
+_faces = [f.index for f in _bm.edges[_target].link_faces]
+
+def _edge_is_slit(eidx):
+    """Do the two faces disagree about where this edge lives in the net?
+
+    That - not the island count - is what a cut means. The dual graph has
+    cycles, so removing one arc slits the net there while the island can stay
+    in one piece through another path; asserting the island splits passes on a
+    cube and fails on a sphere.
+    """
+    if bpy.context.mode == "EDIT_MESH":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+    lay = bm.loops.layers.uv[bridge.UV_LAYER]
+    e = bm.edges[eidx]
+    f1, f2 = e.link_faces
+
+    def corners(f):
+        return {l.vert.index: tuple(l[lay].uv) for l in f.loops if l.vert in e.verts}
+
+    a, b = corners(f1), corners(f2)
+    slit = any(np.linalg.norm(np.array(a[k]) - np.array(b[k])) > 1e-6 for k in a)
+    bm.free()
+    return slit
+
+
+_select_only(_target)
+check(bpy.ops.cbu.edit_seam(mode="CUT") == {"FINISHED"}, "cut a seam from the 2D view")
+check(_edge_is_slit(_target), "cutting an edge slits the net along it")
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+_cuts, _folds = bridge.read_constraints(obj.data)
+check(len(_cuts) == 1 and not _folds, "the cut is recorded as a forced cut")
+
+_select_only(_target)
+check(bpy.ops.cbu.edit_seam(mode="FOLD") == {"FINISHED"}, "weld a seam from the 2D view")
+_after = _island_of_poly()
+check(_after.get(_faces[0]) == _after.get(_faces[1]),
+      "welding the same edge keeps those faces in one island")
+check(not _edge_is_slit(_target), "and closes the slit in the net")
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+_cuts, _folds = bridge.read_constraints(obj.data)
+check(not _cuts and len(_folds) == 1, "the weld replaced the cut, not stacked on it")
+
+# re-nesting on demand must not disturb the islands, only where they sit
+_before_islands = bpy.context.scene.cbu.last_islands
+check(bpy.ops.cbu.repack() == {"FINISHED"}, "re-pack runs on demand")
+check(bpy.context.scene.cbu.last_islands == _before_islands,
+      "re-packing does not re-unfold")
+_pm, _isl, _parts, _sheets, _rep = ops._LAST[obj.name]
+_mat = props.material_from(bpy.context.scene.cbu)
+_stray = [p.island_id for p in _parts if p.sheet >= 0
+          and (p.bounds[0] < _mat.sheet_margin - 1e-6
+               or p.bounds[1] < _mat.sheet_margin - 1e-6
+               or p.bounds[2] > _mat.bed[0] - _mat.sheet_margin + 1e-6
+               or p.bounds[3] > _mat.bed[1] - _mat.sheet_margin + 1e-6)]
+check(not _stray, f"re-packed parts stay inside the margins (stray: {_stray})")
+
+# repacking twice must be idempotent - Part.xform maps island space to the
+# sheet, so packing an already-packed part would compose two placements
+bpy.ops.cbu.repack()
+_s1 = bpy.context.scene.cbu.last_sheets
+bpy.ops.cbu.repack()
+check(bpy.context.scene.cbu.last_sheets == _s1, "re-packing twice is stable")
+
 # ------------------------------------------------ non-planar faces
 # A bent quad has no flat image at all, so it must be triangulated in the MESH.
 # Splitting it core-side instead leaves one Blender polygon claimed by two core

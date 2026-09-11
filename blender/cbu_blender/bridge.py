@@ -70,6 +70,26 @@ def ensure_mesh_attrs(mesh) -> None:
         mesh.attributes.new(FACE_ATTR, "INT", "FACE")
 
 
+def uv_selected_edges(bm, uv_name: str = UV_LAYER) -> set:
+    """Mesh edge indices whose UV edge is selected in the 2D view.
+
+    UV selection lives per loop, not per edge, and with UV Sync Selection off
+    it is completely separate from the mesh selection - so "the edge I picked
+    in the net" cannot be read from `edge.select` at all. Both loops of a
+    shared edge are checked, since only one side is selected when the edge is
+    a seam and the two halves sit apart in the net.
+    """
+    lay = bm.loops.layers.uv.get(uv_name)
+    if lay is None:
+        return set()
+    out = set()
+    for f in bm.faces:
+        for l in f.loops:
+            if getattr(l[lay], "select_edge", False):
+                out.add(l.edge.index)
+    return out
+
+
 def read_constraints(mesh) -> tuple[set, set]:
     """Forced cuts and folds as sets of sorted (v0, v1) vertex-index pairs."""
     cuts, folds = set(), set()
