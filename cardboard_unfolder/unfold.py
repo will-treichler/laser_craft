@@ -375,6 +375,55 @@ def repair(pm: PolyMesh, forest: nx.Graph, overlaps: set, max_cuts: int = 500):
     return forest, pos, bad, cuts
 
 
+def split_island(isl: Island, f0: int, f1: int, new_id: int, new_seam: int):
+    """Split one island along the fold joining f0 and f1. Returns (a, b).
+
+    The local counterpart to re-unfolding with a forced cut. Re-unfolding lets
+    the solver rebuild the whole tree, so the faces freed by the cut usually
+    reattach somewhere else entirely and the island count does not go up -
+    correct, but not what someone dragging a seam in the 2D view expects. This
+    detaches exactly the piece on the far side of that fold and leaves the rest
+    of the net alone.
+
+    An island's folds form a spanning tree over its faces, so every fold is a
+    bridge: removing one always yields exactly two pieces, never zero or three.
+    The fold becomes a matching pair of cuts sharing a new seam id, which is
+    what pairs the glue tab with its partner.
+
+    Returns None if those faces are not joined by a fold here - they may be
+    adjacent in 3D but already cut apart in this net.
+    """
+    target = None
+    G = nx.Graph()
+    G.add_nodes_from(isl.faces)
+    for fo in isl.folds:
+        if target is None and {fo.f0, fo.f1} == {f0, f1}:
+            target = fo
+            continue
+        G.add_edge(fo.f0, fo.f1)
+    if target is None:
+        return None
+
+    comps = list(nx.connected_components(G))
+    if len(comps) != 2:
+        return None
+    side_a, side_b = comps
+    if target.f0 not in side_a:
+        side_a, side_b = side_b, side_a
+
+    def build(iid, members, keep_face):
+        out = Island(id=iid)
+        out.faces = {k: isl.faces[k] for k in sorted(members)}
+        out.folds = [fo for fo in isl.folds
+                     if fo is not target and fo.f0 in members and fo.f1 in members]
+        out.cuts = [c for c in isl.cuts if c.face in members]
+        out.cuts.append(Cut(target.a, target.b, keep_face, new_seam))
+        return out
+
+    return (build(isl.id, side_a, target.f0),
+            build(new_id, side_b, target.f1))
+
+
 # -------------------------------------------------------------- bed limit
 
 def _convex_hull(pts: np.ndarray) -> np.ndarray:

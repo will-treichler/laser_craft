@@ -349,8 +349,76 @@ def _edge_is_slit(eidx):
     return slit
 
 
+def _fold_edge():
+    """An edge that is currently a fold inside one island - the only kind a
+    separating cut can act on."""
+    pm, islands, _p, _s, _r = ops._LAST[obj.name]
+    core_of = {}
+    for ci, grp in enumerate(pm.source_faces):
+        for poly in grp:
+            core_of[poly] = ci
+    if bpy.context.mode != "EDIT_MESH":
+        bpy.ops.object.mode_set(mode="EDIT")
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+    for e in bm.edges:
+        if len(e.link_faces) != 2:
+            continue
+        a, b = (core_of.get(f.index) for f in e.link_faces)
+        if a is None or b is None or a == b:
+            continue
+        host = next((i for i in islands if a in i.faces and b in i.faces), None)
+        if host and any({fo.f0, fo.f1} == {a, b} for fo in host.folds):
+            return e.index
+    return None
+
+
+# The two cut modes must actually differ. Re-unfolding lets the solver rebuild
+# the whole tree, so the freed faces usually reattach to another island and the
+# region count does not move - which is exactly the surprise this option
+# exists to remove.
+bpy.ops.cbu.clear_marks()
+bpy.ops.cbu.unfold()
+_base = bpy.context.scene.cbu.last_islands
+_fe = _fold_edge()
+check(_fe is not None, "found a fold edge to cut")
+_select_only(_fe)
+check(bpy.ops.cbu.edit_seam(mode="CUT", separate=False) == {"FINISHED"},
+      "re-unfolding cut runs")
+_resolved = bpy.context.scene.cbu.last_islands
+
+bpy.ops.cbu.clear_marks()
+bpy.ops.cbu.unfold()
+_fe = _fold_edge()
+_select_only(_fe)
+check(bpy.ops.cbu.edit_seam(mode="CUT", separate=True) == {"FINISHED"},
+      "separating cut runs")
+_detached = bpy.context.scene.cbu.last_islands
+check(_detached == _base + 1,
+      f"a separating cut adds exactly one island ({_base} -> {_detached})")
+check(_detached > _resolved,
+      f"and gives more regions than re-unfolding ({_detached} vs {_resolved})")
+
+_pm, _isl, _parts, _sheets, _rep = ops._LAST[obj.name]
+check(len({i.id for i in _isl}) == len(_isl), "island ids stay unique after a split")
+# the spent fold must become a matched pair of cuts, or the glue tab on one
+# side has no partner on the other
+_pairs = {}
+for i in _isl:
+    for c in i.cuts:
+        if c.seam >= 0:
+            _pairs.setdefault(c.seam, 0)
+            _pairs[c.seam] += 1
+check(all(n == 2 for n in _pairs.values()),
+      f"every seam id appears exactly twice ({sorted(_pairs.values())[:6]})")
+check(sum(len(i.faces) for i in _isl) == len(_pm.faces),
+      "every face still belongs to exactly one island")
+
+bpy.ops.cbu.clear_marks()
+bpy.ops.cbu.unfold()
 _select_only(_target)
-check(bpy.ops.cbu.edit_seam(mode="CUT") == {"FINISHED"}, "cut a seam from the 2D view")
+check(bpy.ops.cbu.edit_seam(mode="CUT", separate=False) == {"FINISHED"},
+      "cut a seam from the 2D view")
 check(_edge_is_slit(_target), "cutting an edge slits the net along it")
 if bpy.context.mode == "EDIT_MESH":
     bpy.ops.object.mode_set(mode="OBJECT")

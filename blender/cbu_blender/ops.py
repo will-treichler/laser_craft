@@ -7,7 +7,7 @@ import traceback
 import bmesh
 import bpy
 import numpy as np
-from bpy.props import EnumProperty
+from bpy.props import BoolProperty, EnumProperty
 
 from . import bridge, overlay
 from . import log as cbulog
@@ -312,9 +312,15 @@ class CBU_OT_edit_seam(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     mode: EnumProperty(items=[
-        ("CUT", "Cut", "Always cut here - splits the island apart"),
+        ("CUT", "Cut", "Cut along this edge"),
         ("FOLD", "Weld", "Never cut here - joins the two islands into one"),
     ], default="CUT")
+    separate: BoolProperty(
+        name="Separate into a new island", default=True,
+        description=("Detach the piece on the far side of the cut as its own "
+                     "island, leaving the rest of the net alone. Off re-runs "
+                     "the solver, which is free to reattach that piece "
+                     "elsewhere - fewer islands, but the whole layout moves"))
 
     @classmethod
     def poll(cls, context):
@@ -323,11 +329,92 @@ class CBU_OT_edit_seam(bpy.types.Operator):
                 and context.mode == "EDIT_MESH")
 
     def execute(self, context):
+        if self.mode == "CUT" and self.separate:
+            return self._separate(context)
         r = bpy.ops.cbu.mark(mode=self.mode)
         if "FINISHED" not in r:
             self.report({"WARNING"}, "nothing selected in this view")
             return {"CANCELLED"}
         return bpy.ops.cbu.unfold()
+
+    def _separate(self, context):
+        """Cut the fold locally instead of re-unfolding.
+
+        Marking the edge and re-unfolding lets the solver rebuild the whole
+        tree, so the faces freed by the cut usually reattach to a different
+        island and the region count does not go up at all. Cutting the fold in
+        place detaches exactly the piece the user pointed at.
+        """
+        obj = context.active_object
+        if obj.name not in _LAST:
+            self.report({"WARNING"}, "unfold first")
+            return {"CANCELLED"}
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        picks = [(e.index, [f.index for f in e.link_faces])
+                 for e in selected_edges(context, bm) if len(e.link_faces) == 2]
+        if not picks:
+            self.report({"WARNING"}, "select an edge between two faces")
+            return {"CANCELLED"}
+
+        # record it so a later re-unfold keeps the cut
+        bpy.ops.cbu.mark(mode="CUT")
+
+        U, L, _ = _core()
+        pm, islands, _parts, _sheets, rep = _LAST[obj.name]
+        core_of = {}
+        for ci, grp in enumerate(pm.source_faces):
+            for poly in grp:
+                core_of[poly] = ci
+
+        done = 0
+        for _eidx, (p0, p1) in picks:
+            a, b = core_of.get(p0), core_of.get(p1)
+            if a is None or b is None or a == b:
+                continue            # inside one merged n-gon: nothing to cut
+            host = next((i for i in islands if a in i.faces and b in i.faces), None)
+            if host is None:
+                continue            # already in different islands
+            nid = max(i.id for i in islands) + 1
+            seam = max([c.seam for i in islands for c in i.cuts] + [-1]) + 1
+            out = U.split_island(host, a, b, nid, seam)
+            if out is None:
+                continue
+            islands[islands.index(host)] = out[0]
+            islands.append(out[1])
+            done += 1
+
+        if not done:
+            self.report({"WARNING"}, "that edge is already cut in this net")
+            return {"CANCELLED"}
+
+        s = context.scene.cbu
+        mat = material_from(s)
+        bpy.ops.object.mode_set(mode="OBJECT")
+        try:
+            parts = L.build_parts(islands, mat)
+            sheets, _over = L.pack(parts, mat)
+            bridge.write_islands(obj.data, pm, islands)
+            bridge.write_net_uv(obj.data, pm, islands,
+                                scale=bridge.uv_scale(*mat.bed),
+                                placement={p.island_id: p for p in parts},
+                                sheet_height=mat.bed[1])
+            _LAST[obj.name] = (pm, islands, parts, sheets, rep)
+            overlay.rebuild(obj, pm, islands, s.overlay_alpha)
+            overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+        except Exception as exc:                        # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
+            return {"CANCELLED"}
+        finally:
+            bpy.ops.object.mode_set(mode="EDIT")
+
+        s.last_islands = len(islands)
+        s.last_sheets = sheets
+        self.report({"INFO"},
+                    f"detached {done} piece(s) - {len(islands)} island(s), "
+                    f"{sheets} sheet(s)")
+        return {"FINISHED"}
 
 
 class CBU_OT_repack(bpy.types.Operator):

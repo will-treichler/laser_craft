@@ -10,12 +10,12 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 107 core invariants (~25 s)
+python -m pytest tests -q               # 109 core invariants (~25 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 92 checks, real Blender API
+python blender/test_addon.py            # 100 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -188,6 +188,16 @@ through another path. Asserting "cut separates the two faces into different
 islands" passes on a cube and fails on a sphere - the real invariant is that
 the two faces disagree about where the edge sits in the net
 (`cutting an edge slits the net along it`).
+
+That is also why `cbu.edit_seam` has two cut modes. Marking the edge and
+re-unfolding lets the solver rebuild the whole tree, so the freed faces
+usually reattach to a *different* island and the region count does not move,
+while the rest of the layout jumps around. `separate=True` (the default)
+instead calls `unfold.split_island`, which removes that one fold in place and
+detaches exactly the piece on its far side. An island's folds form a spanning
+tree, so every fold is a bridge and removing one always yields exactly two
+pieces; the spent fold becomes a matched pair of cuts sharing a new seam id,
+which is what pairs a glue tab with its partner.
 
 **In the UV editor, `edge.select` is the wrong selection.** UV selection lives
 per loop and, with UV Sync Selection off, is entirely separate from the mesh

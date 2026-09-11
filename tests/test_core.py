@@ -18,7 +18,7 @@ from cardboard_unfolder import Material, PolyMesh
 from cardboard_unfolder import mesh as mesh_mod
 from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs,
                                        search, min_rect_size, min_area_rect, fits,
-                                       split_to_fit)
+                                       split_to_fit, split_island)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, kerf_compensate)
 from cardboard_unfolder.tabs import place_tabs
@@ -192,6 +192,56 @@ def test_split_to_fit_respects_the_bed(name, tm):
     for isl in islands:
         pts = np.vstack(list(isl.faces.values()))
         assert fits(pts, *limit), f"island {isl.id} exceeds the bed"
+
+
+def test_split_island_detaches_exactly_one_piece():
+    """Cutting a fold must hand back the two halves and nothing else.
+
+    Conserving faces and area is the point: this is a local edit, so anything
+    that vanished or got duplicated would be a part you cannot cut or one you
+    cut twice.
+    """
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(280)
+    islands, _ = unfold(pm, trials=40)
+    isl = max(islands, key=lambda i: len(i.faces))
+    fold = isl.folds[len(isl.folds) // 2]
+
+    out = split_island(isl, fold.f0, fold.f1, new_id=999, new_seam=777)
+    assert out is not None
+    a, b = out
+    assert set(a.faces) | set(b.faces) == set(isl.faces), "faces must be conserved"
+    assert not (set(a.faces) & set(b.faces)), "a face cannot land in both halves"
+    assert len(a.faces) and len(b.faces), "both halves must be non-empty"
+    assert a.area() + b.area() == pytest.approx(isl.area(), rel=1e-12)
+    assert len(a.folds) + len(b.folds) == len(isl.folds) - 1, "one fold is spent"
+
+    # the spent fold becomes a matching pair of cuts, which is what pairs tabs
+    seams_a = [c.seam for c in a.cuts if c.seam == 777]
+    seams_b = [c.seam for c in b.cuts if c.seam == 777]
+    assert len(seams_a) == 1 and len(seams_b) == 1
+
+    # each half is still one connected run of faces you can fold
+    for half in (a, b):
+        g = nx.Graph()
+        g.add_nodes_from(half.faces)
+        for fo in half.folds:
+            g.add_edge(fo.f0, fo.f1)
+        assert nx.number_connected_components(g) == 1, "a half came out in pieces"
+
+
+def test_split_island_refuses_an_edge_that_is_not_a_fold():
+    """Two faces can be neighbours in 3D and already cut apart in the net."""
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(280)
+    islands, _ = unfold(pm, trials=40)
+    isl = max(islands, key=lambda i: len(i.faces))
+    folded = {frozenset((f.f0, f.f1)) for f in isl.folds}
+    pairs = [(a, b) for a in isl.faces for b in isl.faces
+             if a < b and frozenset((a, b)) not in folded]
+    assert pairs, "expected some face pair that is not a fold"
+    a, b = pairs[0]
+    assert split_island(isl, a, b, new_id=999, new_seam=777) is None
 
 
 @pytest.mark.parametrize("name,tm", ALL, ids=IDS)
