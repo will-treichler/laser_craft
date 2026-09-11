@@ -378,6 +378,21 @@ on the code objects - `the draw handler does not sample live UVs`,
 the vec3 one: if the failure kills the process, test the data or the code, not
 the behaviour.
 
+**UV Sync Selection tears the net, and it defaults ON in Blender 5.x.** In
+that mode the UV editor moves the loops of *selected faces* rather than whole
+islands, so dragging pulls single faces out of the net and scatters them -
+which looks exactly like the net corrupting itself. Each face stays internally
+rigid (its own edges are still exact), it has simply left its neighbours. The
+UV panel warns and offers the toggle when sync is on.
+
+**Measure a net against `pm.vertices`, not against a recomputed world
+transform.** Chasing that apparent corruption, a diagnostic that rebuilt world
+coordinates as `co @ matrix_world + t` disagreed with `pm.vertices` by 0.63 mm
+on an object with unapplied non-uniform scale, and reported 28 of 72 edges
+"torn" with a worst case of 1.21 mm. The net was exact - 0.0000 mm against the
+geometry the unfolder actually used. Compare against the same array the writer
+consumed, or the measurement invents the defect it is looking for.
+
 **Blender UVs are float32.** The net UV layer is a *view*; export comes from
 the core's float64 geometry. ~9e-5 mm error at 500 mm coordinates — 90 nm
 against a 0.3 mm kerf.

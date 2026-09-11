@@ -241,6 +241,20 @@ class CBU_PT_uv(bpy.types.Panel):
         row.prop(s, "show_bed")
         row.prop(s, "show_cut")
 
+        # UV Sync Selection defaults ON in Blender 5.x, and in that mode the UV
+        # editor moves the loops of *selected faces* rather than whole islands.
+        # Dragging then pulls single faces out of the net and scatters them,
+        # which reads as the net corrupting itself.
+        ts = context.scene.tool_settings
+        if ts.use_uv_select_sync:
+            box = lay.box()
+            box.alert = True
+            box.label(text="UV Sync is on", icon="ERROR")
+            box.label(text="Dragging moves selected faces,")
+            box.label(text="not whole islands - it will pull")
+            box.label(text="the net apart. Turn it off:")
+            box.prop(ts, "use_uv_select_sync", text="UV Sync Selection")
+
         box = lay.box()
         box.label(text="Selected edge", icon="EDGESEL")
         if context.mode != "EDIT_MESH":
