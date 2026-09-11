@@ -288,6 +288,44 @@ _v2, _ = overlay.bed_segments((0.0, 0.0, 1e9, 1e9), 600.0, 400.0, 8.0)
 check(len(_v2) // 16 <= overlay.MAX_TILES,
       f"a runaway net is capped at {overlay.MAX_TILES} tiles")
 
+# ------------------------------------------------ the cut outline in 2D
+# The UV layer holds only the islands. Glue tabs are generated in the core and
+# live solely in the exported parts, so a 2D view drawn from UVs alone is
+# smaller than what the laser follows - and anyone arranging islands by eye is
+# optimising the wrong shape.
+obj = fresh("CutView", "ico_sphere", subdivisions=2)
+obj.scale = (0.14,) * 3
+bpy.ops.object.transform_apply(scale=True)
+bpy.ops.cbu.unfold()
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+_rings = overlay._net_cuts.get(obj.name)
+check(bool(_rings), "unfold publishes the cut outline to the 2D view")
+
+_mat = props.material_from(bpy.context.scene.cbu)
+_sc = bridge.uv_scale(*_mat.bed)
+_cut = np.vstack(_rings)
+_d = np.zeros(len(obj.data.loops) * 2)
+obj.data.uv_layers[bridge.UV_LAYER].data.foreach_get("uv", _d)
+_net = _d.reshape(-1, 2) / _sc
+check(_cut[:, 0].max() >= _net[:, 0].max() - 1e-6
+      and _cut[:, 1].max() >= _net[:, 1].max() - 1e-6,
+      "the cut outline reaches past the islands - that is the tabs")
+
+# vec3 or Blender dies on the draw, and this cannot be caught at draw time
+_v, _c = overlay.cut_segments(_rings, _sc)
+check(_v and all(len(q) == 3 for q in _v), "cut vertices are vec3")
+check(len(_v) == len(_c) and all(len(q) == 4 for q in _c), "cut colours are RGBA")
+check(all(q[2] == 0.0 for q in _v), "the cut outline is flat in z")
+
+# it has to go stale with everything else, or it paints a net that has moved
+obj.data.vertices[0].co.x += 0.02
+obj.data.update()
+cbu_blender._on_depsgraph(bpy.context.scene, bpy.context.evaluated_depsgraph_get())
+check(obj.name not in overlay._net_cuts,
+      "the cut outline is dropped when the mesh changes")
+
 # ------------------------------------------------ bed-aware UV nesting
 obj = fresh("Nest", "ico_sphere", subdivisions=3)
 obj.scale = (0.14,) * 3

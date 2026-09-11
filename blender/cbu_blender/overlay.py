@@ -20,6 +20,7 @@ _handle = None
 _uv_handle = None
 _batches = {}          # object name -> dict of batches
 _net_bounds = {}       # object name -> (x0, y0, x1, y1) of the net, in mm
+_net_cuts = {}         # object name -> list of rings, net-space mm
 _fingerprints = {}     # object name -> geometry fingerprint at unfold time
 _bed_cache = {}        # draw key -> batch, so the grid is not rebuilt per frame
 _TRI = None
@@ -141,6 +142,22 @@ def rebuild(obj, pm, islands, alpha: float = 0.55) -> None:
     _tag_redraw()
 
 
+def set_net_cuts(name: str, rings) -> None:
+    """Remember the real cut outlines so the 2D view can show what is cut.
+
+    The UV layer only ever holds the islands. Glue tabs are generated in the
+    core and exist solely in the exported parts, so a net drawn from UVs alone
+    is about 20% smaller than the thing the laser follows - and anyone
+    arranging islands by eye is optimising the wrong shape.
+    """
+    if rings:
+        _net_cuts[name] = [np.asarray(r, dtype=np.float64) for r in rings]
+    else:
+        _net_cuts.pop(name, None)
+    _bed_cache.clear()
+    _tag_redraw()
+
+
 def set_net_bounds(name: str, bounds) -> None:
     """Remember the net's extent so the bed reference knows how far to tile."""
     if bounds is None:
@@ -155,10 +172,12 @@ def clear(name: str | None = None) -> None:
     if name is None:
         _batches.clear()
         _net_bounds.clear()
+        _net_cuts.clear()
         _fingerprints.clear()
     else:
         _batches.pop(name, None)
         _net_bounds.pop(name, None)
+        _net_cuts.pop(name, None)
         _fingerprints.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
@@ -209,6 +228,7 @@ def _draw():
 # ------------------------------------------------- laser bed, in the UV editor
 
 SHEET_RGBA = (0.95, 0.62, 0.15, 0.85)      # sheet outline
+CUT_RGBA = (0.20, 0.85, 0.45, 0.95)        # what the laser actually follows
 USABLE_RGBA = (0.95, 0.62, 0.15, 0.32)     # usable area inside the margins
 MAX_TILES = 400                            # a runaway net must not stall drawing
 
@@ -252,6 +272,38 @@ def bed_segments(bounds, bed_w, bed_h, margin):
                      ox + bed_w - margin, oy + bed_h - margin, USABLE_RGBA)
 
     return verts, cols_rgba
+
+
+def cut_segments(rings, scale: float):
+    """Closed outlines as line segments, in UV units. (verts, colours)."""
+    verts, cols = [], []
+    for ring in rings:
+        n = len(ring)
+        if n < 2:
+            continue
+        for i in range(n):
+            a = ring[i] * scale
+            b = ring[(i + 1) % n] * scale
+            verts.append((float(a[0]), float(a[1]), 0.0))
+            verts.append((float(b[0]), float(b[1]), 0.0))
+            cols.append(CUT_RGBA)
+            cols.append(CUT_RGBA)
+    return verts, cols
+
+
+def _cut_batch(name: str, scale: float):
+    key = ("cuts", name, scale)
+    if key not in _bed_cache:
+        rings = _net_cuts.get(name)
+        line_s = _shaders()[1]
+        if not rings or line_s is None:
+            _bed_cache[key] = None
+        else:
+            verts, cols = cut_segments(rings, scale)
+            _bed_cache[key] = (batch_for_shader(line_s, "LINES",
+                                                {"pos": verts, "color": cols})
+                               if verts else None)
+    return _bed_cache[key]
 
 
 def _bed_batch(bounds, bed_w, bed_h, margin):
@@ -309,6 +361,11 @@ def _draw_bed():
         except Exception:                               # noqa: BLE001
             pass                                        # plain FLAT_COLOR fallback
         batch.draw(line_s)
+
+        if s.show_cut:
+            cuts = _cut_batch(obj.name, sc)
+            if cuts is not None:
+                cuts.draw(line_s)
     finally:
         gpu.state.blend_set("NONE")
 
@@ -337,5 +394,6 @@ def unregister():
         _uv_handle = None
     _batches.clear()
     _net_bounds.clear()
+    _net_cuts.clear()
     _fingerprints.clear()
     _bed_cache.clear()

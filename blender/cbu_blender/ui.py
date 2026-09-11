@@ -213,7 +213,9 @@ class CBU_PT_uv(bpy.types.Panel):
         mm = 1.0 / bridge.uv_scale(s.bed_x, s.bed_y)
         lay.label(text=f'UV layer "{bridge.UV_LAYER}" is the net')
         lay.label(text=f"1 UV unit = {mm:.0f} mm  (bed {s.bed_x:.0f}x{s.bed_y:.0f})")
-        lay.prop(s, "show_bed")
+        row = lay.row(align=True)
+        row.prop(s, "show_bed")
+        row.prop(s, "show_cut")
 
         box = lay.box()
         box.label(text="Selected edge", icon="EDGESEL")

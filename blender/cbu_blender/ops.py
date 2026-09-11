@@ -58,6 +58,30 @@ def selected_edges(context, bm):
     return [e for e in bm.edges if e.select]
 
 
+def publish_cuts(obj, parts, mat):
+    """Hand the real cut outlines to the 2D overlay, in net-space mm.
+
+    The UV layer only holds the islands; glue tabs are generated in the core
+    and live solely in the exported parts. A 2D view drawn from UVs alone is
+    therefore about 20% smaller than what the laser follows, so anyone
+    arranging islands by eye is optimising the wrong shape. Part geometry is
+    in sheet space, so each ring is lifted by its sheet band to match the net.
+    """
+    rings = []
+    for part in parts:
+        g = part.cut
+        if g is None or g.is_empty:
+            continue
+        polys = list(g.geoms) if g.geom_type == "MultiPolygon" else [g]
+        lift = max(part.sheet, 0) * mat.bed[1]
+        for poly in polys:
+            for ring in [poly.exterior] + list(poly.interiors):
+                pts = np.asarray(ring.coords)
+                if len(pts) > 2:
+                    rings.append(pts[:-1] + (0.0, lift))
+    overlay.set_net_cuts(obj.name, rings)
+
+
 class CBU_OT_mark(bpy.types.Operator):
     bl_idname = "cbu.mark"
     bl_label = "Mark Edges"
@@ -268,6 +292,7 @@ class CBU_OT_unfold(bpy.types.Operator):
                                     placement={p.island_id: p for p in parts},
                                     sheet_height=mat.bed[1])
                 overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+                publish_cuts(obj, parts, mat)
 
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             with cbulog.stage(T, "overlay"):
@@ -402,6 +427,7 @@ class CBU_OT_edit_seam(bpy.types.Operator):
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             overlay.rebuild(obj, pm, islands, s.overlay_alpha)
             overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+            publish_cuts(obj, parts, mat)
         except Exception as exc:                        # noqa: BLE001
             traceback.print_exc()
             self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
@@ -452,6 +478,7 @@ class CBU_OT_repack(bpy.types.Operator):
                                 sheet_height=mat.bed[1])
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+            publish_cuts(obj, parts, mat)
         except Exception as exc:                       # noqa: BLE001
             traceback.print_exc()
             self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
@@ -546,6 +573,7 @@ class CBU_OT_pack_uv(bpy.types.Operator):
                             sheet_height=mat.bed[1])
         _LAST[obj.name] = (pm, islands, parts, sheets, rep)
         overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+        publish_cuts(obj, parts, mat)
         s.last_sheets = sheets
         if prev == "EDIT_MESH":
             bpy.ops.object.mode_set(mode="EDIT")

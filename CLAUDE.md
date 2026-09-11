@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 105 checks, real Blender API
+python blender/test_addon.py            # 111 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -274,6 +274,31 @@ BMesh, so reading or writing the mesh datablock there silently does nothing -
 drops to Object Mode and restores; any new code touching mesh data must do the
 same, and any *diagnostic* must too or it will report a perfectly good net as
 missing.
+
+**The UV net is the islands; the cut is the parts.** Glue tabs are generated
+in the core and exist only in the exported parts - there is no mesh geometry
+for them - so a 2D view drawn from UVs alone is smaller than what the laser
+follows. Measured on a real design: islands 51.1% of a sheet, parts 62.1%,
+**tabs and kerf add 21% on top**, and the two largest islands stack in 278 mm
+bare but 289.6 mm with tabs against a 284 mm bed. Someone arranging islands by
+eye is optimising the wrong shape and will conclude the packer is broken.
+`overlay.cut_segments` therefore draws the real outline over the net
+(`show_cut`), fed by `ops.publish_cuts` from every path that produces parts.
+
+That also reframes packing. Before blaming the nester, check what is being
+nested: no algorithm recovers 6 mm that the tabs put there. `tab_depth`
+defaults to 12 mm, which is a lot of flap on a 100-200 mm part - at 8 mm the
+same design becomes geometrically stackable. The deeper fix is to grow tabs
+into the gaps *after* nesting rather than baking them into the outline before
+it, which takes a fifth of the area out of the packing problem entirely.
+
+For the record on packing skill, measured on that design (4 parts, 64% of one
+bed): Blender's `pack_islands` reaches 318 x 319 against a 284 x 284 bed;
+raster bottom-left with 24 rotations x all 24 orders fails; 4000 randomised
+restarts with escape jitter fails. Greedy bottom-left plateaus regardless of
+how finely it is swept - past it needs raster occupancy with FFT collision
+(fast: ~40 ms a query) driving annealing over sequence and orientation, not a
+finer sweep.
 
 **Nest the parts, not the island UVs.** `cbu.pack_uv` builds a throwaway
 mesh with one flat face per `Part` outline, packs *that* with Blender's

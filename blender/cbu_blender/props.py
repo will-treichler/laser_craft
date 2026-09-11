@@ -98,6 +98,12 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "Off re-runs the solver, which may reattach that piece "
                      "to a different island instead"))
 
+    show_cut: BoolProperty(
+        name="Show cut outline", default=True,
+        description=("Draw what the laser actually follows - the islands plus "
+                     "their glue tabs and kerf. The UV net alone shows only "
+                     "the islands, which is about 20% smaller"))
+
     show_overlay: BoolProperty(name="Show islands", default=True)
     show_bed: BoolProperty(
         name="Show bed", default=True,
