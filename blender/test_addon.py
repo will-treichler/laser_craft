@@ -35,7 +35,7 @@ print("blender", bpy.app.version_string)
 
 # ---------------------------------------------------------------- register
 import cbu_blender
-from cbu_blender import bridge, ops, overlay, props
+from cbu_blender import bridge, dev, ops, overlay, props
 
 cbu_blender.register()
 check(hasattr(bpy.types.Scene, "cbu"), "settings registered on Scene")
@@ -73,7 +73,16 @@ uv = obj.data.uv_layers[bridge.UV_LAYER]
 arr = np.zeros(len(obj.data.loops) * 2)
 uv.data.foreach_get("uv", arr)
 arr = arr.reshape(-1, 2)
-check(arr.max() > 100.0, f"UVs are in mm, not 0-1 (max {arr.max():.1f})")
+# The net is not normalised per model - it is millimetres scaled by a single
+# power of two derived from the bed, so the same object at the same bed
+# settings always lands at the same size and two models stay comparable.
+# Normalising each net to 0-1 would destroy that.
+_sc = bridge.uv_scale(bpy.context.scene.cbu.bed_x, bpy.context.scene.cbu.bed_y)
+_mm = arr.max() / _sc
+check(_mm > 100.0, f"UVs carry real size, not a normalised 0-1 fit ({_mm:.0f} mm)")
+check(abs(_sc - bridge.uv_scale(bpy.context.scene.cbu.bed_x,
+                                bpy.context.scene.cbu.bed_y)) < 1e-18,
+      "the scale depends only on the bed, not on the model")
 
 
 def uv_edge_lengths(mesh, layer):
@@ -88,7 +97,17 @@ def uv_edge_lengths(mesh, layer):
             v1 = np.array(mesh.vertices[
                 mesh.loops[li[(i + 1) % len(li)]].vertex_index].co)
             out.append((np.linalg.norm(b - a), np.linalg.norm(v1 - v0) * 1000.0))
-    return np.array(out)
+    out = np.array(out)
+    # The net is stored scaled so it fits the UV editor's unit square; undo
+    # that here so both columns are millimetres and the comparison is a true
+    # isometry check rather than a similarity one.
+    out[:, 0] /= uv_mm_scale()
+    return out
+
+
+def uv_mm_scale():
+    s = bpy.context.scene.cbu
+    return bridge.uv_scale(s.bed_x, s.bed_y)
 
 
 # Blender stores UVs as float32 (measured: coordinates round-trip at ~3e-8
@@ -202,6 +221,218 @@ bpy.context.scene.cbu.merge_coplanar = False
 bpy.context.scene.cbu.trials = 40
 r = bpy.ops.cbu.unfold()
 check(r == {"FINISHED"}, "unfold works on native n-gons with merging off")
+
+# ------------------------------------------------ net layout and bed reference
+# The net UV layer is written in millimetres, so it is enormous next to the
+# editor's 0-1 grid. It used to be laid out as one horizontal strip, which made
+# it impossible to frame: a 6-island cube net ran 12650 x 2000 mm. Rows must
+# wrap instead, so the net stays roughly as wide as a sheet.
+obj = fresh("Rows", "ico_sphere", subdivisions=2)
+obj.scale = (0.14, 0.14, 0.14)
+bpy.ops.object.transform_apply(scale=True)
+bpy.context.scene.cbu.merge_coplanar = True
+bpy.ops.cbu.unfold()
+
+import numpy as _np
+_d = _np.zeros(len(obj.data.loops) * 2)
+obj.data.uv_layers[bridge.UV_LAYER].data.foreach_get("uv", _d)
+_d = _d.reshape(-1, 2)
+_w, _h = (_d.max(0) - _d.min(0)) / uv_mm_scale()        # back to mm
+_row = bpy.context.scene.cbu.bed_x - 2 * bpy.context.scene.cbu.margin
+check(_w <= _row + 1e-6,
+      f"net is no wider than one usable sheet ({_w:.0f} <= {_row:.0f} mm)")
+check(max(_w, _h) / max(min(_w, _h), 1e-9) < 8.0,
+      f"net is a block, not a strip (aspect {max(_w,_h)/max(min(_w,_h),1e-9):.1f})")
+
+_b = bridge.net_bounds(obj.data)
+check(_b is not None and abs((_b[2] - _b[0]) / uv_mm_scale() - _w) < 1e-6,
+      "net_bounds agrees with the UV layer")
+
+# the whole point of the exercise: a sheet has to fit the editor's unit square
+_sc = uv_mm_scale()
+_bx, _by = bpy.context.scene.cbu.bed_x, bpy.context.scene.cbu.bed_y
+check(_bx * _sc <= 1.0 and _by * _sc <= 1.0,
+      f"a sheet fits the 1x1 UV grid ({_bx*_sc:.3f} x {_by*_sc:.3f})")
+check(_bx * _sc > 0.5 or _by * _sc > 0.5,
+      "and is not needlessly tiny inside it")
+_inv = 1.0 / _sc
+check(_inv == int(_inv) and (int(_inv) & (int(_inv) - 1)) == 0,
+      f"the scale is a power of two (1/{_inv:.0f})")
+# a power of two is exact in binary floating point, so scaling must not
+# perturb a single mantissa bit - that is the reason for choosing one
+_probe = np.array([123.456789012345, 0.1, 40.0, 1e-7])
+check(np.all(_probe * _sc / _sc == _probe),
+      "scaling by it round-trips bit for bit")
+check(overlay.NET_UV == bridge.UV_LAYER,
+      "overlay's net layer name tracks bridge.UV_LAYER")
+
+# the bed reference tiles the net at true size
+_v, _c = overlay.bed_segments((0.0, 0.0, 1200.0, 800.0), 600.0, 400.0, 8.0)
+check(len(_v) == 4 * 16, f"2x2 sheets -> 4 tiles of 8 segments (got {len(_v)//16})")
+check(len(_v) == len(_c), "every bed vertex carries a colour")
+# Regression: these were 2-tuples once. The builtin shaders declare `pos` as
+# vec3, and batch_for_shader given 2-component data is a buffer format
+# mismatch that crashes Blender outright instead of raising - so it cannot be
+# caught at draw time and has to be asserted on the data.
+check(all(len(v) == 3 for v in _v),
+      "bed vertices are vec3, as the builtin shaders require")
+check(all(len(c) == 4 for c in _c), "bed colours are RGBA")
+check(all(v[2] == 0.0 for v in _v), "bed is flat in z")
+_xs = [v[0] for v in _v]
+check(abs(max(_xs) - 1200.0) < 1e-6, "bed grid spans the net, in mm")
+check(overlay.bed_segments((0, 0, 100, 100), 0.0, 400.0, 8.0) == ([], []),
+      "a zero-width bed draws nothing instead of dividing by zero")
+_v2, _ = overlay.bed_segments((0.0, 0.0, 1e9, 1e9), 600.0, 400.0, 8.0)
+check(len(_v2) // 16 <= overlay.MAX_TILES,
+      f"a runaway net is capped at {overlay.MAX_TILES} tiles")
+
+# ------------------------------------------------ non-planar faces
+# A bent quad has no flat image at all, so it must be triangulated in the MESH.
+# Splitting it core-side instead leaves one Blender polygon claimed by two core
+# faces with two different placements; write_net_uv writes the whole polygon
+# through source_faces, the second write wins, and the quad tears away from its
+# neighbours by up to 11 mm. source_faces must stay a 1:1 partition.
+obj = fresh("Bent", "plane")
+bpy.ops.object.mode_set(mode="OBJECT")
+obj.data.vertices[0].co.z += 0.35          # pull one corner out of plane
+_pm = bridge.polymesh_from_object(obj, merge_coplanar=True)
+check(_pm.planarity().max() > 1e-3, "the test face really is non-planar")
+_claims = [s for grp in _pm.source_faces for s in grp]
+check(len(_claims) == len(set(_claims)),
+      "source_faces is a 1:1 partition of the caller's polygons")
+
+_before = len(obj.data.polygons)
+check(bpy.ops.cbu.split_nonplanar() == {"FINISHED"}, "split operator runs")
+check(len(obj.data.polygons) > _before,
+      f"the bent face was triangulated ({_before} -> {len(obj.data.polygons)})")
+_pm2 = bridge.polymesh_from_object(obj, merge_coplanar=True)
+check(_pm2.planarity().max() <= 1e-3, "nothing bent survives the split")
+
+# a flat mesh must be left completely alone - no fold line down every panel
+obj = fresh("Flat", "cube")
+_n = len(obj.data.polygons)
+bpy.ops.cbu.split_nonplanar()
+check(len(obj.data.polygons) == _n,
+      f"a flat mesh is untouched ({_n} -> {len(obj.data.polygons)})")
+
+# ------------------------------------------------ UV islands match the core
+# Blender decides UV island membership by whether the loops across an edge
+# carry the SAME uv, compared as float32. Two faces of one island reach a
+# shared corner down different tree paths and land a few ulps apart, so a
+# 6e-14 mm disagreement used to read as a seam - and pack_islands then walked
+# the halves off in different directions. A two-piece net arrived as six.
+def _uv_island_count(mesh):
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    lay = bm.loops.layers.uv[bridge.UV_LAYER]
+    par = {f.index: f.index for f in bm.faces}
+
+    def find(a):
+        while par[a] != a:
+            par[a] = par[par[a]]
+            a = par[a]
+        return a
+
+    hairline = 0
+    for e in bm.edges:
+        if len(e.link_faces) != 2:
+            continue
+        f1, f2 = e.link_faces
+
+        def corners(f):
+            return {l.vert.index: np.array(l[lay].uv[:], dtype=np.float32)
+                    for l in f.loops if l.vert in e.verts}
+
+        a, b = corners(f1), corners(f2)
+        if set(a) != set(b):
+            continue
+        if all(np.array_equal(a[k], b[k]) for k in a):
+            ra, rb = find(f1.index), find(f2.index)
+            if ra != rb:
+                par[ra] = rb
+        elif max(float(np.abs(a[k] - b[k]).max()) for k in a) < 1e-5:
+            hairline += 1          # same corner, disagreeing in the last bits
+    n = len({find(f.index) for f in bm.faces})
+    bm.free()
+    return n, hairline
+
+
+for _prim, _kw in (("ico_sphere", {"subdivisions": 2}), ("torus", {}),
+                   ("cylinder", {"vertices": 16})):
+    obj = fresh(f"UV_{_prim}", _prim, **_kw)
+    obj.scale = (0.14,) * 3
+    bpy.ops.object.transform_apply(scale=True)
+    bpy.ops.cbu.unfold()
+    _core = bpy.context.scene.cbu.last_islands
+    _n, _hair = _uv_island_count(obj.data)
+    check(_hair == 0, f"{_prim}: no corner disagrees in the last bits ({_hair})")
+    check(_n == _core,
+          f"{_prim}: Blender sees the same island count as the core "
+          f"({_n} vs {_core})")
+    bpy.ops.cbu.pack_uv()
+    _n2, _ = _uv_island_count(obj.data)
+    check(_n2 == _core,
+          f"{_prim}: packing does not fragment the net ({_n2} vs {_core})")
+
+# ------------------------------------------ stale overlay after a mesh edit
+obj = fresh("Staleness", "ico_sphere", subdivisions=1)
+obj.scale = (0.14,)*3
+bpy.ops.object.transform_apply(scale=True)
+bpy.ops.cbu.unfold()
+check(obj.name in ops._LAST, "unfold cached a result to export")
+check(obj.name in overlay._fingerprints, "unfold fingerprinted the geometry")
+check(not overlay.geometry_changed(obj), "an untouched mesh reads as unchanged")
+
+# Marking a seam writes an edge attribute. The depsgraph calls that a geometry
+# update, but it must NOT count as modifying the object - otherwise the island
+# colours vanish at the exact moment you are marking against them.
+bpy.ops.object.mode_set(mode="EDIT")
+_bm = bmesh.from_edit_mesh(obj.data)
+_bm.edges.ensure_lookup_table()
+for _e in _bm.edges:
+    _e.select_set(False)
+_bm.edges[0].select_set(True)
+bmesh.update_edit_mesh(obj.data)
+bpy.ops.cbu.mark(mode="CUT")
+bpy.ops.object.mode_set(mode="OBJECT")
+bpy.context.view_layer.update()
+check(not overlay.geometry_changed(obj),
+      "marking a seam does NOT count as modifying the object")
+check(obj.name in ops._LAST, "and does not throw away the cached unfold")
+
+# Moving a vertex does.
+obj.data.vertices[0].co.x += 0.01
+obj.data.update()
+check(overlay.geometry_changed(obj), "moving a vertex counts as modifying it")
+
+# so does adding or removing geometry
+_before = overlay.geometry_fingerprint(obj.data)
+bpy.ops.object.mode_set(mode="EDIT")
+bpy.ops.mesh.select_all(action="SELECT")
+bpy.ops.mesh.subdivide(number_cuts=1)
+bpy.ops.object.mode_set(mode="OBJECT")
+check(overlay.geometry_fingerprint(obj.data) != _before,
+      "subdividing changes the fingerprint")
+
+# and the handler wired to the depsgraph drops both caches
+cbu_blender._on_depsgraph(bpy.context.scene, bpy.context.evaluated_depsgraph_get())
+check(obj.name not in ops._LAST,
+      "the depsgraph handler drops the cached unfold after a real edit")
+check(obj.name not in overlay._fingerprints,
+      "and the overlay annotation with it")
+
+# ------------------------------------------------------- reload operator
+# reload_all() unregisters CBU_OT_reload itself, so the operator must not
+# touch `self` afterwards - that is a use-after-free on a freed RNA type.
+# test_dev.py calls reload_all() directly and so never exercised this path.
+# Assert on the compiled code object, not the source text: a comment
+# mentioning self.report would fool a substring search either way round.
+_names = dev.CBU_OT_reload.execute.__code__.co_names
+check("report" not in _names,
+      f"the reload operator never touches self.report (names: {_names})")
+check("timers" in _names and "register" in _names,
+      "the reload operator defers the reload off its own stack")
+check(bpy.ops.cbu.reload() == {"FINISHED"}, "reload operator returns cleanly")
 
 # -------------------------------------------------------------- teardown
 cbu_blender.unregister()

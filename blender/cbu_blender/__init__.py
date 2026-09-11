@@ -29,6 +29,36 @@ def _on_load(_dummy):
     ops._LAST.clear()
 
 
+@persistent
+def _on_depsgraph(scene, depsgraph):
+    """Drop the island colours once the mesh they describe actually changes.
+
+    The batches hold vertex positions copied at unfold time, so after an edit
+    they paint islands over geometry that has moved. The cached unfold goes
+    with them - `ops._LAST` is what Export writes, and exporting it after an
+    edit would cut a net that no longer matches the object. Same pairing as
+    `_on_load` below.
+
+    The depsgraph reports an edge-attribute write as a geometry update too, so
+    marking a seam would trip a naive check and wipe the very colours you are
+    marking against. `overlay.geometry_changed` compares counts and vertex
+    positions instead, which marking does not touch.
+    """
+    tracked = overlay.tracked_names() | set(ops._LAST)
+    if not tracked:
+        return
+    if not any(u.is_updated_geometry for u in depsgraph.updates):
+        return
+    for name in tracked:
+        obj = bpy.data.objects.get(name)
+        if obj is None or obj.type != "MESH":
+            overlay.clear(name)
+            ops._LAST.pop(name, None)
+        elif overlay.geometry_changed(obj):
+            overlay.clear(name)
+            ops._LAST.pop(name, None)
+
+
 def _reload():
     for m in _MODULES:
         importlib.reload(m)
@@ -43,9 +73,13 @@ def register():
     overlay.register()
     if _on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load)
+    if _on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph)
 
 
 def unregister():
+    if _on_depsgraph in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph)
     if _on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load)
     overlay.unregister()

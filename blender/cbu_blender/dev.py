@@ -101,6 +101,15 @@ def reload_all() -> tuple[bool, str]:
     return True, f"reloaded {n} module(s)"
 
 
+def _deferred_reload():
+    """Run the reload off the operator's stack. Timer callbacks return None to
+    unregister themselves, so this fires exactly once."""
+    ok, msg = reload_all()
+    lg = log.get()
+    (lg.info if ok else lg.error)("reload add-on: %s", msg)
+    return None
+
+
 class CBU_OT_reload(bpy.types.Operator):
     bl_idname = "cbu.reload"
     bl_label = "Reload Add-on"
@@ -108,9 +117,14 @@ class CBU_OT_reload(bpy.types.Operator):
                       "without restarting Blender. Your scene is untouched")
 
     def execute(self, context):
-        ok, msg = reload_all()
-        self.report({"INFO"} if ok else {"ERROR"}, msg)
-        return {"FINISHED"} if ok else {"CANCELLED"}
+        # reload_all() unregisters every class in the add-on - including this
+        # operator's own. Anything touching `self` after that dereferences a
+        # freed RNA type and segfaults Blender; self.report() did exactly
+        # that, and because report() also tags the UI for redraw it ran the
+        # freshly re-registered draw handlers at the same moment. Defer the
+        # whole reload so the operator has finished before any of it happens.
+        bpy.app.timers.register(_deferred_reload, first_interval=0.0)
+        return {"FINISHED"}
 
 
 class CBU_OT_debugpy(bpy.types.Operator):

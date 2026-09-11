@@ -40,6 +40,10 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         col = lay.column(align=True)
         col.scale_y = 1.4
         col.operator("cbu.unfold", icon="MOD_UVPROJECT")
+        # A bent face has no flat image, so it has to be triangulated in the
+        # mesh - the core cannot paper over it. Offered next to Unfold because
+        # that is where the warning about it appears.
+        lay.operator("cbu.split_nonplanar", icon="MOD_TRIANGULATE")
 
         if s.last_report:
             box = lay.box()
@@ -132,6 +136,7 @@ class CBU_PT_solver(_Base, bpy.types.Panel):
         lay.separator()
         lay.prop(s, "show_overlay")
         lay.prop(s, "overlay_alpha")
+        lay.prop(s, "show_bed")
         lay.separator()
         lay.prop(s, "out_dir")
         lay.prop(s, "write_dxf")
@@ -179,6 +184,10 @@ class CBU_PT_debug(_Base, bpy.types.Panel):
         box.label(text="macOS/Linux: launch Blender from a terminal")
 
 
+def s_cbu(context):
+    return context.scene.cbu
+
+
 class CBU_PT_uv(bpy.types.Panel):
     """The net lives in a UV layer, so the UV editor is the 2D view."""
     bl_space_type = "IMAGE_EDITOR"
@@ -200,7 +209,11 @@ class CBU_PT_uv(bpy.types.Panel):
             lay.label(text="Nothing unfolded yet", icon="INFO")
             lay.operator("cbu.unfold", icon="MOD_UVPROJECT")
             return
-        lay.label(text=f'UV layer "{bridge.UV_LAYER}" is the net, in mm')
+        s = s_cbu(context)
+        mm = 1.0 / bridge.uv_scale(s.bed_x, s.bed_y)
+        lay.label(text=f'UV layer "{bridge.UV_LAYER}" is the net')
+        lay.label(text=f"1 UV unit = {mm:.0f} mm  (bed {s.bed_x:.0f}x{s.bed_y:.0f})")
+        lay.prop(s, "show_bed")
         lay.operator("cbu.pack_uv", icon="UV_ISLANDSEL")
         lay.operator("cbu.export", icon="EXPORT")
         box = lay.box()

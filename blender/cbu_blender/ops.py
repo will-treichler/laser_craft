@@ -78,6 +78,52 @@ class CBU_OT_mark(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CBU_OT_split_nonplanar(bpy.types.Operator):
+    bl_idname = "cbu.split_nonplanar"
+    bl_label = "Split Non-Planar Faces"
+    bl_description = ("Triangulate only the faces too bent to unfold flat. "
+                      "Flat faces are left alone, so no panel gains a fold "
+                      "line down its diagonal")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH"
+
+    def execute(self, context):
+        obj = context.active_object
+        me = obj.data
+        from .vendor.cardboard_unfolder.mesh import ring_planarity
+
+        co = np.empty(len(me.vertices) * 3, dtype=np.float64)
+        me.vertices.foreach_get("co", co)
+        co = co.reshape(-1, 3)
+        bad = [p.index for p in me.polygons
+               if len(p.vertices) > 3
+               and ring_planarity(co, list(p.vertices)) > PLANAR_TOL]
+        if not bad:
+            self.report({"INFO"}, "every face is already flat enough")
+            return {"CANCELLED"}
+
+        prev = context.mode
+        if prev != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        for p in me.polygons:
+            p.select = False
+        for i in bad:
+            me.polygons[i].select = True
+        bpy.ops.object.mode_set(mode="EDIT")
+        context.tool_settings.mesh_select_mode = (False, False, True)
+        bpy.ops.mesh.quads_convert_to_tris(quad_method="BEAUTY",
+                                           ngon_method="BEAUTY")
+        bpy.ops.object.mode_set(mode="OBJECT")
+        if prev == "EDIT_MESH":
+            bpy.ops.object.mode_set(mode="EDIT")
+        self.report({"INFO"}, f"split {len(bad)} non-planar face(s)")
+        return {"FINISHED"}
+
+
 class CBU_OT_clear_marks(bpy.types.Operator):
     bl_idname = "cbu.clear_marks"
     bl_label = "Clear All Marks"
@@ -197,7 +243,15 @@ class CBU_OT_unfold(bpy.types.Operator):
                 sheets, oversized = L.pack(parts, mat)
             with cbulog.stage(T, "write mesh"):
                 bridge.write_islands(obj.data, pm, islands)
-                bridge.write_net_uv(obj.data, pm, islands)
+                # rows one usable-sheet wide, so the preview lines up with the
+                # bed reference drawn underneath it
+                # lay the net out exactly where packing put it, so the bed
+                # reference under it is the truth and not a decoration
+                bridge.write_net_uv(obj.data, pm, islands,
+                                    scale=bridge.uv_scale(*mat.bed),
+                                    placement={p.island_id: p for p in parts},
+                                    sheet_height=mat.bed[1])
+                overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
 
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             with cbulog.stage(T, "overlay"):
@@ -287,7 +341,9 @@ class CBU_OT_pack_uv(bpy.types.Operator):
                 rotate_method="CARDINAL",       # 90 degree steps only
                 scale=False,                    # never rescale: isometry
                 margin_method="ADD",
-                margin=context.scene.cbu.part_gap,
+                # UV units, not mm: scale it the same way the net was
+                margin=context.scene.cbu.part_gap * bridge.uv_scale(
+                    context.scene.cbu.bed_x, context.scene.cbu.bed_y),
                 shape_method="CONCAVE")
         except (RuntimeError, TypeError) as exc:
             self.report({"WARNING"}, f"pack_islands: {exc}")
@@ -298,8 +354,10 @@ class CBU_OT_pack_uv(bpy.types.Operator):
         return {"FINISHED"}
 
 
+PLANAR_TOL = 1e-3      # same gate PolyMesh.check uses
+
 classes = (CBU_OT_mark, CBU_OT_clear_marks, CBU_OT_select_marked,
-           CBU_OT_unfold, CBU_OT_export, CBU_OT_pack_uv)
+           CBU_OT_split_nonplanar, CBU_OT_unfold, CBU_OT_export, CBU_OT_pack_uv)
 
 
 def register():

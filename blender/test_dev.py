@@ -41,14 +41,17 @@ check(bpy.ops.cbu.selftest() == {"FINISHED"}, "self-test operator passes")
 
 # ------------------------------------------------------- reload picks up edits
 target = ROOT / "cbu_blender" / "vendor" / "cardboard_unfolder" / "material.py"
-original = target.read_text()
+# Bytes, not text: read_text/write_text round-trip through os.linesep, so on
+# Windows the restore in the finally block would rewrite every LF as CRLF and
+# leave the vendored file permanently dirty in git.
+original = target.read_bytes()
 try:
     from cbu_blender.vendor.cardboard_unfolder.material import Material
     before = Material().crush
     check(abs(before - 0.75) < 1e-9, f"crush default starts at 0.75 (got {before})")
 
-    target.write_text(original.replace("crush: float = 0.75",
-                                       "crush: float = 0.61"))
+    target.write_bytes(original.replace(b"crush: float = 0.75",
+                                        b"crush: float = 0.61"))
     # without a reload the old value must still be live
     from cbu_blender.vendor.cardboard_unfolder.material import Material as M2
     check(abs(M2().crush - 0.75) < 1e-9,
@@ -66,7 +69,7 @@ try:
     check(hasattr(bpy.types.Scene, "cbu"), "settings re-registered after reload")
     check(bpy.ops.cbu.unfold() == {"FINISHED"}, "unfold still works after reload")
 finally:
-    target.write_text(original)
+    target.write_bytes(original)
     dev.reload_all()
 
 mod = sys.modules["cbu_blender.vendor.cardboard_unfolder.material"]

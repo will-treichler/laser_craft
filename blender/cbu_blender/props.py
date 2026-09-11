@@ -92,6 +92,11 @@ class CBUSettings(bpy.types.PropertyGroup):
 
     # --- overlay ---
     show_overlay: BoolProperty(name="Show islands", default=True)
+    show_bed: BoolProperty(
+        name="Show bed", default=True,
+        description="Draw the laser bed, at true size, behind the net in the "
+                    "UV editor. The net is in millimetres, so islands can be "
+                    "read straight against it")
     overlay_alpha: FloatProperty(name="Opacity", default=0.55, min=0.0, max=1.0)
 
     # --- last run, for the panel readout ---
