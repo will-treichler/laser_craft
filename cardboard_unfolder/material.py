@@ -39,17 +39,37 @@ class Material:
     max_relief: float = 12.0        # mm. Above this, warn - the fold is too sharp
                                     # for single-score and wants a double score.
 
+    # --- relief width ---
+    relief_adaptive: bool = True    # width from thickness and bend angle, as derived
+                                    # above. Off uses relief_fixed for every fold,
+                                    # which is what you want when cutting to a
+                                    # known blade width rather than to the model.
+    relief_fixed: float = 3.0       # mm, used when relief_adaptive is off
+
     # --- perforation ---
     perf_cut: float = 1.0           # mm of cut per dash
-    perf_tie: float = 0.6           # mm of uncut tie per dash
+    connect_ratio: float = 0.5      # fraction of the fold line left CONNECTED.
+                                    # 0.5 cuts half the material away; 0.8 leaves a
+                                    # stiff fold, 0.2 an easy one.
+    min_connect: float = 10.0       # mm of material that must survive a fold, total.
+                                    # A short fold given a blanket ratio ends up with
+                                    # almost nothing holding it; this floor is what
+                                    # stops small joints tearing off. EMPIRICAL.
+    round_cut_ends: bool = True     # radius slot ends instead of leaving them square.
+                                    # A square internal corner is a crack starter, and
+                                    # the beam dwells there anyway.
     # Period must stay well under the flute pitch or consecutive flutes get very
-    # different treatment. Enforced in folds.perf_dash().
+    # different treatment. Enforced in folds.perf_segments().
 
     # --- relief slot bridges ---
     bridge_len: float = 6.0         # mm of uncut material holding the hinge
     bridge_every: float = 45.0      # mm between bridge centres
 
     # --- joinery ---
+    use_tabs: bool = False          # Most cardboard goes together with tape or a
+                                    # glued backing strip, and tabs cost ~20% of the
+                                    # sheet in flap area. Off by default for that
+                                    # reason; turn on for a glued assembly.
     tab_depth: float = 12.0         # mm
     tab_inset_deg: float = 35.0     # trapezoid side angle
     tab_min_edge: float = 14.0      # don't tab an edge shorter than this
@@ -66,6 +86,17 @@ class Material:
                                     # part visibly racks, then creases must cross flutes.
 
     label_height: float = 5.0       # mm. Below ~3.5mm the character burns closed.
+
+    @property
+    def perf_tie(self) -> float:
+        """Uncut length per dash, from the connect ratio.
+
+        Expressed as a ratio rather than a length because the useful question
+        is "how much of this fold survives", which is what governs whether it
+        hinges or tears - not how long one tie happens to be.
+        """
+        r = min(max(self.connect_ratio, 0.0), 0.99)
+        return self.perf_cut * r / (1.0 - r) if r > 0.0 else 0.0
 
     @classmethod
     def from_flute(cls, grade: str, **overrides):

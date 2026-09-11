@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 109 core invariants (~25 s)
+python -m pytest tests -q               # 114 core invariants (~30 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -381,6 +381,30 @@ hinge.
 
 Perforation dash period stays under a third of the flute pitch, or consecutive
 flutes get very different treatment.
+
+The fold line is controlled by a *ratio*, not by two lengths: `connect_ratio`
+is the fraction left connected (0.5 cuts half of it away), because the useful
+question is how much of the fold survives - that governs whether it hinges or
+tears - not how long one tie happens to be. `min_connect` (default 10 mm) is
+the floor underneath it: a blanket ratio leaves a short joint with a
+proportionally small and absolutely tiny amount of material, and this is what
+stops small joints tearing off. A fold shorter than the floor is left solid.
+
+That floor must NOT be applied to the remnants between relief bridges. Those
+remnants *are* the bridges - the material the floor exists to protect - and
+they are shorter than it by design; applying it there deleted every dash and
+the PERF layer vanished from the SVG entirely. `perf_segments` takes
+`min_connect=0.0` for that call.
+
+`round_cut_ends` radiuses slot ends, because a square internal corner
+concentrates stress and is where a fold starts to tear. Note shapely draws a
+round cap *beyond* the line end, so `_strip` pulls the ends in by the radius
+first - buffering the full segment turned a 50 mm fold into a 54 mm slot that
+ate into the panels either side.
+
+`use_tabs` is **off by default**. Most cardboard is taped or gets a glued
+backing strip, and the flaps cost about 22% of the sheet in area - measured on
+a real design, part area 39857 mm2 without them against 50233 with.
 
 `docs/spec.html` has the full derivation, the research behind it, and the
 calibration procedure.

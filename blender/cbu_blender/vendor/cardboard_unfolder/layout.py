@@ -106,7 +106,9 @@ def _mls(segs) -> MultiLineString:
 
 def build_parts(islands: list[Island], mat: Material) -> list[Part]:
     """Island -> Part: relief slots subtracted, tabs unioned on, kerf applied."""
-    tabs, skipped = place_tabs(islands, mat)
+    # Tabs are optional: most cardboard is taped or gets a glued backing strip,
+    # and the flaps cost about a fifth of the sheet in area.
+    tabs, skipped = place_tabs(islands, mat) if mat.use_tabs else ({}, set())
     slabels = seam_labels(islands, mat)
     plabels = part_labels(islands, mat)
 

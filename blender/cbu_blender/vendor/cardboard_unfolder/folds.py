@@ -34,17 +34,26 @@ from .unfold import Island, Fold
 
 
 def relief_width(bend: float, mat: Material) -> float:
-    """Opening width for a fold of signed bend angle (radians)."""
+    """Opening width for a fold of signed bend angle (radians).
+
+    Adaptive by default, from the derivation at the top of this module. A fixed
+    width is offered because the derived one is the width the *board* needs,
+    and sometimes you are cutting to a width the *machine* wants instead.
+    """
     a = abs(float(bend))
     if a <= 1e-9:
         return 0.0
+    if not mat.relief_adaptive:
+        return min(float(mat.relief_fixed), mat.max_relief)
     if a >= np.pi - 1e-6:                 # folded flat back on itself
         return mat.max_relief
     return mat.crush * 2.0 * mat.pivot_depth * np.tan(a / 2.0)
 
 
 def perf_segments(a: np.ndarray, b: np.ndarray, mat: Material,
-                  phase: float = 0.0) -> list[tuple[np.ndarray, np.ndarray]]:
+                  phase: float = 0.0,
+                  min_connect: float | None = None
+                  ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Dash a fold line into cut/tie segments, centred so both ends get a tie.
 
     The corrugated-specific constraint: keep the dash period well under the
@@ -57,6 +66,9 @@ def perf_segments(a: np.ndarray, b: np.ndarray, mat: Material,
     L = float(np.linalg.norm(b - a))
     if L < 1e-9:
         return []
+    floor = mat.min_connect if min_connect is None else float(min_connect)
+    if L <= floor:
+        return []                         # too short to cut and still hold
 
     cut, tie = mat.perf_cut, mat.perf_tie
     period = cut + tie
@@ -75,9 +87,24 @@ def perf_segments(a: np.ndarray, b: np.ndarray, mat: Material,
     for _ in range(n):
         s, e = max(0.0, x), min(L, x + cut)
         if e - s > 1e-6:
-            out.append((a + s * d, a + e * d))
+            out.append((s, e))
         x += period
-    return out
+
+    # Hold back min_connect of material overall. The ratio alone is a fraction,
+    # so on a short fold it leaves a proportionally small - and absolutely
+    # tiny - amount holding the joint together.
+    total = sum(e - s for s, e in out)
+    allowed = max(0.0, L - floor)
+    if total > allowed + 1e-9:
+        k = allowed / total if total > 0 else 0.0
+        shrunk = []
+        for s, e in out:
+            c = (s + e) / 2.0
+            half = (e - s) * k / 2.0
+            if half > 1e-6:
+                shrunk.append((c - half, c + half))
+        out = shrunk
+    return [(a + s * d, a + e * d) for s, e in out]
 
 
 @dataclass
@@ -94,9 +121,29 @@ class FoldPlan:
         return self.fold.bend > 0
 
 
-def _strip(a: np.ndarray, b: np.ndarray, width: float) -> Polygon:
-    """Rectangle of given width centred on segment a-b, not overhanging its ends."""
-    return LineString([a, b]).buffer(width / 2.0, cap_style=2, join_style=2)
+def _strip(a: np.ndarray, b: np.ndarray, width: float,
+           round_ends: bool = False) -> Polygon:
+    """Strip of given width centred on segment a-b.
+
+    Square ends by default so a slot does not overhang the fold it relieves.
+    Rounded ends are offered because a square internal corner concentrates
+    stress and is where a fold starts tearing - and the beam dwells there
+    anyway, so the corner is never truly sharp in the board.
+    """
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    r = width / 2.0
+    if not round_ends:
+        return LineString([a, b]).buffer(r, cap_style=2, join_style=2)
+
+    # Pull the ends in by the radius first. A round cap is drawn *beyond* the
+    # line end, so buffering the full segment would push the slot width/2 past
+    # the fold at each end and eat into the panels either side - a 50 mm fold
+    # became a 54 mm slot.
+    L = float(np.linalg.norm(b - a))
+    if L <= 2.0 * r + 1e-9:               # too short to inset: a disc will do
+        return LineString([a, b]).centroid.buffer(min(r, L / 2.0))
+    d = (b - a) / L
+    return LineString([a + d * r, b - d * r]).buffer(r, cap_style=1, join_style=1)
 
 
 def _bridges(a: np.ndarray, b: np.ndarray, width: float, mat: Material) -> Polygon:
@@ -106,6 +153,8 @@ def _bridges(a: np.ndarray, b: np.ndarray, width: float, mat: Material) -> Polyg
     d = (b - a) / L
     n = max(1, int(np.floor(L / mat.bridge_every)))
     blen = min(mat.bridge_len, L / (2 * n + 1))       # never eat the whole fold
+    if n * blen < mat.min_connect:        # the floor that stops small joints tearing
+        blen = min(mat.min_connect / n, L / (2 * n + 1) * 2.0, L * 0.9 / n)
     pieces = []
     for i in range(n):
         c = L * (i + 0.5) / n
@@ -129,7 +178,7 @@ def plan_folds(island: Island, mat: Material) -> list[FoldPlan]:
             plans.append(FoldPlan(f, w, "perf", None, perf_segments(f.a, f.b, mat), warn))
             continue
 
-        strip = _strip(f.a, f.b, w)
+        strip = _strip(f.a, f.b, w, round_ends=mat.round_cut_ends)
         slot = strip.difference(_bridges(f.a, f.b, w, mat))
         if slot.is_empty:
             plans.append(FoldPlan(f, w, "perf", None, perf_segments(f.a, f.b, mat), warn))
@@ -144,7 +193,11 @@ def plan_folds(island: Island, mat: Material) -> list[FoldPlan]:
             if seg.is_empty or seg.length < 1e-6:
                 continue
             cs = np.asarray(seg.coords)
-            perf.extend(perf_segments(cs[0], cs[-1], mat))
+            # No min_connect floor here. These remnants ARE the bridges - the
+            # material the floor exists to protect - and they are shorter than
+            # it by design. Applying it would delete every dash on them, which
+            # is how the PERF layer vanished from the SVG entirely.
+            perf.extend(perf_segments(cs[0], cs[-1], mat, min_connect=0.0))
         plans.append(FoldPlan(f, w, "relief", slot, perf, warn))
     return plans
 

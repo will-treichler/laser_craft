@@ -400,6 +400,69 @@ def test_split_to_fit_splits_a_net_that_sits_off_the_origin():
 
 # ------------------------------------------------------------ fold geometry
 
+def test_tabs_are_optional():
+    """Most cardboard is taped or gets a glued backing strip, and the flaps
+    cost about a fifth of the sheet - so tabs off must mean no tab area."""
+    tm = trimesh.creation.icosphere(subdivisions=1)
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(200)
+    islands, _ = unfold(pm, trials=40)
+
+    off = Material.from_flute("B", use_tabs=False)
+    on = Material.from_flute("B", use_tabs=True)
+    a = sum(p.cut.area for p in build_parts(islands, off))
+    b = sum(p.cut.area for p in build_parts(islands, on))
+    assert b > a * 1.02, f"tabs should add area (off {a:.0f}, on {b:.0f})"
+
+    bare = sum(i.area() for i in islands)
+    assert a <= bare * 1.02, "with tabs off the part is the island plus kerf only"
+
+
+def test_fixed_relief_width_overrides_the_derived_one():
+    """Adaptive width is what the board needs; fixed is what the machine wants."""
+    m = Material.from_flute("B", relief_adaptive=False, relief_fixed=2.5)
+    for deg in (20, 60, 90, 150):
+        assert relief_width(math.radians(deg), m) == pytest.approx(2.5)
+    m.relief_fixed = 999.0
+    assert relief_width(math.radians(90), m) == pytest.approx(m.max_relief),         "a fixed width must still respect max_relief"
+
+
+def test_connect_ratio_sets_how_much_material_survives():
+    """0.5 means half the fold line is left connected."""
+    m = Material.from_flute("B")
+    a, b = np.array([0.0, 0.0]), np.array([200.0, 0.0])
+    for ratio in (0.25, 0.5, 0.75):
+        m.connect_ratio = ratio
+        segs = perf_segments(a, b, m)
+        cut = sum(float(np.linalg.norm(q - p)) for p, q in segs)
+        left = (200.0 - cut) / 200.0
+        assert left == pytest.approx(ratio, abs=0.08),             f"ratio {ratio}: {left:.2f} of the fold survived"
+
+
+def test_short_folds_keep_min_connect_of_material():
+    """A blanket ratio leaves a proportionally small - and absolutely tiny -
+    amount holding a short joint together. The floor is what stops it tearing."""
+    m = Material.from_flute("B", min_connect=10.0, connect_ratio=0.2)
+    for length in (6.0, 12.0, 25.0, 120.0):
+        a, b = np.array([0.0, 0.0]), np.array([length, 0.0])
+        segs = perf_segments(a, b, m)
+        cut = sum(float(np.linalg.norm(q - p)) for p, q in segs)
+        assert length - cut >= min(10.0, length) - 1e-6,             f"a {length}mm fold kept only {length - cut:.1f}mm of material"
+    a, b = np.array([0.0, 0.0]), np.array([8.0, 0.0])
+    assert perf_segments(a, b, m) == [], "a fold shorter than the floor is left solid"
+
+
+def test_round_cut_ends_changes_the_slot_not_its_span():
+    """Radiused ends must not make the slot overhang the fold it relieves."""
+    from cardboard_unfolder.folds import _strip
+    a, b = np.array([0.0, 0.0]), np.array([50.0, 0.0])
+    square = _strip(a, b, 4.0, round_ends=False)
+    round_ = _strip(a, b, 4.0, round_ends=True)
+    assert round_.area < square.area, "rounding removes the corners"
+    assert round_.bounds[0] >= square.bounds[0] - 1e-9
+    assert round_.bounds[2] <= square.bounds[2] + 1e-9
+    assert round_.bounds[2] - round_.bounds[0] == pytest.approx(50.0, abs=1e-6)
+
+
 def test_relief_width_matches_closed_form():
     m = Material.from_flute("B")
     m.crush = 1.0

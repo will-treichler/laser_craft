@@ -91,10 +91,34 @@ class CBU_PT_material(_Base, bpy.types.Panel):
         lay.prop(s, "thickness")
         lay.prop(s, "kerf")
         lay.prop(s, "crush")
-        lay.prop(s, "tab_depth")
+        lay.separator()
+        lay.prop(s, "use_tabs")
+        sub = lay.column()
+        sub.enabled = s.use_tabs
+        sub.prop(s, "tab_depth")
         lay.separator()
         lay.label(text="Every value here is empirical.", icon="INFO")
         lay.label(text="Cut a calibration set before trusting it.")
+
+
+class CBU_PT_folds(_Base, bpy.types.Panel):
+    bl_label = "Folds"
+    bl_parent_id = "CBU_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        s = context.scene.cbu
+        lay = self.layout
+        lay.use_property_split = True
+        lay.prop(s, "relief_adaptive")
+        sub = lay.column()
+        sub.enabled = not s.relief_adaptive
+        sub.prop(s, "relief_fixed")
+        lay.separator()
+        lay.prop(s, "perf_cut")
+        lay.prop(s, "connect_ratio")
+        lay.prop(s, "min_connect")
+        lay.prop(s, "round_cut_ends")
 
 
 class CBU_PT_machine(_Base, bpy.types.Panel):
@@ -252,8 +276,8 @@ class CBU_PT_uv(bpy.types.Panel):
         box.label(text="isometry and parts stop mating.")
 
 
-classes = (CBU_PT_main, CBU_PT_seams, CBU_PT_material, CBU_PT_machine,
-           CBU_PT_solver, CBU_PT_debug, CBU_PT_uv)
+classes = (CBU_PT_main, CBU_PT_seams, CBU_PT_material, CBU_PT_folds,
+           CBU_PT_machine, CBU_PT_solver, CBU_PT_debug, CBU_PT_uv)
 
 
 def register():

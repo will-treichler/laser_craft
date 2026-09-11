@@ -48,7 +48,38 @@ class CBUSettings(bpy.types.PropertyGroup):
         description="Corrugated squashes into the fold channel, so the "
                     "theoretical relief width is conservative. Empirical - "
                     "0.6 soft or recycled board, 1.0 stiff or double wall")
+    use_tabs: BoolProperty(
+        name="Glue tabs", default=False,
+        description=("Add glue flaps along the seams. Off for tape or a glued "
+                     "backing strip, which is how most cardboard goes "
+                     "together - the flaps cost about a fifth of the sheet"))
     tab_depth: FloatProperty(name="Tab depth", default=12.0, min=0.0, max=60.0)
+
+    # --- fold relief ---
+    relief_adaptive: BoolProperty(
+        name="Adaptive cut width", default=True,
+        description=("Width from board thickness and bend angle, which is what "
+                     "the board needs to close. Off uses a fixed width, which "
+                     "is what you want when cutting to a known blade width"))
+    relief_fixed: FloatProperty(
+        name="Cut width", default=3.0, min=0.1, max=30.0,
+        description="Fixed relief width, used when Adaptive is off")
+    perf_cut: FloatProperty(
+        name="Perforation length", default=1.0, min=0.1, max=50.0,
+        description="Length of each cut along a fold line")
+    connect_ratio: FloatProperty(
+        name="Connect ratio", default=0.5, min=0.0, max=0.95,
+        description=("Fraction of the fold line left connected. 0.5 cuts half "
+                     "the material away; higher is a stiffer fold"))
+    min_connect: FloatProperty(
+        name="Min connect width", default=10.0, min=0.0, max=100.0,
+        description=("Material that must survive a fold, in total. A blanket "
+                     "ratio leaves a short joint with almost nothing holding "
+                     "it; this floor is what stops it tearing off"))
+    round_cut_ends: BoolProperty(
+        name="Radius cut ends", default=True,
+        description=("Round the ends of relief slots. A square internal corner "
+                     "concentrates stress and is where a fold starts to tear"))
 
     # --- machine ---
     bed_x: FloatProperty(name="Bed X", default=600.0, min=50.0)
@@ -140,6 +171,13 @@ def material_from(s: CBUSettings):
     m.kerf = s.kerf
     m.crush = s.crush
     m.tab_depth = s.tab_depth
+    m.use_tabs = s.use_tabs
+    m.relief_adaptive = s.relief_adaptive
+    m.relief_fixed = s.relief_fixed
+    m.perf_cut = s.perf_cut
+    m.connect_ratio = s.connect_ratio
+    m.min_connect = s.min_connect
+    m.round_cut_ends = s.round_cut_ends
     m.bed = (s.bed_x, s.bed_y)
     m.sheet_margin = s.margin
     m.part_gap = s.part_gap
