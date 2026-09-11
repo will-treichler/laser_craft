@@ -12,3 +12,7 @@ cbu.log
 
 # pre-existing files in this folder, not part of the project
 OLD_VERSION_READ_DESCRIPTION_pikachu_1gen_flowalistik.STL
+
+# Blender autosaves that land in the project folder
+*_autosave.blend
+*.blend1
