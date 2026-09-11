@@ -503,6 +503,57 @@ def test_pipeline_produces_parts_that_fit_the_bed(name, tm):
         assert x1 <= m.bed[0] + 1e-6 and y1 <= m.bed[1] + 1e-6
 
 
+def test_pack_never_loses_to_either_strategy():
+    """Neither packer dominates, so pack() runs both and keeps the winner.
+
+    Nesting is far better when parts can share a sheet and worse when its
+    greedy placement paints itself into a corner - measured both ways on real
+    nets. This is the property that makes adding it safe.
+    """
+    from cardboard_unfolder.layout import shelf_pack, nest as nest_fn
+    m = Material.from_flute("B")
+    pad = 2 * m.tab_depth + 2 * m.kerf
+    for tm, frac in ((trimesh.creation.icosphere(subdivisions=1), 1.0),
+                     (trimesh.creation.icosphere(subdivisions=1), 0.6),
+                     (trimesh.creation.cylinder(radius=1, height=2, sections=16), 0.7)):
+        pm = PolyMesh.from_trimesh(tm).scale_to_height(280)
+        limit = ((m.usable_bed[0] - pad) * frac, (m.usable_bed[1] - pad) * frac)
+        islands, _ = unfold(pm, trials=40, max_size=limit)
+
+        a = build_parts(islands, m)
+        b = build_parts(islands, m)
+        c = build_parts(islands, m)
+        s_shelf, _ = shelf_pack(a, m)
+        s_nest, _ = nest_fn(b, m)
+        s_pack, _ = pack(c, m)
+        assert s_pack <= min(s_shelf, s_nest), (
+            f"pack used {s_pack} sheets, shelf {s_shelf}, nest {s_nest}")
+
+
+def test_nested_parts_do_not_overlap():
+    """Nesting places against real outlines, so this is the check that the
+    gap is actually being honoured rather than parts merely not colliding."""
+    from cardboard_unfolder.layout import nest as nest_fn
+    m = Material.from_flute("B")
+    pad = 2 * m.tab_depth + 2 * m.kerf
+    pm = PolyMesh.from_trimesh(
+        trimesh.creation.icosphere(subdivisions=1)).scale_to_height(280)
+    limit = ((m.usable_bed[0] - pad) * 0.6, (m.usable_bed[1] - pad) * 0.6)
+    islands, _ = unfold(pm, trials=40, max_size=limit)
+    parts = build_parts(islands, m)
+    sheets, _ = nest_fn(parts, m)
+    for s in range(sheets):
+        on = [p for p in parts if p.sheet == s]
+        for i in range(len(on)):
+            for j in range(i + 1, len(on)):
+                assert on[i].cut.intersection(on[j].cut).area < 1e-6,                     f"sheet {s}: islands {on[i].island_id} and {on[j].island_id} overlap"
+        for p in on:
+            x0, y0, x1, y1 = p.bounds
+            assert x0 >= m.sheet_margin - 1e-6 and y0 >= m.sheet_margin - 1e-6
+            assert x1 <= m.bed[0] - m.sheet_margin + 1e-6
+            assert y1 <= m.bed[1] - m.sheet_margin + 1e-6
+
+
 def test_part_xform_reproduces_the_packing():
     """The tracked transform must BE the packing, not an approximation of it.
 

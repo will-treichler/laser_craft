@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 105 core invariants (~35 s)
+python -m pytest tests -q               # 107 core invariants (~25 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -93,6 +93,34 @@ Anything measuring one piece against another must use the *pre-split* `pos`.
 then live in different frames - stack them and they appear to overlap at the
 origin, and any merge looks like it fits. This produced a convincing but
 entirely false "NOT MAXIMAL" result while developing.
+
+**Packing is not the bottleneck you would expect - part *shape* is.** On a
+pauldron split to fit the bed, every island's bounding box is 65-80% of the
+bed's while its area is only 32-56%. The two largest need 1053 mm of a 584 mm
+bed side by side and 670 mm of 384 mm stacked, so **no two parts can share a
+sheet at all** and utilisation is just the mean part area. Nesting cannot help
+there; it helps a lot once parts are smaller (pauldron split to 70% of the
+bed: 9 sheets shelved, 5 nested).
+
+So fewer islands is not free. Splitting harder gives smaller, denser-packing
+pieces: lowpoly_dome goes 4 islands / 4 sheets / 38% to 15 islands / 3 sheets
+/ 54%. That is the real trade the optimiser has to make, and it is
+model-dependent - drum12 is best left at its 4 islands, where splitting more
+costs sheets.
+
+`pack()` runs both `shelf_pack` and `nest` and keeps the winner, because
+neither dominates: nesting lost 5 sheets to 10 on drum12 split to 50%, where
+its greedy bottom-left placement paints itself into a corner. Regression:
+`test_pack_never_loses_to_either_strategy`.
+
+Two performance traps in that nester. Buffer the candidate once per rotation,
+never inside the position loop - buffering is the expensive call and there are
+hundreds of positions. And offer candidate positions a full gap *past* a
+neighbour's edge: at the edge itself the two half-gap buffers overlap by the
+whole gap, so every candidate is rejected and parts silently never share a
+sheet. Tree scoring is also budgeted (`size_candidates`, and few split trials
+while scoring); at 12 candidates x 24 trials the core suite ran 158 s for
+identical piece counts.
 
 **Overlap checks must be component-aware.** After splitting, separate islands
 sit on top of each other in raw coordinates — meaningless, they get packed onto

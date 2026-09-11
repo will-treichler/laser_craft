@@ -294,7 +294,7 @@ def _forest_positions(pm: PolyMesh, forest: nx.Graph):
 
 def search(pm: PolyMesh, G: nx.Graph | None = None, trials: int = 250,
            seed: int = 0, verbose: bool = False,
-           max_size: tuple | None = None, size_candidates: int = 12):
+           max_size: tuple | None = None, size_candidates: int = 6):
     """Randomised-restart maximum spanning tree with overlap rejection.
 
     Returns (forest, pos, overlaps, trials_used). A clean result has an empty
@@ -329,7 +329,7 @@ def search(pm: PolyMesh, G: nx.Graph | None = None, trials: int = 250,
                     print(f"  clean unfold on trial {i + 1}")
                 return T, pos, set(), i + 1
             seen_clean += 1
-            _, _, ncuts, over = split_to_fit(pm, T, pos, *max_size, trials=6)
+            _, _, ncuts, over = split_to_fit(pm, T, pos, *max_size, trials=3)
             # an unsplittable oversized face is worse than any piece count
             score = (over, 1 + ncuts)
             if best_clean is None or score < best_clean[0]:
@@ -512,7 +512,7 @@ def _grow_partition(sub: nx.Graph, pos: dict[int, np.ndarray],
 
 def split_to_fit(pm: PolyMesh, forest: nx.Graph, pos: dict[int, np.ndarray],
                  max_w: float, max_h: float, max_splits: int = 400,
-                 trials: int = 24, seed: int = 0):
+                 trials: int = 8, seed: int = 0):
     """Cut tree arcs until every island fits the bed, using as few as possible.
 
     Key economy: removing an arc never moves a face relative to the others in
