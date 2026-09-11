@@ -165,8 +165,10 @@ cuts2, _ = bridge.read_constraints(obj.data)
 check(not cuts2, "clear marks empties the constraint set")
 
 # ---------------------------------------------------------------- pack UV
+# CANCELLED is a legitimate answer: nesting declines rather than take a
+# layout that needs more sheets than the packing already in hand.
 r = bpy.ops.cbu.pack_uv()
-check(r == {"FINISHED"}, f"pack_uv runs (got {r})")
+check(r in ({"FINISHED"}, {"CANCELLED"}), f"pack_uv runs (got {r})")
 L2 = uv_edge_lengths(obj.data, bridge.UV_LAYER)
 err2 = np.abs(L2[:, 0] - L2[:, 1]).max()
 check(err2 < UV_TOL_MM,

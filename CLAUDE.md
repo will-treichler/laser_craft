@@ -275,33 +275,48 @@ drops to Object Mode and restores; any new code touching mesh data must do the
 same, and any *diagnostic* must too or it will report a perfectly good net as
 missing.
 
-**Bed-aware nesting: four things bite, in order.** `cbu.pack_uv` re-nests
-each sheet with Blender's packer, which is markedly better than the core's
-(60% vs 46% density measured on one net) but has no idea what a sheet is.
+**Nest the parts, not the island UVs.** `cbu.pack_uv` builds a throwaway
+mesh with one flat face per `Part` outline, packs *that* with Blender's
+true-shape packer, and reads the rigid motion back onto the parts. Nesting the
+island UVs instead means guessing an allowance for the glue tabs, which the
+packer cannot see: reserve it and nothing is eligible (a 259 mm staging box
+against islands 261-271 mm across - every sheet rolled back and the operator
+was a measured no-op), reserve nothing and the tabs overhang the sheet. With
+part outlines the fit test is a direct answer.
+
+Things that bite, all of which silently produce a wrong layout rather than an
+error:
 
 - **UV Sync Selection defaults ON in Blender 5.x**, and with it on
-  `uv.select_all` selects the whole mesh - so packing one sheet repacked the
-  entire net and undid every sheet placed before it. Force it off, restore it
-  after.
+  `uv.select_all` selects the whole mesh. Force it off, restore it after.
 - **Select inside Edit Mode, via bmesh.** Setting `poly.select` in Object Mode
-  and *then* switching `mesh_select_mode` to faces makes Blender re-derive the
-  selection from vertices, which can quietly select everything.
-- **`pack_islands` does not fail when it cannot fit.** With scale locked off
-  it crams islands in overlapping, and the result still measures inside the
-  box - a bounding-box test accepted 19 islands on one sheet with 20
-  overlapping pairs. Validate with real outlines, and roll the sheet back.
-- **Islands are nested; parts are cut.** A glue tab reaches up to `tab_depth`
-  past the island outline, so nesting to the full usable bed overhangs the
-  margin and two tabs can meet in a gap sized only for `part_gap`. Reserve the
-  allowance while staging, widen the pack margin by `2*tab_depth`, and decide
-  final placement from the *parts*.
+  and *then* switching `mesh_select_mode` re-derives the selection from
+  vertices and can select everything.
+- **Re-fetch the uv layer after every mode switch.** Entering or leaving Edit
+  Mode invalidates RNA pointers into mesh data; holding one across the switch
+  crashes Blender inside `attribute_access` rather than raising.
+- **`pack_islands` does not fail when it cannot fit.** With scale locked off it
+  crams islands in overlapping and the result still measures inside the box, so
+  the overlap test is the one that matters, not the bounding box.
+- **ORIGINAL_AABB is the bounding box of the *selection*.** Leaving parked-away
+  parts selected makes the container enormous and every trial fails, which
+  looks exactly like "nothing fits together" (19 sheets instead of 8). There is
+  no target-rectangle argument - `CUSTOM_REGION` exists but only
+  `use_uv_custom_region` is exposed to Python, so the box has to be set by
+  parking the candidates at the origin and pushing one to the far corner.
+- **`rotate_method` must be ANY, not CARDINAL.** The core orients each part to
+  its minimum-area box at an arbitrary angle, so an island 263 mm across
+  belongs on a 284 mm sheet; restricted to 90 degree steps the packer rejects
+  arrangements the core had already proved fit. Free rotation is only legal
+  because `Material.lock_grain` is off.
+- **First-fit-decreasing, not "take everything and drop the smallest".** The
+  latter packs all the large parts together and wastes the rest of every sheet:
+  9 sheets against 8, and three times slower.
 
-`pack_islands` also has no target-rectangle argument: with ORIGINAL_AABB it
-rearranges inside the selection's bounding box, so the box is set by parking
-the candidates at the origin and pushing one out to the far corner. The net is
-re-emitted from the parts afterwards, so the 2D view and the export cannot
-drift apart. Anything that fails validation falls back to the core's layout,
-which is always valid.
+It ties the core's shelf packing rather than beating it (8 sheets on the test
+net, declining outright on others), because the binding constraint is part
+*shape*, not packing skill - see above. It never takes a layout needing more
+sheets than the packing already in hand, so `CANCELLED` is a normal answer.
 
 **Blender splits a UV island wherever two loops disagree in the last bit.**
 Island membership is decided by whether the loops across an edge carry the
