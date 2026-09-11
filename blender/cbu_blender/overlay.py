@@ -20,7 +20,9 @@ _handle = None
 _uv_handle = None
 _batches = {}          # object name -> dict of batches
 _net_bounds = {}       # object name -> (x0, y0, x1, y1) of the net, in mm
-_net_cuts = {}         # object name -> list of rings, net-space mm
+_net_cuts = {}         # object name -> per-island outlines, island space
+_live_rings = {}       # object name -> resolved rings, sampled off the draw
+_live_timer = None
 _fingerprints = {}     # object name -> geometry fingerprint at unfold time
 _bed_cache = {}        # draw key -> batch, so the grid is not rebuilt per frame
 _TRI = None
@@ -159,6 +161,7 @@ def set_net_cuts(name: str, groups) -> None:
         _net_cuts[name] = groups
     else:
         _net_cuts.pop(name, None)
+    _live_rings.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
 
@@ -168,6 +171,12 @@ def _live_uv(obj, loop_idx):
 
     uv_layers[...].data is empty in Edit Mode - the live values are in the
     BMesh - and Edit Mode is exactly when islands are being dragged.
+
+    NEVER call this from a draw handler. bmesh.from_edit_mesh can allocate or
+    refresh BMesh customdata, which frees blocks the draw is still walking:
+    dragging a UV island crashed Blender in BLI_mempool_free, under
+    BM_data_layer_add, under cb_region_draw. It is sampled from a timer
+    instead and the draw only ever reads the cache.
     """
     me = obj.data
     if obj.mode == "EDIT":
@@ -196,6 +205,38 @@ def _live_uv(obj, loop_idx):
         return None
     return np.asarray([tuple(uv.data[int(i)].uv) for i in loop_idx],
                       dtype=np.float64)
+
+
+def refresh_live_cuts() -> float:
+    """Resample the cut outlines, off the draw path. Returns the next delay.
+
+    A timer rather than depsgraph_update_post because a modal transform does
+    not report until it ends, and the whole point is for the outline to move
+    with the island while it is being dragged.
+    """
+    try:
+        ctx = bpy.context
+        scene = getattr(ctx, "scene", None)
+        s = getattr(scene, "cbu", None) if scene else None
+        if s is not None and _net_cuts:
+            from . import bridge
+            sc = bridge.uv_scale(s.bed_x, s.bed_y)
+            for name in list(_net_cuts):
+                obj = bpy.data.objects.get(name)
+                if obj is None or obj.type != "MESH":
+                    _live_rings.pop(name, None)
+                    continue
+                rings = live_cut_rings(obj, sc)
+                if rings is None:
+                    continue
+                before = _live_rings.get(name)
+                _live_rings[name] = rings
+                if before is None or len(before) != len(rings) or any(
+                        not np.array_equal(a, b) for a, b in zip(before, rings)):
+                    _tag_redraw()
+    except Exception:                                   # noqa: BLE001
+        pass                    # a cosmetic overlay must never break the session
+    return 0.15
 
 
 def live_cut_rings(obj, scale: float):
@@ -247,11 +288,13 @@ def clear(name: str | None = None) -> None:
         _batches.clear()
         _net_bounds.clear()
         _net_cuts.clear()
+        _live_rings.clear()
         _fingerprints.clear()
     else:
         _batches.pop(name, None)
         _net_bounds.pop(name, None)
         _net_cuts.pop(name, None)
+        _live_rings.pop(name, None)
         _fingerprints.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
@@ -366,8 +409,13 @@ def cut_segments(rings, scale: float):
 
 
 def _cut_batch(obj, scale: float):
-    """Rebuilt whenever the islands have actually moved, not every frame."""
-    rings = live_cut_rings(obj, scale)
+    """Rebuilt whenever the islands have actually moved, not every frame.
+
+    Reads the cache the timer fills. Sampling here instead is what crashed
+    Blender: bmesh.from_edit_mesh inside a draw handler frees customdata
+    blocks out from under the draw.
+    """
+    rings = _live_rings.get(obj.name)
     line_s = _shaders()[1]
     if not rings or line_s is None:
         return None
@@ -450,9 +498,13 @@ def _draw_bed():
 
 
 def register():
-    global _handle, _uv_handle
+    global _handle, _uv_handle, _live_timer
     if not available():
         return
+    if _live_timer is None:
+        bpy.app.timers.register(refresh_live_cuts, first_interval=0.3,
+                                persistent=True)
+        _live_timer = refresh_live_cuts
     if _handle is None:
         _handle = bpy.types.SpaceView3D.draw_handler_add(
             _draw, (), "WINDOW", "POST_VIEW")
@@ -464,7 +516,13 @@ def register():
 
 
 def unregister():
-    global _handle, _uv_handle
+    global _handle, _uv_handle, _live_timer
+    if _live_timer is not None:
+        try:
+            bpy.app.timers.unregister(_live_timer)
+        except Exception:                               # noqa: BLE001
+            pass
+        _live_timer = None
     if _handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_handle, "WINDOW")
         _handle = None
@@ -474,5 +532,6 @@ def unregister():
     _batches.clear()
     _net_bounds.clear()
     _net_cuts.clear()
+    _live_rings.clear()
     _fingerprints.clear()
     _bed_cache.clear()

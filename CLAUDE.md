@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 116 checks, real Blender API
+python blender/test_addon.py            # 120 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -361,15 +361,22 @@ canonical value is a real member of the cluster, not the rounded key, so
 nothing moves further than the cluster's own width. Regressions:
 `no corner disagrees in the last bits`, `packing does not fragment the net`.
 
-**The cut overlay must follow islands that are dragged.** It is stored per
-island in *island space* with two reference loops, and resolved against the
-current UV positions on redraw (`overlay.live_cut_rings`). Two points are
-enough to recover the rigid motion and cheap enough to redo per frame; a full
-fit over every loop would not be. Reading them needs the bmesh path in Edit
-Mode, which is exactly when islands are being dragged - `uv_layers[...].data`
-is empty there. A stale outline is worse than none, because it invites
-arranging against a shape that has moved. Regression:
-`the cut outline follows an island dragged in the 2D view`.
+**The cut overlay must follow islands that are dragged - but never sample
+them from the draw handler.** The outline is stored per island in *island
+space* with two reference loops and resolved against the current UV positions;
+two points recover the rigid motion cheaply, where a full fit over every loop
+would not. Reading them needs bmesh in Edit Mode, which is exactly when
+islands are being dragged (`uv_layers[...].data` is empty there).
+
+`bmesh.from_edit_mesh` inside a GPU draw handler can allocate or refresh BMesh
+customdata, freeing blocks the draw is still walking: dragging a UV island
+crashed Blender in `BLI_mempool_free`, under `BM_data_layer_add`, under
+`cb_region_draw`. So a timer samples (0.15 s) and the draw only ever reads the
+cache. A GPU crash cannot be caught at runtime, so the separation is asserted
+on the code objects - `the draw handler does not sample live UVs`,
+`the cut batch reads the cache rather than sampling`. Same shape of rule as
+the vec3 one: if the failure kills the process, test the data or the code, not
+the behaviour.
 
 **Blender UVs are float32.** The net UV layer is a *view*; export comes from
 the core's float64 geometry. ~9e-5 mm error at 500 mm coordinates — 90 nm

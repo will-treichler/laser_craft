@@ -340,6 +340,23 @@ check(all(abs(d[0] - 40.0) < 1e-3 and abs(d[1] - 25.0) < 1e-3 for d in _moved),
       f"and it moved by exactly the drag (got {_moved[0] if _moved else None})")
 check(bool(_still), "the islands that were not dragged stayed put")
 
+# Sampling live UVs needs bmesh, and bmesh.from_edit_mesh inside a draw handler
+# can allocate or refresh BMesh customdata - freeing blocks the draw is still
+# walking. Dragging a UV island crashed Blender in BLI_mempool_free under
+# BM_data_layer_add under cb_region_draw. A GPU crash cannot be caught at
+# runtime, so the separation is asserted on the code: the draw path reads a
+# cache that a timer fills.
+_draw_names = overlay._draw_bed.__code__.co_names
+check("_live_uv" not in _draw_names and "live_cut_rings" not in _draw_names,
+      f"the draw handler does not sample live UVs (names: {_draw_names})")
+_batch_names = overlay._cut_batch.__code__.co_names
+check("live_cut_rings" not in _batch_names and "_live_uv" not in _batch_names,
+      "the cut batch reads the cache rather than sampling")
+check("_live_rings" in _batch_names, "and the cache is where it reads from")
+check("_live_uv" in overlay.refresh_live_cuts.__code__.co_names
+      or "live_cut_rings" in overlay.refresh_live_cuts.__code__.co_names,
+      "the timer is what samples")
+
 # it has to go stale with everything else, or it paints a net that has moved
 obj.data.vertices[0].co.x += 0.02
 obj.data.update()
