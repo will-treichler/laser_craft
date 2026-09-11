@@ -499,40 +499,277 @@ class CBU_OT_export(bpy.types.Operator):
 class CBU_OT_pack_uv(bpy.types.Operator):
     bl_idname = "cbu.pack_uv"
     bl_label = "Pack Net (UV)"
-    bl_description = ("Nest the net with Blender's own true-shape island packer. "
-                      "Scale is locked off so the unfold stays isometric")
+    bl_description = ("Re-nest each sheet with Blender's true-shape packer, "
+                      "keeping every part inside its own bed. Scale is locked "
+                      "off so the unfold stays isometric")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "MESH" and \
-            bridge.UV_LAYER in obj.data.uv_layers
+        return (obj is not None and obj.type == "MESH" and obj.name in _LAST
+                and bridge.UV_LAYER in obj.data.uv_layers)
 
     def execute(self, context):
         obj = context.active_object
-        obj.data.uv_layers.active = obj.data.uv_layers[bridge.UV_LAYER]
+        s = context.scene.cbu
+        mat = material_from(s)
+        _, L, _ = _core()
+        pm, islands, parts, sheets, rep = _LAST[obj.name]
+        sc = bridge.uv_scale(*mat.bed)
+
         prev = context.mode
-        bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="SELECT")
+        if prev != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
         try:
-            bpy.ops.uv.select_all(action="SELECT")
-            bpy.ops.uv.pack_islands(
-                udim_source="ORIGINAL_AABB", rotate=True,
-                rotate_method="CARDINAL",       # 90 degree steps only
-                scale=False,                    # never rescale: isometry
-                margin_method="ADD",
-                # UV units, not mm: scale it the same way the net was
-                margin=context.scene.cbu.part_gap * bridge.uv_scale(
-                    context.scene.cbu.bed_x, context.scene.cbu.bed_y),
-                shape_method="CONCAVE")
-        except (RuntimeError, TypeError) as exc:
-            self.report({"WARNING"}, f"pack_islands: {exc}")
+            sheet_of = {p.island_id: max(p.sheet, 0) for p in parts}
+            tightened = self._tighten(context, obj, pm, islands, mat, sc, sheet_of)
+            new_parts, err = self._readback(obj, pm, islands, mat, sc, sheet_of, L)
+        except Exception as exc:                        # noqa: BLE001
+            traceback.print_exc()
+            self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
+            return {"CANCELLED"}
         finally:
-            if prev != "EDIT_MESH":
+            if context.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
-        self.report({"INFO"}, "packed (scale locked, 90 degree rotations)")
+
+        if err:
+            # never ship a layout we could not verify - the old one is valid
+            bridge.write_net_uv(obj.data, pm, islands, scale=sc,
+                                placement={p.island_id: p for p in parts},
+                                sheet_height=mat.bed[1])
+            self.report({"ERROR"}, err)
+            if prev == "EDIT_MESH":
+                bpy.ops.object.mode_set(mode="EDIT")
+            return {"CANCELLED"}
+
+        sheets = max(sheet_of.values()) + 1 if sheet_of else 0
+        # Re-emit the net from the parts. The 2D view then shows exactly what
+        # will be cut, by construction rather than by agreement.
+        bridge.write_net_uv(obj.data, pm, islands, scale=sc,
+                            placement={p.island_id: p for p in new_parts},
+                            sheet_height=mat.bed[1])
+        _LAST[obj.name] = (pm, islands, new_parts, sheets, rep)
+        overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+        s.last_sheets = sheets
+        if prev == "EDIT_MESH":
+            bpy.ops.object.mode_set(mode="EDIT")
+        self.report({"INFO"}, f"re-nested {tightened} of {sheets} sheet(s)")
         return {"FINISHED"}
+
+    # ------------------------------------------------------------------
+    def _tighten(self, context, obj, pm, islands, mat, sc, sheet_of):
+        """Re-nest each sheet in place. Returns how many sheets improved.
+
+        Starts from the core's assignment on purpose. Handed a container it
+        cannot fit, with scale locked off, pack_islands does not fail - it
+        crams the islands in overlapping, and the result still measures inside
+        the box. A bounding-box test alone therefore accepted 19 islands on one
+        sheet with 20 overlapping pairs. The core's assignment is already
+        valid, so re-nesting *within* a sheet can only improve it, and anything
+        failing validation is rolled back sheet by sheet.
+        """
+        # Pack the ISLANDS, but what gets cut is PARTS - islands plus glue
+        # tabs and kerf, which stick out past the island outline. Nesting to
+        # the full usable bed therefore produces a layout whose parts overhang
+        # the margin, which the read-back then rightly refuses. Hold back the
+        # same allowance the unfolder uses for its bed limit.
+        pad = 2 * mat.tab_depth + 2 * mat.kerf
+        W = mat.usable_bed[0] - pad
+        H = mat.usable_bed[1] - pad
+        m0 = mat.sheet_margin                 # where finished sheets start
+        stage_m = m0 + pad / 2.0              # inset used only while nesting
+        loops = bridge.island_loops(obj.data, islands, pm)
+        by_id = {i.id: i for i in islands}
+
+        # UV Sync Selection defaults to ON in Blender 5.x, and with it on
+        # uv.select_all selects the whole mesh - so packing one sheet repacked
+        # the entire net and undid every sheet placed before it. Off, the face
+        # selection gates which UVs exist to be packed, which is the whole
+        # mechanism this relies on.
+        ts = context.scene.tool_settings
+        sync_was = ts.use_uv_select_sync
+        ts.use_uv_select_sync = False
+
+        groups = {}
+        for iid, sh in sheet_of.items():
+            groups.setdefault(sh, []).append(iid)
+
+        improved = 0
+        for sheet, ids in sorted(groups.items()):
+            ids = [i for i in ids if i in loops and len(loops[i])]
+            if not ids:
+                continue
+            pts = bridge.read_net(obj.data, sc)
+            saved = {i: pts[loops[i]].copy() for i in ids}
+
+            if len(ids) > 1:
+                before = self._span(pts, loops, ids)
+                self._stage(obj, loops, ids, sc, W, H, stage_m)
+                self._pack_selected(context, obj, ids, mat, sc)
+                pts = bridge.read_net(obj.data, sc)
+                span = self._span(pts, loops, ids)
+                fits = span[0] <= W + 1e-6 and span[1] <= H + 1e-6
+                ok = fits and self._disjoint(obj, pm, [by_id[i] for i in ids], sc)
+                if not ok:
+                    for i in ids:
+                        pts[loops[i]] = saved[i]
+                    bridge.write_net(obj.data, pts, sc)
+                elif span[0] * span[1] < before[0] * before[1] - 1e-6:
+                    improved += 1
+
+            self._park(obj, loops, ids, sheet, mat, sc, m0)
+        ts.use_uv_select_sync = sync_was
+        return improved
+
+    @staticmethod
+    def _span(pts, loops, ids):
+        sub = pts[np.concatenate([loops[i] for i in ids])]
+        lo, hi = sub.min(axis=0), sub.max(axis=0)
+        return (hi[0] - lo[0], hi[1] - lo[1])
+
+    @staticmethod
+    def _park(obj, loops, ids, sheet, mat, sc, m0):
+        """Place these islands at the bottom-left of their own sheet band.
+
+        Absolute, computed from where they are right now. Nudging them by the
+        sheet offset on top of whatever a previous layout left behind applies
+        it twice - which is exactly how parts ended up at y = -430 on sheet 5.
+        """
+        pts = bridge.read_net(obj.data, sc)
+        idx = np.concatenate([loops[i] for i in ids])
+        lo = pts[idx].min(axis=0)
+        pts[idx] += np.array([m0 - lo[0], m0 - lo[1] + sheet * mat.bed[1]])
+        bridge.write_net(obj.data, pts, sc)
+
+    @staticmethod
+    def _stage(obj, loops, ids, sc, W, H, m0):
+        """Make the selection's bounding box exactly one bed.
+
+        pack_islands has no target-rectangle argument: with ORIGINAL_AABB it
+        rearranges inside the bounding box of whatever is selected. So the box
+        is set by parking every candidate at the origin and pushing one out to
+        the far corner.
+        """
+        pts = bridge.read_net(obj.data, sc)
+        for i in ids:
+            lo = pts[loops[i]].min(axis=0)
+            pts[loops[i]] += np.array([m0 - lo[0], m0 - lo[1]])
+        last = ids[-1]
+        hi = pts[loops[last]].max(axis=0)
+        pts[loops[last]] += np.array([(m0 + W) - hi[0], (m0 + H) - hi[1]])
+        bridge.write_net(obj.data, pts, sc)
+
+    @staticmethod
+    def _pack_selected(context, obj, ids, mat, sc):
+        attr = obj.data.attributes.get(bridge.FACE_ATTR)
+        vals = np.zeros(len(obj.data.polygons), dtype=np.int32)
+        if attr is not None:
+            attr.data.foreach_get("value", vals)
+        want = set(ids)
+
+        # Select inside Edit Mode, after the select-mode switch. Setting
+        # poly.select in Object Mode and *then* switching to face mode makes
+        # Blender re-derive the face selection from the vertices, which can
+        # quietly select the whole mesh - and then pack_islands repacks every
+        # island instead of this sheet's.
+        bpy.ops.object.mode_set(mode="EDIT")
+        context.tool_settings.mesh_select_mode = (False, False, True)
+        bpy.ops.mesh.select_all(action="DESELECT")
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        for f in bm.faces:
+            f.select_set(int(vals[f.index]) in want)
+        bmesh.update_edit_mesh(obj.data)
+        bpy.ops.uv.select_all(action="SELECT")
+        bpy.ops.uv.pack_islands(
+            udim_source="ORIGINAL_AABB", rotate=True,
+            rotate_method="CARDINAL", scale=False, margin_method="ADD",
+            # Islands are what is packed, parts are what is cut: a glue tab
+            # protrudes up to tab_depth beyond the island outline, so leaving
+            # only part_gap between islands lets two tabs collide.
+            margin=(mat.part_gap + 2.0 * mat.tab_depth) * sc,
+            shape_method="CONCAVE")
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    @staticmethod
+    def _disjoint(obj, pm, isls, sc) -> bool:
+        """Do these islands actually keep out of each other's way?
+
+        The check a bounding box cannot make, and the one whose absence let a
+        sheet of 19 overlapping islands through. Uses the real outlines at
+        their recovered positions.
+        """
+        from shapely import affinity as _aff
+        xf, res = bridge.net_transforms(obj.data, pm, isls, sc)
+        if res > 0.5:
+            return False
+        polys = []
+        for isl in isls:
+            M = xf.get(isl.id)
+            if M is None:
+                return False
+            polys.append(_aff.affine_transform(
+                isl.outline(),
+                [M[0, 0], M[0, 1], M[1, 0], M[1, 1], M[0, 2], M[1, 2]]))
+        for a in range(len(polys)):
+            for b in range(a + 1, len(polys)):
+                if polys[a].intersection(polys[b]).area > 1e-6:
+                    return False
+        return True
+
+    @staticmethod
+    def _readback(obj, pm, islands, mat, sc, sheet_of, L):
+        """Push the 2D layout onto freshly built parts. Returns (parts, error)."""
+        from shapely import affinity as _aff
+        xf, res = bridge.net_transforms(obj.data, pm, islands, sc)
+        if res > 0.5:
+            return None, (f"layout is not a rigid motion of the net "
+                          f"({res:.2f} mm) - was an island scaled?")
+        parts = L.build_parts(islands, mat)
+        for part in parts:
+            M = xf.get(part.island_id)
+            if M is None:
+                continue
+            part.apply(lambda g, M=M: _aff.affine_transform(
+                g, [M[0, 0], M[0, 1], M[1, 0], M[1, 1], M[0, 2], M[1, 2]]))
+            part.xform = M.copy()
+            part.sheet = sheet_of.get(part.island_id, 0)
+            part.translate(0.0, -part.sheet * mat.bed[1])   # net -> sheet space
+
+        # Final placement is decided by the PARTS, not the islands. Parking by
+        # island outline puts the island edge on the margin and leaves the glue
+        # tab hanging outside it - the islands are what gets nested, but the
+        # parts are what gets cut.
+        m0 = mat.sheet_margin
+        per_sheet = {}
+        for part in parts:
+            per_sheet.setdefault(part.sheet, []).append(part)
+        for group in per_sheet.values():
+            x0 = min(p.bounds[0] for p in group)
+            y0 = min(p.bounds[1] for p in group)
+            for part in group:
+                part.translate(m0 - x0, m0 - y0)
+
+        for part in parts:
+            x0, y0, x1, y1 = part.bounds
+            if (x0 < m0 - 1e-3 or y0 < m0 - 1e-3
+                    or x1 > mat.bed[0] - m0 + 1e-3
+                    or y1 > mat.bed[1] - m0 + 1e-3):
+                return None, (f"island {part.island_id} ended up outside "
+                              f"sheet {part.sheet}")
+
+        # Final word on validity, checked on the geometry that is actually
+        # cut. The per-sheet check during nesting compares island outlines,
+        # which cannot see two glue tabs reaching into the same gap.
+        for sheet, group in per_sheet.items():
+            for a in range(len(group)):
+                for b in range(a + 1, len(group)):
+                    if group[a].cut.intersection(group[b].cut).area > 1e-6:
+                        return None, (
+                            f"islands {group[a].island_id} and "
+                            f"{group[b].island_id} overlap on sheet {sheet}")
+        return parts, None
 
 
 PLANAR_TOL = 1e-3      # same gate PolyMesh.check uses

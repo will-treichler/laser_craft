@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 100 checks, real Blender API
+python blender/test_addon.py            # 105 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -274,6 +274,34 @@ BMesh, so reading or writing the mesh datablock there silently does nothing -
 drops to Object Mode and restores; any new code touching mesh data must do the
 same, and any *diagnostic* must too or it will report a perfectly good net as
 missing.
+
+**Bed-aware nesting: four things bite, in order.** `cbu.pack_uv` re-nests
+each sheet with Blender's packer, which is markedly better than the core's
+(60% vs 46% density measured on one net) but has no idea what a sheet is.
+
+- **UV Sync Selection defaults ON in Blender 5.x**, and with it on
+  `uv.select_all` selects the whole mesh - so packing one sheet repacked the
+  entire net and undid every sheet placed before it. Force it off, restore it
+  after.
+- **Select inside Edit Mode, via bmesh.** Setting `poly.select` in Object Mode
+  and *then* switching `mesh_select_mode` to faces makes Blender re-derive the
+  selection from vertices, which can quietly select everything.
+- **`pack_islands` does not fail when it cannot fit.** With scale locked off
+  it crams islands in overlapping, and the result still measures inside the
+  box - a bounding-box test accepted 19 islands on one sheet with 20
+  overlapping pairs. Validate with real outlines, and roll the sheet back.
+- **Islands are nested; parts are cut.** A glue tab reaches up to `tab_depth`
+  past the island outline, so nesting to the full usable bed overhangs the
+  margin and two tabs can meet in a gap sized only for `part_gap`. Reserve the
+  allowance while staging, widen the pack margin by `2*tab_depth`, and decide
+  final placement from the *parts*.
+
+`pack_islands` also has no target-rectangle argument: with ORIGINAL_AABB it
+rearranges inside the selection's bounding box, so the box is set by parking
+the candidates at the origin and pushing one out to the far corner. The net is
+re-emitted from the parts afterwards, so the 2D view and the export cannot
+drift apart. Anything that fails validation falls back to the core's layout,
+which is always valid.
 
 **Blender splits a UV island wherever two loops disagree in the last bit.**
 Island membership is decided by whether the loops across an edge carry the

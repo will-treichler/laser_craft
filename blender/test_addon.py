@@ -286,6 +286,53 @@ _v2, _ = overlay.bed_segments((0.0, 0.0, 1e9, 1e9), 600.0, 400.0, 8.0)
 check(len(_v2) // 16 <= overlay.MAX_TILES,
       f"a runaway net is capped at {overlay.MAX_TILES} tiles")
 
+# ------------------------------------------------ bed-aware UV nesting
+obj = fresh("Nest", "ico_sphere", subdivisions=3)
+obj.scale = (0.14,) * 3
+bpy.ops.object.transform_apply(scale=True)
+bpy.context.scene.cbu.bed_x = 300.0
+bpy.context.scene.cbu.bed_y = 300.0
+bpy.ops.cbu.unfold()
+_mat = props.material_from(bpy.context.scene.cbu)
+_before_sheets = bpy.context.scene.cbu.last_sheets
+
+check(bpy.ops.cbu.pack_uv() == {"FINISHED"}, "bed-aware UV nesting runs")
+_pm, _isl, _parts, _sheets, _rep = ops._LAST[obj.name]
+
+# Every part inside its own sheet. Nesting works on island outlines, but a
+# glue tab reaches past them - place by island and the tab hangs over the
+# margin, which is why final placement is decided by the parts.
+_out = []
+for p in _parts:
+    x0, y0, x1, y1 = p.bounds
+    if (x0 < _mat.sheet_margin - 1e-3 or y0 < _mat.sheet_margin - 1e-3
+            or x1 > _mat.bed[0] - _mat.sheet_margin + 1e-3
+            or y1 > _mat.bed[1] - _mat.sheet_margin + 1e-3):
+        _out.append(p.island_id)
+check(not _out, f"every nested part stays inside its sheet (out: {_out})")
+
+# The check a bounding box cannot make. pack_islands, given a container it
+# cannot fit, crams islands in overlapping rather than failing.
+_ov = 0
+_by_sheet = {}
+for p in _parts:
+    _by_sheet.setdefault(p.sheet, []).append(p)
+for _grp in _by_sheet.values():
+    for _a in range(len(_grp)):
+        for _b in range(_a + 1, len(_grp)):
+            if _grp[_a].cut.intersection(_grp[_b].cut).area > 1e-6:
+                _ov += 1
+check(_ov == 0, f"no two nested parts overlap ({_ov} pair(s))")
+check(_sheets <= _before_sheets,
+      f"nesting never needs more sheets ({_before_sheets} -> {_sheets})")
+
+# the 2D view is re-emitted from the parts, so it cannot drift from the export
+_sc = bridge.uv_scale(*_mat.bed)
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+_xf, _res = bridge.net_transforms(obj.data, _pm, _isl, _sc)
+check(_res < 0.01, f"the net is still a rigid image of the unfold ({_res:.1e} mm)")
+
 # ------------------------------------------------ 2D seam editing
 obj = fresh("Seams2D", "ico_sphere", subdivisions=1)
 obj.scale = (0.14,) * 3

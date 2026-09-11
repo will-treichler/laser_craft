@@ -228,6 +228,114 @@ def net_bounds(mesh):
             float(d[:, 0].max()), float(d[:, 1].max()))
 
 
+# ----------------------------------------------------------- coordinate spaces
+#
+# Four of them, and mixing them up is what makes 2D layout work go wrong:
+#
+#   island space  mm, as unfold produced it. All islands share one origin.
+#   sheet space   mm within one bed. Origin at the bed corner; the usable area
+#                 is [margin, bed - margin].
+#   net space     mm, sheets stacked upward: sheet s owns y in
+#                 [s * bed_y, (s+1) * bed_y]. This is what the UV layer holds.
+#   uv space      net space * uv_scale(bed). Only ever touched at the edges.
+#
+# Everything below works in NET SPACE. uv_scale is applied on read and undone
+# on write, so no caller has to think in UV units.
+
+
+def island_loops(mesh, islands, pm: PolyMesh) -> dict:
+    """{island id: array of loop indices} - which UVs belong to which island."""
+    out = {}
+    for isl in islands:
+        idx = []
+        for f in isl.faces:
+            for poly_i in pm.source_faces[f]:
+                idx.extend(mesh.polygons[poly_i].loop_indices)
+        out[isl.id] = np.asarray(sorted(set(idx)), dtype=np.int64)
+    return out
+
+
+def read_net(mesh, scale: float) -> np.ndarray:
+    """The whole net as (nloops, 2) in net-space mm.
+
+    Object Mode only: uv_layers[...].data is empty in Edit Mode, so this would
+    quietly hand back zeros. write_net asserts on the same thing.
+    """
+    uv = mesh.uv_layers.get(UV_LAYER)
+    if uv is None or not len(mesh.loops):
+        return np.zeros((0, 2))
+    buf = np.zeros(len(mesh.loops) * 2)
+    uv.data.foreach_get("uv", buf)
+    return buf.reshape(-1, 2) / (scale or 1.0)
+
+
+def write_net(mesh, pts: np.ndarray, scale: float) -> None:
+    """Write net-space mm back to the UV layer."""
+    uv = mesh.uv_layers.get(UV_LAYER)
+    if uv is None:
+        return
+    assert len(uv.data) == len(mesh.loops), (
+        "uv_layers[...].data is empty - this only works in Object Mode")
+    uv.data.foreach_set("uv", (pts * (scale or 1.0)).ravel())
+    mesh.update()
+
+
+def _kabsch2d(A: np.ndarray, B: np.ndarray):
+    """Best RIGID motion taking A onto B, plus the worst residual in mm.
+
+    Rigid, never a general affine fit: if an island has been scaled, an affine
+    fit absorbs it with a near-zero residual and the broken isometry is
+    accepted silently into the cut geometry. Rotation and translation only, so
+    a scale shows up as a large residual the caller can refuse.
+    """
+    ca, cb = A.mean(axis=0), B.mean(axis=0)
+    U, _S, Vt = np.linalg.svd((A - ca).T @ (B - cb))
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0.0:
+        Vt = Vt.copy()
+        Vt[-1] *= -1.0
+        R = Vt.T @ U.T
+    t = cb - R @ ca
+    M = np.eye(3)
+    M[:2, :2] = R
+    M[:2, 2] = t
+    res = float(np.abs((A @ R.T + t) - B).max()) if len(A) else 0.0
+    return M, res
+
+
+def island_source_points(mesh, pm: PolyMesh, isl):
+    """(island-space points, matching loop indices) for one island."""
+    srcs, idx = [], []
+    for f, pos2 in isl.faces.items():
+        fn = pm.plane_map(f, pos2)
+        for poly_i in pm.source_faces[f]:
+            poly = mesh.polygons[poly_i]
+            srcs.append(fn(pm.vertices[list(poly.vertices)]))
+            idx.extend(poly.loop_indices)
+    if not srcs:
+        return np.zeros((0, 2)), np.zeros(0, dtype=np.int64)
+    return np.vstack(srcs), np.asarray(idx, dtype=np.int64)
+
+
+def net_transforms(mesh, pm: PolyMesh, islands, scale: float):
+    """Where each island sits now: ({island id: 3x3}, worst residual mm).
+
+    Maps ISLAND SPACE to NET SPACE. This is what lets a layout rearranged in
+    the UV editor be pushed back onto the parts that actually get exported,
+    instead of the 2D view being a read-only preview.
+    """
+    pts = read_net(mesh, scale)
+    out, worst = {}, 0.0
+    for isl in islands:
+        A, idx = island_source_points(mesh, pm, isl)
+        if not len(A):
+            continue
+        M, res = _kabsch2d(A, pts[idx])
+        out[isl.id] = M
+        worst = max(worst, res)
+    return out, worst
+
+
 def write_net_uv(mesh, pm: PolyMesh, islands, spread: bool = True,
                  row_width: float | None = None, gap: float = 10.0,
                  scale: float = 1.0, placement: dict | None = None,
