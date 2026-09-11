@@ -20,7 +20,8 @@ from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs
                                        search, min_rect_size, min_area_rect, fits,
                                        split_to_fit, split_island)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
-                                      apply_relief, kerf_compensate)
+                                      apply_relief, kerf_compensate,
+                                      fold_intervals, flute_warning)
 from cardboard_unfolder.tabs import place_tabs
 from cardboard_unfolder.layout import build_parts, pack, narrow_necks
 from cardboard_unfolder import strokefont
@@ -515,15 +516,26 @@ def test_flat_fold_needs_no_relief():
 
 
 @pytest.mark.parametrize("grade", ["E", "B", "C"])
-def test_perf_period_stays_under_a_third_of_flute_pitch(grade):
-    """Dash period must be small against the flute pitch or consecutive flutes
-    get very different treatment - some ties on a glue line, some over a void."""
-    m = Material.from_flute(grade)
-    segs = perf_segments(np.array([0.0, 0.0]), np.array([80.0, 0.0]), m)
-    assert len(segs) > 1
-    period = segs[1][0][0] - segs[0][0][0]
-    assert period <= m.pitch / 3 + 1e-9
+def test_a_coarse_perforation_warns_instead_of_being_silently_rescaled(grade):
+    """The flute constraint is advice now, not a clamp.
 
+    Dash period wants to stay well under the flute pitch, or consecutive flutes
+    get very different treatment - some ties on a glue line, some over a void.
+    That used to be enforced by rescaling, which made the dash-length control
+    look broken: anything over 2 mm came back as 1.08 mm. The rule is real but
+    not absolute - it matters for a fine score, far less for a slot with long
+    bridges - so the user's number is honoured and the risk is reported.
+    """
+    m = Material.from_flute(grade)
+    m.perf_cut = 20.0
+    segs = perf_segments(np.array([0.0, 0.0]), np.array([200.0, 0.0]), m)
+    assert segs, "a coarse perforation must still produce cuts"
+    length = float(np.linalg.norm(segs[0][1] - segs[0][0]))
+    assert length == pytest.approx(20.0, abs=1e-6),         f"asked for 20mm dashes, got {length:.2f}mm"
+    assert "flute pitch" in flute_warning(m), "and it must say so"
+
+    m.perf_cut = m.pitch / 8.0            # comfortably inside the guidance
+    assert flute_warning(m) == "", "a fine perforation must not warn"
 
 def test_perf_dashes_stay_inside_the_fold():
     m = Material.from_flute("B")

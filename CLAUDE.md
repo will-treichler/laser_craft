@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 111 checks, real Blender API
+python blender/test_addon.py            # 116 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -361,6 +361,16 @@ canonical value is a real member of the cluster, not the rounded key, so
 nothing moves further than the cluster's own width. Regressions:
 `no corner disagrees in the last bits`, `packing does not fragment the net`.
 
+**The cut overlay must follow islands that are dragged.** It is stored per
+island in *island space* with two reference loops, and resolved against the
+current UV positions on redraw (`overlay.live_cut_rings`). Two points are
+enough to recover the rigid motion and cheap enough to redo per frame; a full
+fit over every loop would not be. Reading them needs the bmesh path in Edit
+Mode, which is exactly when islands are being dragged - `uv_layers[...].data`
+is empty there. A stale outline is worse than none, because it invites
+arranging against a shape that has moved. Regression:
+`the cut outline follows an island dragged in the 2D view`.
+
 **Blender UVs are float32.** The net UV layer is a *view*; export comes from
 the core's float64 geometry. ~9e-5 mm error at 500 mm coordinates — 90 nm
 against a 0.3 mm kerf.
@@ -381,6 +391,25 @@ hinge.
 
 Perforation dash period stays under a third of the flute pitch, or consecutive
 flutes get very different treatment.
+
+**One set of controls governs both fold styles.** A thin score and a wide
+relief slot are the same decision - how much of this bend line is removed and
+how much is left holding it - so `fold_intervals` produces the cut intervals
+and both styles consume them. Relief slots used to carry their own
+`bridge_len` / `bridge_every` pair that no UI exposed, so on any model whose
+folds were wide enough to become slots (which is *every* fold once a fixed cut
+width above `relief_threshold` is set) the exposed perforation controls
+appeared to do nothing at all.
+
+The slot is built as one strip per interval rather than one long strip with
+bridges subtracted, so the radius lands on the ends of every segment. Rounding
+the whole slot and then cutting bridges out of it leaves square corners at
+every bridge - which is most of the corners, and exactly where a fold tears.
+
+The flute-pitch rule is advice now, not a clamp. Rescaling the period to
+pitch/3 silently made the dash-length control useless - anything over 2 mm came
+back as 1.08 mm - and the rule matters for a fine score, far less for a slot
+with long bridges. `flute_warning` reports it instead.
 
 The fold line is controlled by a *ratio*, not by two lengths: `connect_ratio`
 is the fraction left connected (0.5 cuts half of it away), because the useful

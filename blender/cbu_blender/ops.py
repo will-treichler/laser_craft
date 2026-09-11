@@ -58,28 +58,50 @@ def selected_edges(context, bm):
     return [e for e in bm.edges if e.select]
 
 
-def publish_cuts(obj, parts, mat):
-    """Hand the real cut outlines to the 2D overlay, in net-space mm.
+def publish_cuts(obj, parts, mat, pm=None, islands=None):
+    """Hand the real cut outlines to the 2D overlay, in ISLAND space.
 
     The UV layer only holds the islands; glue tabs are generated in the core
-    and live solely in the exported parts. A 2D view drawn from UVs alone is
-    therefore about 20% smaller than what the laser follows, so anyone
-    arranging islands by eye is optimising the wrong shape. Part geometry is
-    in sheet space, so each ring is lifted by its sheet band to match the net.
+    and live solely in the exported parts, so a 2D view drawn from UVs alone is
+    smaller than what the laser follows. Stored in island space with two
+    reference loops per island so the overlay can follow the island when it is
+    dragged in the UV editor - a stale outline invites arranging against a
+    shape that has moved.
     """
-    rings = []
-    for part in parts:
+    if pm is None or islands is None:
+        overlay.set_net_cuts(obj.name, None)
+        return
+    by_id = {p.island_id: p for p in parts}
+    groups = []
+    for isl in islands:
+        part = by_id.get(isl.id)
+        if part is None:
+            continue
+        src_pts, loop_idx = bridge.island_source_points(obj.data, pm, isl)
+        if len(loop_idx) < 2:
+            continue
+        # two reference loops far enough apart to pin down a rotation
+        j = int(np.argmax(np.linalg.norm(src_pts - src_pts[0], axis=1)))
+        if j == 0:
+            continue
+        # the part sits wherever packing put it; bring it back to island space
+        M = np.asarray(part.xform, dtype=np.float64)
+        inv = np.linalg.inv(M)
+        rings = []
         g = part.cut
         if g is None or g.is_empty:
             continue
         polys = list(g.geoms) if g.geom_type == "MultiPolygon" else [g]
-        lift = max(part.sheet, 0) * mat.bed[1]
         for poly in polys:
             for ring in [poly.exterior] + list(poly.interiors):
-                pts = np.asarray(ring.coords)
+                pts = np.asarray(ring.coords)[:-1]
                 if len(pts) > 2:
-                    rings.append(pts[:-1] + (0.0, lift))
-    overlay.set_net_cuts(obj.name, rings)
+                    rings.append(pts @ inv[:2, :2].T + inv[:2, 2])
+        if rings:
+            groups.append({"refs": [int(loop_idx[0]), int(loop_idx[j])],
+                           "ref_pts": (src_pts[0], src_pts[j]),
+                           "rings": rings})
+    overlay.set_net_cuts(obj.name, groups)
 
 
 class CBU_OT_mark(bpy.types.Operator):
@@ -292,7 +314,7 @@ class CBU_OT_unfold(bpy.types.Operator):
                                     placement={p.island_id: p for p in parts},
                                     sheet_height=mat.bed[1])
                 overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
-                publish_cuts(obj, parts, mat)
+                publish_cuts(obj, parts, mat, pm, islands)
 
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             with cbulog.stage(T, "overlay"):
@@ -427,7 +449,7 @@ class CBU_OT_edit_seam(bpy.types.Operator):
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             overlay.rebuild(obj, pm, islands, s.overlay_alpha)
             overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
-            publish_cuts(obj, parts, mat)
+            publish_cuts(obj, parts, mat, pm, islands)
         except Exception as exc:                        # noqa: BLE001
             traceback.print_exc()
             self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
@@ -478,7 +500,7 @@ class CBU_OT_repack(bpy.types.Operator):
                                 sheet_height=mat.bed[1])
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
-            publish_cuts(obj, parts, mat)
+            publish_cuts(obj, parts, mat, pm, islands)
         except Exception as exc:                       # noqa: BLE001
             traceback.print_exc()
             self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
@@ -573,7 +595,7 @@ class CBU_OT_pack_uv(bpy.types.Operator):
                             sheet_height=mat.bed[1])
         _LAST[obj.name] = (pm, islands, parts, sheets, rep)
         overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
-        publish_cuts(obj, parts, mat)
+        publish_cuts(obj, parts, mat, pm, islands)
         s.last_sheets = sheets
         if prev == "EDIT_MESH":
             bpy.ops.object.mode_set(mode="EDIT")

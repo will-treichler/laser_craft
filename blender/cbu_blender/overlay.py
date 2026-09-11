@@ -142,20 +142,94 @@ def rebuild(obj, pm, islands, alpha: float = 0.55) -> None:
     _tag_redraw()
 
 
-def set_net_cuts(name: str, rings) -> None:
+def set_net_cuts(name: str, groups) -> None:
     """Remember the real cut outlines so the 2D view can show what is cut.
 
     The UV layer only ever holds the islands. Glue tabs are generated in the
     core and exist solely in the exported parts, so a net drawn from UVs alone
     is about 20% smaller than the thing the laser follows - and anyone
     arranging islands by eye is optimising the wrong shape.
+
+    Stored per island, in ISLAND space, with two reference loops each. The
+    outline then follows the island when it is dragged in the UV editor
+    instead of staying where the last unfold left it: a stale outline is worse
+    than none, because it invites arranging against a shape that has moved.
     """
-    if rings:
-        _net_cuts[name] = [np.asarray(r, dtype=np.float64) for r in rings]
+    if groups:
+        _net_cuts[name] = groups
     else:
         _net_cuts.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
+
+
+def _live_uv(obj, loop_idx):
+    """Current UV of specific loops, working in Edit Mode too.
+
+    uv_layers[...].data is empty in Edit Mode - the live values are in the
+    BMesh - and Edit Mode is exactly when islands are being dragged.
+    """
+    me = obj.data
+    if obj.mode == "EDIT":
+        try:
+            import bmesh
+            bm = bmesh.from_edit_mesh(me)
+            lay = bm.loops.layers.uv.get(NET_UV)
+            if lay is None:
+                return None
+            flat = [None] * len(loop_idx)
+            want = {li: k for k, li in enumerate(loop_idx)}
+            i = 0
+            for f in bm.faces:
+                for l in f.loops:
+                    k = want.get(i)
+                    if k is not None:
+                        flat[k] = tuple(l[lay].uv)
+                    i += 1
+            if any(v is None for v in flat):
+                return None
+            return np.asarray(flat, dtype=np.float64)
+        except Exception:                               # noqa: BLE001
+            return None
+    uv = me.uv_layers.get(NET_UV)
+    if uv is None or not len(uv.data):
+        return None
+    return np.asarray([tuple(uv.data[int(i)].uv) for i in loop_idx],
+                      dtype=np.float64)
+
+
+def live_cut_rings(obj, scale: float):
+    """Cut outlines where the islands are *now*, in UV units.
+
+    Two reference points per island are enough to recover the rigid motion,
+    and cheap enough to redo on every redraw - a full fit over every loop
+    would not be.
+    """
+    groups = _net_cuts.get(obj.name)
+    if not groups:
+        return None
+    loop_idx = []
+    for g in groups:
+        loop_idx.extend(g["refs"])
+    cur = _live_uv(obj, loop_idx)
+    if cur is None:
+        return None
+
+    out = []
+    for k, g in enumerate(groups):
+        p0, p1 = g["ref_pts"]                      # island space
+        q0, q1 = cur[2 * k] / scale, cur[2 * k + 1] / scale
+        u, v = p1 - p0, q1 - q0
+        lu = float(np.hypot(u[0], u[1]))
+        lv = float(np.hypot(v[0], v[1]))
+        if lu < 1e-9 or lv < 1e-9:
+            continue
+        c = float(u @ v) / (lu * lv)
+        s = float(u[0] * v[1] - u[1] * v[0]) / (lu * lv)
+        R = np.array([[c, -s], [s, c]])
+        for ring in g["rings"]:
+            out.append((ring - p0) @ R.T + q0)
+    return out
 
 
 def set_net_bounds(name: str, bounds) -> None:
@@ -291,19 +365,24 @@ def cut_segments(rings, scale: float):
     return verts, cols
 
 
-def _cut_batch(name: str, scale: float):
-    key = ("cuts", name, scale)
-    if key not in _bed_cache:
-        rings = _net_cuts.get(name)
-        line_s = _shaders()[1]
-        if not rings or line_s is None:
-            _bed_cache[key] = None
-        else:
-            verts, cols = cut_segments(rings, scale)
-            _bed_cache[key] = (batch_for_shader(line_s, "LINES",
-                                                {"pos": verts, "color": cols})
-                               if verts else None)
-    return _bed_cache[key]
+def _cut_batch(obj, scale: float):
+    """Rebuilt whenever the islands have actually moved, not every frame."""
+    rings = live_cut_rings(obj, scale)
+    line_s = _shaders()[1]
+    if not rings or line_s is None:
+        return None
+    key = ("cuts", obj.name, scale,
+           float(np.round(np.concatenate([r.ravel() for r in rings]).sum(), 4)))
+    hit = _bed_cache.get(key)
+    if hit is None:
+        verts, cols = cut_segments(rings, scale)
+        hit = (batch_for_shader(line_s, "LINES", {"pos": verts, "color": cols})
+               if verts else None)
+        for k in [k for k in _bed_cache if isinstance(k, tuple)
+                  and k and k[0] == "cuts"]:
+            del _bed_cache[k]
+        _bed_cache[key] = hit
+    return hit
 
 
 def _bed_batch(bounds, bed_w, bed_h, margin):
@@ -363,7 +442,7 @@ def _draw_bed():
         batch.draw(line_s)
 
         if s.show_cut:
-            cuts = _cut_batch(obj.name, sc)
+            cuts = _cut_batch(obj, sc)
             if cuts is not None:
                 cuts.draw(line_s)
     finally:

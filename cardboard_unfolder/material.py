@@ -61,9 +61,11 @@ class Material:
     # Period must stay well under the flute pitch or consecutive flutes get very
     # different treatment. Enforced in folds.perf_segments().
 
-    # --- relief slot bridges ---
-    bridge_len: float = 6.0         # mm of uncut material holding the hinge
-    bridge_every: float = 45.0      # mm between bridge centres
+    # Relief slots used to carry their own bridge_len / bridge_every pair.
+    # They are gone: a slot and a score are the same decision about how much of
+    # the bend line survives, so perf_cut / connect_ratio / min_connect govern
+    # both. Two sets of controls meant the exposed ones appeared to do nothing
+    # on any model whose folds were wide enough to become slots.
 
     # --- joinery ---
     use_tabs: bool = False          # Most cardboard goes together with tape or a

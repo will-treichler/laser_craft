@@ -300,11 +300,13 @@ bpy.ops.cbu.unfold()
 if bpy.context.mode == "EDIT_MESH":
     bpy.ops.object.mode_set(mode="OBJECT")
 
-_rings = overlay._net_cuts.get(obj.name)
-check(bool(_rings), "unfold publishes the cut outline to the 2D view")
+_groups = overlay._net_cuts.get(obj.name)
+check(bool(_groups), "unfold publishes the cut outline to the 2D view")
 
 _mat = props.material_from(bpy.context.scene.cbu)
 _sc = bridge.uv_scale(*_mat.bed)
+_rings = overlay.live_cut_rings(obj, _sc)
+check(bool(_rings), "the cut outline resolves against the current layout")
 _cut = np.vstack(_rings)
 _d = np.zeros(len(obj.data.loops) * 2)
 obj.data.uv_layers[bridge.UV_LAYER].data.foreach_get("uv", _d)
@@ -318,6 +320,25 @@ _v, _c = overlay.cut_segments(_rings, _sc)
 check(_v and all(len(q) == 3 for q in _v), "cut vertices are vec3")
 check(len(_v) == len(_c) and all(len(q) == 4 for q in _c), "cut colours are RGBA")
 check(all(q[2] == 0.0 for q in _v), "the cut outline is flat in z")
+
+# and it must follow an island that is dragged in the UV editor, or it invites
+# arranging against a shape that has moved
+_pm, _isl, _parts, _s2, _r2 = ops._LAST[obj.name]
+_loops = bridge.island_loops(obj.data, _isl, _pm)
+_b4 = [r.mean(axis=0) for r in overlay.live_cut_rings(obj, _sc)]
+_pts = bridge.read_net(obj.data, _sc)
+_tgt = sorted(_loops)[0]
+_pts[_loops[_tgt]] += np.array([40.0, 25.0])
+bridge.write_net(obj.data, _pts, _sc)
+_af = [r.mean(axis=0) for r in overlay.live_cut_rings(obj, _sc)]
+check(len(_b4) == len(_af), "ring count is stable across a drag")
+_shift = [np.asarray(b) - np.asarray(a) for a, b in zip(_b4, _af)]
+_moved = [d for d in _shift if np.linalg.norm(d) > 1e-6]
+_still = [d for d in _shift if np.linalg.norm(d) <= 1e-6]
+check(bool(_moved), "some of the outline moved with the dragged island")
+check(all(abs(d[0] - 40.0) < 1e-3 and abs(d[1] - 25.0) < 1e-3 for d in _moved),
+      f"and it moved by exactly the drag (got {_moved[0] if _moved else None})")
+check(bool(_still), "the islands that were not dragged stayed put")
 
 # it has to go stale with everything else, or it paints a net that has moved
 obj.data.vertices[0].co.x += 0.02

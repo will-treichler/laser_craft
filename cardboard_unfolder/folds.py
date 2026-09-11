@@ -22,7 +22,7 @@ Two corrections theory doesn't give you:
     demands 2.0t. Hence the crush factor, default 0.75. This one is empirical.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import shapely
@@ -50,37 +50,34 @@ def relief_width(bend: float, mat: Material) -> float:
     return mat.crush * 2.0 * mat.pivot_depth * np.tan(a / 2.0)
 
 
-def perf_segments(a: np.ndarray, b: np.ndarray, mat: Material,
-                  phase: float = 0.0,
-                  min_connect: float | None = None
-                  ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Dash a fold line into cut/tie segments, centred so both ends get a tie.
+def fold_intervals(length: float, mat: Material) -> list[tuple[float, float]]:
+    """Cut intervals along a fold of the given length, as (start, end) in mm.
 
-    The corrugated-specific constraint: keep the dash period well under the
-    flute pitch. At a 4 mm period on a 6.5 mm B-flute pitch, consecutive
-    flutes get wildly different treatment - some ties land on a glue line
-    (locally 3-ply solid, cracks), some over a void (hinges on nothing).
-    Period <= pitch/3 means every flute sees ~3 dashes and behaves alike.
+    Shared by both fold styles on purpose. A thin score and a wide relief slot
+    are the same decision - how much of this bend line is removed and how much
+    is left holding it - so one set of controls governs both. Before this the
+    slot was segmented by its own bridge_len/bridge_every pair, which no UI
+    exposed, so changing the perforation settings appeared to do nothing on
+    any model whose folds were wide enough to become slots.
+
+    Centred so both ends of the fold keep material.
     """
-    a, b = np.asarray(a, float), np.asarray(b, float)
-    L = float(np.linalg.norm(b - a))
-    if L < 1e-9:
+    L = float(length)
+    if L <= 0.0:
         return []
-    floor = mat.min_connect if min_connect is None else float(min_connect)
-    if L <= floor:
+    floor = min(mat.min_connect, L)
+    if L <= floor + 1e-9:
         return []                         # too short to cut and still hold
 
-    cut, tie = mat.perf_cut, mat.perf_tie
+    cut = max(float(mat.perf_cut), 1e-3)
+    tie = mat.perf_tie
     period = cut + tie
-    limit = mat.pitch / 3.0
-    if period > limit:                    # rescale, preserving the cut:tie ratio
-        k = limit / period
-        cut, tie, period = cut * k, tie * k, limit
+    if period <= 1e-9:
+        return []
 
-    d = (b - a) / L
     n = max(1, int(round((L - tie) / period)))
-    span = n * period - tie               # keep a tie at each end
-    start = (L - span) / 2.0 + phase % period
+    span = n * period - tie               # a tie at each end
+    start = (L - span) / 2.0
 
     out = []
     x = start
@@ -90,21 +87,51 @@ def perf_segments(a: np.ndarray, b: np.ndarray, mat: Material,
             out.append((s, e))
         x += period
 
-    # Hold back min_connect of material overall. The ratio alone is a fraction,
-    # so on a short fold it leaves a proportionally small - and absolutely
-    # tiny - amount holding the joint together.
+    # Hold back min_connect of material overall. The ratio is a fraction, so on
+    # a short fold it leaves a proportionally small - and absolutely tiny -
+    # amount holding the joint together.
     total = sum(e - s for s, e in out)
     allowed = max(0.0, L - floor)
-    if total > allowed + 1e-9:
-        k = allowed / total if total > 0 else 0.0
-        shrunk = []
-        for s, e in out:
-            c = (s + e) / 2.0
-            half = (e - s) * k / 2.0
-            if half > 1e-6:
-                shrunk.append((c - half, c + half))
-        out = shrunk
-    return [(a + s * d, a + e * d) for s, e in out]
+    if total > allowed + 1e-9 and total > 0.0:
+        k = allowed / total
+        out = [(( s + e) / 2.0 - (e - s) * k / 2.0,
+                (s + e) / 2.0 + (e - s) * k / 2.0) for s, e in out]
+        out = [(s, e) for s, e in out if e - s > 1e-6]
+    return out
+
+
+def flute_warning(mat: Material) -> str:
+    """Perforation period against the flute pitch.
+
+    Kept as advice rather than a clamp. Silently rescaling the user's dash
+    length to pitch/3 made the control look broken - anything over 2 mm came
+    back as 1.08 mm - and the constraint is real but not absolute: it matters
+    for a fine score, far less for a slot with long bridges.
+    """
+    period = mat.perf_cut + mat.perf_tie
+    limit = mat.pitch / 3.0
+    if period > limit + 1e-9:
+        return (f"perforation period {period:.1f}mm exceeds a third of the "
+                f"{mat.pitch:.1f}mm flute pitch ({limit:.1f}mm) - consecutive "
+                f"flutes will be treated very differently")
+    return ""
+
+
+def perf_segments(a: np.ndarray, b: np.ndarray, mat: Material,
+                  phase: float = 0.0,
+                  min_connect: float | None = None
+                  ) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Dash a fold line into cut/tie segments, centred so both ends get a tie."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    L = float(np.linalg.norm(b - a))
+    if L < 1e-9:
+        return []
+    if min_connect is not None:           # bridge remnants ask for no floor
+        m2 = replace(mat, min_connect=float(min_connect))
+    else:
+        m2 = mat
+    d = (b - a) / L
+    return [(a + s * d, a + e * d) for s, e in fold_intervals(L, m2)]
 
 
 @dataclass
@@ -146,29 +173,32 @@ def _strip(a: np.ndarray, b: np.ndarray, width: float,
     return LineString([a + d * r, b - d * r]).buffer(r, cap_style=1, join_style=1)
 
 
-def _bridges(a: np.ndarray, b: np.ndarray, width: float, mat: Material) -> Polygon:
-    """Uncut ties spanning the relief slot. These are the actual hinge."""
+def _slot(a: np.ndarray, b: np.ndarray, width: float, mat: Material) -> Polygon:
+    """The material a relief fold removes: one strip per cut interval.
+
+    Built from the intervals rather than as one strip with bridges subtracted,
+    so the radius lands on the ends of *every* segment. Rounding the whole slot
+    and then cutting bridges out of it leaves square corners at each bridge -
+    which is most of the corners, and exactly where a fold tears.
+    """
     a, b = np.asarray(a, float), np.asarray(b, float)
     L = float(np.linalg.norm(b - a))
+    if L < 1e-9:
+        return Polygon()
     d = (b - a) / L
-    n = max(1, int(np.floor(L / mat.bridge_every)))
-    blen = min(mat.bridge_len, L / (2 * n + 1))       # never eat the whole fold
-    if n * blen < mat.min_connect:        # the floor that stops small joints tearing
-        blen = min(mat.min_connect / n, L / (2 * n + 1) * 2.0, L * 0.9 / n)
-    pieces = []
-    for i in range(n):
-        c = L * (i + 0.5) / n
-        s, e = max(0.0, c - blen / 2), min(L, c + blen / 2)
-        pieces.append(_strip(a + s * d, a + e * d, width * 1.5))
-    return unary_union(pieces)
+    pieces = [_strip(a + s * d, a + e * d, width, round_ends=mat.round_cut_ends)
+              for s, e in fold_intervals(L, mat)]
+    pieces = [p for p in pieces if not p.is_empty]
+    return unary_union(pieces) if pieces else Polygon()
 
 
 def plan_folds(island: Island, mat: Material) -> list[FoldPlan]:
     """Decide, per fold, whether to simply perforate or to remove a relief slot."""
     plans = []
+    flute = flute_warning(mat)
     for f in island.folds:
         w = relief_width(f.bend, mat)
-        warn = ""
+        warn = flute
         if w > mat.max_relief:
             warn = (f"relief {w:.1f}mm exceeds max {mat.max_relief:.1f}mm at "
                     f"{np.degrees(abs(f.bend)):.0f} deg - use a double score here")
@@ -178,8 +208,7 @@ def plan_folds(island: Island, mat: Material) -> list[FoldPlan]:
             plans.append(FoldPlan(f, w, "perf", None, perf_segments(f.a, f.b, mat), warn))
             continue
 
-        strip = _strip(f.a, f.b, w, round_ends=mat.round_cut_ends)
-        slot = strip.difference(_bridges(f.a, f.b, w, mat))
+        slot = _slot(f.a, f.b, w, mat)
         if slot.is_empty:
             plans.append(FoldPlan(f, w, "perf", None, perf_segments(f.a, f.b, mat), warn))
             continue
