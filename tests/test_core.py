@@ -15,8 +15,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cardboard_unfolder import Material, PolyMesh
+from cardboard_unfolder import mesh as mesh_mod
 from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs,
-                                       search, min_rect_size, fits)
+                                       search, min_rect_size, min_area_rect, fits,
+                                       split_to_fit)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, kerf_compensate)
 from cardboard_unfolder.tabs import place_tabs
@@ -50,6 +52,48 @@ IDS = [n for n, _ in ALL]
 def test_faces_are_planar(name, tm):
     pm = PolyMesh.from_trimesh(tm)
     assert pm.planarity().max() < 1e-9, "merged faces must stay planar"
+
+
+def test_nonplanar_faces_are_split_but_flat_ones_are_not():
+    """A bent face has no rigid flat position, so it must be triangulated.
+
+    Flat faces must survive intact: triangulating everything and letting the
+    coplanar merge put it back together is what stops a fold line appearing
+    down the diagonal of every panel.
+    """
+    # a unit square pulled out of plane at one corner
+    v = np.array([[0., 0., 0.], [100., 0., 0.], [100., 100., 8.], [0., 100., 0.]])
+    rings, origin = mesh_mod.split_nonplanar(v, [[0, 1, 2, 3]], tol=1e-3)
+    assert len(rings) == 2, "a bent quad must be split"
+    assert origin == [0, 0], "both halves still come from the caller's face 0"
+
+    flat = np.array([[0., 0., 0.], [100., 0., 0.], [100., 100., 0.], [0., 100., 0.]])
+    rings, origin = mesh_mod.split_nonplanar(flat, [[0, 1, 2, 3]], tol=1e-3)
+    assert rings == [[0, 1, 2, 3]] and origin == [0], "a flat quad is left alone"
+
+
+def test_split_faces_keep_pointing_at_their_original_face():
+    """source_faces must survive the split, or the add-on writes UVs onto the
+    wrong polygons - it indexes the caller's mesh with exactly these values."""
+    v = np.array([[0., 0., 0.], [100., 0., 0.], [100., 100., 8.], [0., 100., 0.],
+                  [200., 0., 0.], [200., 100., 0.]])
+    pm = PolyMesh.from_rings(v, [[0, 1, 2, 3], [1, 4, 5, 2]], merge=True)
+    seen = sorted({s for grp in pm.source_faces for s in grp})
+    assert seen == [0, 1], f"source faces must index the input rings, got {seen}"
+    assert all(0 <= s <= 1 for grp in pm.source_faces for s in grp)
+
+
+def test_nonplanar_split_keeps_the_unfold_exact():
+    """The whole point: after splitting, the unfold is isometric again."""
+    tm = trimesh.creation.icosphere(subdivisions=1)
+    tm.apply_scale(200.0 / tm.extents.max())
+    v = tm.vertices.copy()
+    quads = []                      # glue triangle pairs into deliberately bent quads
+    for a, b in zip(tm.faces[0::2], tm.faces[1::2]):
+        quads.append(list(dict.fromkeys(list(a) + list(b))))
+    quads = [q for q in quads if len(q) == 4]
+    pm = PolyMesh.from_rings(v, quads, merge=True)
+    assert pm.planarity().max() < 1e-3, "nothing bent should survive the split"
 
 
 def test_coplanar_merge_collapses_a_cube():
@@ -150,6 +194,79 @@ def test_split_to_fit_respects_the_bed(name, tm):
         assert fits(pts, *limit), f"island {isl.id} exceeds the bed"
 
 
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_bed_split_is_maximal(name, tm):
+    """No two finished pieces could have been left joined.
+
+    This is the quality bar for bed splitting, and it is stronger than "every
+    piece fits": a splitter that cuts every face apart also passes that one.
+    Growing each piece until the bed stops it makes maximality automatic -
+    after a cut the child piece is final while the parent only grows, and a
+    superset of something that did not fit cannot fit.
+
+    Checked in the ORIGINAL frame. split_to_fit re-roots every component
+    afterwards, so two pieces' coordinates then live in different frames and
+    stacking them measures nothing - they would appear to overlap at the
+    origin and any merge would look like it fitted. Same trap as
+    component-aware overlap counting.
+    """
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(280)
+    limit = (400.0, 260.0)
+    forest, pos, _, _ = search(pm, pm.dual_graph(), trials=60)
+    cut, _, ncuts, _ = split_to_fit(pm, forest, pos, *limit)
+
+    removed = set(map(frozenset, forest.edges())) - set(map(frozenset, cut.edges()))
+    assert len(removed) == ncuts, "reported split count must match the arcs removed"
+
+    comps = [set(c) for c in nx.connected_components(cut)]
+    comp_of = {f: i for i, c in enumerate(comps) for f in c}
+    for e in removed:
+        u, v = tuple(e)
+        merged = comps[comp_of[u]] | comps[comp_of[v]]
+        assert not fits(np.vstack([pos[f] for f in merged]), *limit),             f"{name}: the cut {u}-{v} was unnecessary, those pieces both fit joined"
+
+
+def test_scored_tree_search_never_does_worse_than_the_first_clean_tree():
+    """Scoring candidate trees must not be able to lose.
+
+    The old behaviour was "return the first overlap-free tree". That tree is
+    still the first candidate the scored search evaluates, so the best of the
+    candidates can only tie it or beat it. This is what stops the extra search
+    cost from ever buying a worse result.
+    """
+    m = Material.from_flute("B")
+    pad = 2 * m.tab_depth + 2 * m.kerf
+    limit = (m.usable_bed[0] - pad, m.usable_bed[1] - pad)
+    for tm in (trimesh.creation.icosphere(subdivisions=1),
+               trimesh.creation.cylinder(radius=1, height=2, sections=16)):
+        pm = PolyMesh.from_trimesh(tm).scale_to_height(280)
+        G = pm.dual_graph()
+
+        first, pos_a, bad_a, _ = search(pm, G, trials=60, seed=3)
+        scored, pos_b, bad_b, _ = search(pm, G, trials=60, seed=3, max_size=limit)
+        if bad_a or bad_b:
+            continue                       # no clean tree to compare against
+
+        _, _, cuts_first, _ = split_to_fit(pm, first, pos_a, *limit)
+        _, _, cuts_scored, _ = split_to_fit(pm, scored, pos_b, *limit)
+        assert cuts_scored <= cuts_first, (
+            f"scored search returned a worse tree: {1+cuts_scored} pieces "
+            f"vs {1+cuts_first} for the first clean tree")
+
+
+def test_bed_split_only_removes_existing_arcs():
+    """Splitting may cut the unfold tree, never invent a join that was not
+    there - a piece has to stay a connected run of faces you can fold."""
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(280)
+    forest, pos, _, _ = search(pm, pm.dual_graph(), trials=60)
+    cut, _, _, _ = split_to_fit(pm, forest, pos, 400.0, 260.0)
+    before = set(map(frozenset, forest.edges()))
+    after = set(map(frozenset, cut.edges()))
+    assert after <= before
+    assert set(cut.nodes()) == set(forest.nodes()), "no face may be dropped"
+
+
 def test_min_rect_beats_axis_aligned_for_a_diagonal():
     """A net rotated 45 degrees fits a bed its axis-aligned box would not."""
     s = 100.0
@@ -159,6 +276,76 @@ def test_min_rect_beats_axis_aligned_for_a_diagonal():
     assert aabb[0] == pytest.approx(200.0)
     assert min(w, h) == pytest.approx(math.hypot(s, s), rel=1e-9)
     assert max(w, h) < aabb[0]
+
+
+def test_min_area_rect_encloses_its_points():
+    """The rectangle must contain the cloud, must not be smaller than the
+    cloud's convex hull, and must never do worse than the axis-aligned box."""
+    from shapely.geometry import MultiPoint
+    rng = np.random.default_rng(7)
+    for _ in range(200):
+        n = int(rng.integers(3, 40))
+        pts = rng.normal(size=(n, 2)) * rng.uniform(1.0, 500.0)
+        w, h, ang, centre = min_area_rect(pts)
+        d = np.array([math.cos(ang), math.sin(ang)])
+        q = pts - np.asarray(centre)
+        u, v = q @ d, q @ np.array([-d[1], d[0]])
+        scale = max(1.0, w, h)
+        assert u.max() - u.min() <= w + 1e-9 * scale, "points stick out sideways"
+        assert v.max() - v.min() <= h + 1e-9 * scale, "points stick out endwise"
+        hull = MultiPoint([tuple(pt) for pt in pts]).convex_hull.area
+        aabb = pts.max(axis=0) - pts.min(axis=0)
+        assert w * h >= hull - 1e-6 * scale ** 2, "smaller than the hull it holds"
+        assert w * h <= aabb[0] * aabb[1] + 1e-6 * scale ** 2, "worse than the AABB"
+
+
+def test_min_rect_area_is_invariant_under_translation():
+    """Where a net happens to sit cannot change the size of its minimum box.
+    GEOS' rotated-rectangle broke precisely this: the same cylinder net gave
+    687 x 436 mm centred on the origin and a zero-width sliver at its natural
+    offset a few hundred mm out. The achieving rectangle can tie between two
+    orientations, so the invariant is on area, which is unique."""
+    rng = np.random.default_rng(11)
+    for _ in range(100):
+        n = int(rng.integers(3, 40))
+        pts = rng.normal(size=(n, 2)) * rng.uniform(1.0, 400.0)
+        w, h = min_rect_size(pts)
+        base = w * h
+        for off in ([300.0, 700.0], [-1200.0, 450.0], [5000.0, 5000.0]):
+            w, h = min_rect_size(pts + np.array(off))
+            assert w * h == pytest.approx(base, rel=1e-9)
+
+
+def test_min_area_rect_survives_degenerate_clouds():
+    """Collinear and coincident inputs must return a usable answer, not raise
+    and not report a size that hides a real extent."""
+    line = np.array([[0.0, 0.0], [10.0, 0.0], [5.0, 0.0], [2.5, 0.0]])
+    w, h, _, _ = min_area_rect(line)
+    assert max(w, h) == pytest.approx(10.0)
+    assert min(w, h) == pytest.approx(0.0)
+
+    w, h, _, _ = min_area_rect(np.zeros((5, 2)))
+    assert (w, h) == (0.0, 0.0)
+
+    diag = np.array([[0.0, 0.0], [3.0, 4.0], [1.5, 2.0]])
+    w, h, _, _ = min_area_rect(diag)
+    assert max(w, h) == pytest.approx(5.0)
+
+
+def test_split_to_fit_splits_a_net_that_sits_off_the_origin():
+    """Regression. The cylinder net at costume scale lands a few hundred mm
+    from the origin, where GEOS' rotated-rectangle collapsed to a sliver: a
+    687 x 436 mm island reported that it fitted a 559 x 359 mm bed, so bed
+    splitting stopped one cut early and shipped an uncuttable part."""
+    limit = (559.4, 359.4)
+    tm = trimesh.creation.cylinder(radius=1, height=2, sections=16)
+    tm.apply_scale(200.0 / tm.extents.max())
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(220)
+    islands, rep = unfold(pm, trials=80, max_size=limit)
+    assert rep["oversize_islands"] == 0
+    for isl in islands:
+        pts = np.vstack(list(isl.faces.values()))
+        assert fits(pts, *limit),             f"island {isl.id} is {min_rect_size(pts)} on a {limit} bed"
 
 
 # ------------------------------------------------------------ fold geometry
@@ -314,6 +501,56 @@ def test_pipeline_produces_parts_that_fit_the_bed(name, tm):
         x0, y0, x1, y1 = p.bounds
         assert x0 >= -1e-6 and y0 >= -1e-6
         assert x1 <= m.bed[0] + 1e-6 and y1 <= m.bed[1] + 1e-6
+
+
+def test_part_xform_reproduces_the_packing():
+    """The tracked transform must BE the packing, not an approximation of it.
+
+    Everything downstream trusts it to place the same island somewhere else -
+    the net UV layer uses it to show the real sheet layout - so if it drifts
+    from the geometry the 2D view silently lies about what will be cut.
+    """
+    import shapely
+    m = Material.from_flute("B")
+    tm = trimesh.creation.icosphere(subdivisions=1)
+    tm.apply_scale(240 / tm.extents.max())
+    pm = PolyMesh.from_trimesh(tm)
+    pad = 2 * m.tab_depth + 2 * m.kerf
+    islands, _ = unfold(pm, trials=60,
+                        max_size=(m.usable_bed[0] - pad, m.usable_bed[1] - pad))
+    parts = build_parts(islands, m)
+
+    before = {p.island_id: shapely.get_coordinates(p.cut) for p in parts}
+    pack(parts, m)
+    for p in parts:
+        moved = shapely.get_coordinates(p.cut)
+        pred = p.place(before[p.island_id])
+        assert moved.shape == pred.shape
+        assert np.abs(moved - pred).max() < 1e-6, (
+            f"island {p.island_id}: transform and geometry disagree by "
+            f"{np.abs(moved - pred).max():.3e} mm")
+
+
+def test_packed_parts_sit_inside_the_margins():
+    """Nothing may stray into the sheet margin or across a sheet boundary -
+    that is clamped material the laser cannot reach."""
+    m = Material.from_flute("B")
+    tm = trimesh.creation.icosphere(subdivisions=1)
+    tm.apply_scale(240 / tm.extents.max())
+    pm = PolyMesh.from_trimesh(tm)
+    pad = 2 * m.tab_depth + 2 * m.kerf
+    islands, _ = unfold(pm, trials=60,
+                        max_size=(m.usable_bed[0] - pad, m.usable_bed[1] - pad))
+    parts = build_parts(islands, m)
+    sheets, oversized = pack(parts, m)
+    for p in parts:
+        if p.sheet < 0:
+            continue
+        x0, y0, x1, y1 = p.bounds
+        assert x0 >= m.sheet_margin - 1e-6, f"island {p.island_id} crosses the left margin"
+        assert y0 >= m.sheet_margin - 1e-6, f"island {p.island_id} crosses the bottom margin"
+        assert x1 <= m.bed[0] - m.sheet_margin + 1e-6, "crosses the right margin"
+        assert y1 <= m.bed[1] - m.sheet_margin + 1e-6, "crosses the top margin"
 
 
 def test_packed_parts_do_not_collide():

@@ -10,7 +10,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import networkx as nx
-import trimesh
+
+# trimesh is imported lazily, inside the two loaders that need it. It is only
+# ever used to read a mesh file; the Blender add-on builds its PolyMesh from
+# bmesh instead and never touches those loaders. An eager import here made the
+# add-on fail to register in Blender's Python with ModuleNotFoundError, which
+# also hid the panel offering to install the missing packages.
 
 
 def newell_normal(pts: np.ndarray) -> np.ndarray:
@@ -49,6 +54,47 @@ def _chain_boundary(edges: np.ndarray) -> list[int] | None:
         if len(ring) > len(adj):
             return None
     return ring if len(ring) == len(adj) else None
+
+
+def ring_planarity(vertices: np.ndarray, ring: list[int]) -> float:
+    """Max deviation from the ring's best-fit plane, relative to its longest
+    edge - the same measure PolyMesh.planarity reports, for one loose ring."""
+    pts = vertices[ring]
+    n = newell_normal(pts)
+    dev = float(np.abs((pts - pts.mean(axis=0)) @ n).max())
+    span = max(float(np.linalg.norm(pts[i] - pts[(i + 1) % len(pts)]))
+               for i in range(len(pts)))
+    return dev / span if span > 1e-12 else 0.0
+
+
+def split_nonplanar(vertices: np.ndarray, rings: list[list[int]],
+                    tol: float = 1e-3):
+    """Fan-triangulate any ring too bent to unfold rigidly.
+
+    A non-planar quad has no flat position that keeps all four corners, so the
+    two faces meeting along one of its edges disagree about where that corner
+    goes - measured at 0.79 mm on a real part, well past the +/-0.5 mm this
+    is built for. Splitting is not a nicety: it is the only honest handling,
+    because the isometry guarantee simply does not apply to a bent face.
+
+    Triangles come back through merge_coplanar, so genuinely flat faces that
+    were triangulated on import are re-merged and do not gain a fold line.
+    Only the bent ones stay split, and those have to bend somewhere.
+
+    Returns (new_rings, origin) where origin[i] is the input ring that ring i
+    came from, so source_faces can still point at the caller's own faces.
+    """
+    out: list[list[int]] = []
+    origin: list[int] = []
+    for i, r in enumerate(rings):
+        if len(r) > 3 and ring_planarity(vertices, r) > tol:
+            for k in range(1, len(r) - 1):      # fan from the first vertex
+                out.append([r[0], r[k], r[k + 1]])
+                origin.append(i)
+        else:
+            out.append(list(r))
+            origin.append(i)
+    return out, origin
 
 
 def merge_coplanar(vertices: np.ndarray, rings: list[list[int]],
@@ -132,13 +178,22 @@ class PolyMesh:
             self.source_faces = [[i] for i in range(len(self.faces))]
 
     @classmethod
-    def from_rings(cls, vertices, rings, merge: bool = True, tol_deg: float = 0.5):
+    def from_rings(cls, vertices, rings, merge: bool = True, tol_deg: float = 0.5,
+                   planar_tol: float | None = 1e-3):
         vertices = np.asarray(vertices, dtype=float)
         rings = [list(r) for r in rings]
+
+        origin = list(range(len(rings)))
+        if planar_tol is not None:
+            rings, origin = split_nonplanar(vertices, rings, planar_tol)
+
         if merge:
             rings, src = merge_coplanar(vertices, rings, tol_deg)
+            # merge_coplanar indexes the rings it was handed; map back to the
+            # caller's original faces or source_faces points at the wrong ones.
+            src = [sorted({origin[j] for j in group}) for group in src]
             return cls(vertices, rings, src)
-        return cls(vertices, rings)
+        return cls(vertices, rings, [[origin[i]] for i in range(len(rings))])
 
     def plane_map(self, face: int, pos2: np.ndarray):
         """Return f(points3d) -> points2d, the rigid map that placed this face.
@@ -168,7 +223,7 @@ class PolyMesh:
     # ---------------------------------------------------------------- build
 
     @classmethod
-    def from_trimesh(cls, tm: trimesh.Trimesh, merge_coplanar: bool = True) -> "PolyMesh":
+    def from_trimesh(cls, tm: "trimesh.Trimesh", merge_coplanar: bool = True) -> "PolyMesh":
         tm = tm.copy()
         tm.merge_vertices()
         if not merge_coplanar:
@@ -179,6 +234,7 @@ class PolyMesh:
 
     @classmethod
     def load(cls, path: str, merge_coplanar: bool = True) -> "PolyMesh":
+        import trimesh
         tm = trimesh.load(path, force="mesh", process=True)
         return cls.from_trimesh(tm, merge_coplanar)
 

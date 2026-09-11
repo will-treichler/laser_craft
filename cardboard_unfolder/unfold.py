@@ -293,15 +293,29 @@ def _forest_positions(pm: PolyMesh, forest: nx.Graph):
 
 
 def search(pm: PolyMesh, G: nx.Graph | None = None, trials: int = 250,
-           seed: int = 0, verbose: bool = False):
+           seed: int = 0, verbose: bool = False,
+           max_size: tuple | None = None, size_candidates: int = 12):
     """Randomised-restart maximum spanning tree with overlap rejection.
 
     Returns (forest, pos, overlaps, trials_used). A clean result has an empty
     overlap set; otherwise the caller repairs by splitting.
+
+    With max_size given, a tree that merely avoids overlaps is not good
+    enough. Overlap-free trees are plentiful - what separates them is how many
+    pieces they cost once the bed limit is applied, and that varies by a third
+    or more on real parts (a dome measured 4 pieces from the best tree and 6
+    from the worst). So instead of returning the first clean tree, score up to
+    size_candidates of them by the objective that actually matters - the piece
+    count after bed splitting - and keep the cheapest.
+
+    Scoring costs a bed split per candidate, so it is capped rather than run
+    over every trial, and skipped entirely when there is no bed limit.
     """
     G = G if G is not None else pm.dual_graph()
     rng = np.random.default_rng(seed)
-    best = None
+    best = None                     # fewest overlaps, used only if none are clean
+    best_clean = None               # (score, T, pos, trials_used)
+    seen_clean = 0
     for i in range(trials):
         c = rng.normal(size=3)
         c /= np.linalg.norm(c)
@@ -310,11 +324,27 @@ def search(pm: PolyMesh, G: nx.Graph | None = None, trials: int = 250,
         pos, _ = _forest_positions(pm, T)
         bad = overlapping_pairs(T, pos)
         if not bad:
-            if verbose:
-                print(f"  clean unfold on trial {i + 1}")
-            return T, pos, set(), i + 1
+            if max_size is None:
+                if verbose:
+                    print(f"  clean unfold on trial {i + 1}")
+                return T, pos, set(), i + 1
+            seen_clean += 1
+            _, _, ncuts, over = split_to_fit(pm, T, pos, *max_size, trials=6)
+            # an unsplittable oversized face is worse than any piece count
+            score = (over, 1 + ncuts)
+            if best_clean is None or score < best_clean[0]:
+                best_clean = (score, T, pos, i + 1)
+            if seen_clean >= size_candidates:
+                break
+            continue
         if best is None or len(bad) < len(best[2]):
             best = (T, pos, bad, i + 1)
+
+    if best_clean is not None:
+        score, T, pos, used = best_clean
+        if verbose:
+            print(f"  best of {seen_clean} clean unfold(s): {score[1]} piece(s)")
+        return T, pos, set(), used
     return best
 
 
@@ -347,20 +377,82 @@ def repair(pm: PolyMesh, forest: nx.Graph, overlaps: set, max_cuts: int = 500):
 
 # -------------------------------------------------------------- bed limit
 
+def _convex_hull(pts: np.ndarray) -> np.ndarray:
+    """Monotone-chain convex hull, counter-clockwise, no repeated endpoint.
+
+    Written out instead of taken from GEOS because its rotated-rectangle
+    routine returns a degenerate sliver on some of these nets - a hull of
+    2.3e5 mm2 came back as a rectangle of 7e-12 - and a wrong "it fits" lets
+    an oversized island straight through to the packer. Collinear points are
+    dropped, so every edge of the result is a genuine support direction.
+    """
+    p = np.unique(np.asarray(pts, dtype=float), axis=0)   # also sorts lexically
+    if len(p) < 3:
+        return p
+
+    def chain(seq):
+        out: list = []
+        for q in seq:
+            while len(out) >= 2:
+                a, b = out[-2], out[-1]
+                cross = ((b[0] - a[0]) * (q[1] - a[1])
+                         - (b[1] - a[1]) * (q[0] - a[0]))
+                if cross > 0.0:
+                    break
+                out.pop()
+            out.append(q)
+        return out
+
+    lower, upper = chain(p), chain(p[::-1])
+    return np.array(lower[:-1] + upper[:-1], dtype=float)
+
+
+def min_area_rect(pts: np.ndarray) -> tuple[float, float, float, tuple]:
+    """Minimum-area enclosing rectangle, as (width, height, angle, centre).
+
+    width runs along angle (radians), height across it. Rotating calipers over
+    the hull edges: the minimum-area rectangle always has a side flush with
+    one of them, and the extreme along any direction is attained at a hull
+    vertex, so projecting the hull alone is exact rather than a sample.
+    """
+    h = _convex_hull(pts)
+    if len(h) == 0:
+        return (0.0, 0.0, 0.0, (0.0, 0.0))
+    if len(h) < 3:                       # a single point, or a collinear run
+        d = h[-1] - h[0]
+        length = float(np.hypot(d[0], d[1]))
+        mid = (h[0] + h[-1]) / 2.0
+        angle = float(np.arctan2(d[1], d[0])) if length > 0.0 else 0.0
+        return (length, 0.0, angle, (float(mid[0]), float(mid[1])))
+
+    best = None
+    for i in range(len(h)):
+        e = h[(i + 1) % len(h)] - h[i]
+        length = float(np.hypot(e[0], e[1]))
+        if length <= 0.0:
+            continue
+        d = e / length
+        n = np.array([-d[1], d[0]])
+        u, v = h @ d, h @ n
+        u0, u1, v0, v1 = u.min(), u.max(), v.min(), v.max()
+        w, ht = float(u1 - u0), float(v1 - v0)
+        if best is None or w * ht < best[0]:
+            c = d * ((u0 + u1) / 2.0) + n * ((v0 + v1) / 2.0)
+            best = (w * ht, w, ht, float(np.arctan2(d[1], d[0])),
+                    (float(c[0]), float(c[1])))
+    if best is None:                     # every hull edge of zero length
+        return (0.0, 0.0, 0.0, (float(h[0][0]), float(h[0][1])))
+    return (best[1], best[2], best[3], best[4])
+
+
 def min_rect_size(pts: np.ndarray) -> tuple[float, float]:
     """Side lengths of the minimum-area rotated bounding box of a point cloud.
     A net that is too wide axis-aligned often fits fine on the diagonal, so
     testing the AABB alone rejects islands that would actually have fitted."""
-    from shapely.geometry import MultiPoint
     if len(pts) < 3:
         return (0.0, 0.0)
-    r = MultiPoint([tuple(p) for p in pts]).minimum_rotated_rectangle
-    if r.geom_type != "Polygon":
-        b = pts.max(axis=0) - pts.min(axis=0)
-        return (float(b[0]), float(b[1]))
-    c = np.asarray(r.exterior.coords)[:4]
-    e = np.linalg.norm(np.diff(np.vstack([c, c[:1]]), axis=0), axis=1)
-    return (float(e[0]), float(e[1]))
+    w, h, _, _ = min_area_rect(pts)
+    return (w, h)
 
 
 def fits(pts: np.ndarray, max_w: float, max_h: float) -> bool:
@@ -368,9 +460,60 @@ def fits(pts: np.ndarray, max_w: float, max_h: float) -> bool:
     return (w <= max_w and h <= max_h) or (h <= max_w and w <= max_h)
 
 
+def _grow_partition(sub: nx.Graph, pos: dict[int, np.ndarray],
+                    max_w: float, max_h: float, root: int,
+                    order: str, rng) -> list:
+    """Partition one tree into as few connected pieces as the bed allows.
+
+    Bottom-up: every node starts a piece, absorbs each child's piece if the
+    result still fits, and cuts that child off if it does not. Growing pieces
+    to their limit is the whole point - the previous scorer preferred *even*
+    splits, which is precisely how you turn one net into many small ones.
+
+    Two properties make this sound rather than merely plausible:
+
+    - Feasibility is downward-closed. Dropping faces can only shrink the point
+      cloud, so "grow until it stops fitting" is well defined.
+    - A cut can never become regrettable. After a child is cut off, its piece
+      is final while the parent's piece only ever grows, and a superset of a
+      set that did not fit does not fit either. So no two finished pieces
+      could have been left joined - the result is maximal, not just valid.
+
+    Only the convex hull of each piece is carried, since min_area_rect reads
+    nothing else, which keeps the merge test cheap as pieces grow.
+    """
+    parent = {}
+    for u, v in nx.dfs_edges(sub, source=root):
+        parent[v] = u
+
+    hulls: dict[int, np.ndarray] = {}
+    sizes: dict[int, int] = {}
+    cuts = []
+    for u in nx.dfs_postorder_nodes(sub, source=root):
+        hull = _convex_hull(pos[u])
+        size = 1
+        kids = [v for v in sub.neighbors(u) if parent.get(v) is u or parent.get(v) == u]
+        if order == "small":
+            kids.sort(key=lambda v: sizes[v])
+        elif order == "big":
+            kids.sort(key=lambda v: -sizes[v])
+        else:
+            rng.shuffle(kids)
+        for v in kids:
+            cand = np.vstack([hull, hulls[v]])
+            if fits(cand, max_w, max_h):
+                hull = _convex_hull(cand)
+                size += sizes[v]
+            else:
+                cuts.append((u, v))
+        hulls[u], sizes[u] = hull, size
+    return cuts
+
+
 def split_to_fit(pm: PolyMesh, forest: nx.Graph, pos: dict[int, np.ndarray],
-                 max_w: float, max_h: float, max_splits: int = 400):
-    """Cut tree arcs until every island fits the bed.
+                 max_w: float, max_h: float, max_splits: int = 400,
+                 trials: int = 24, seed: int = 0):
+    """Cut tree arcs until every island fits the bed, using as few as possible.
 
     Key economy: removing an arc never moves a face relative to the others in
     its own half - the placement of each half is fixed by the tree paths that
@@ -380,48 +523,43 @@ def split_to_fit(pm: PolyMesh, forest: nx.Graph, pos: dict[int, np.ndarray],
     Splitting along a fold edge is the good kind of split: the seam lands on a
     real crease that already needs a glue flap, instead of a flat butt joint
     across the middle of a panel.
+
+    Cutting k arcs of a forest always yields exactly k more components, so
+    "fewest pieces" is just "fewest cuts" - the trials below vary the root and
+    the order children are absorbed in, and keep the cheapest result.
     """
     forest = forest.copy()
-    splits = 0
+    rng = np.random.default_rng(seed)
 
-    def comp_pts(comp):
-        return np.vstack([pos[f] for f in comp])
+    comps = [c for c in nx.connected_components(forest) if len(c) > 1]
+    best_cuts = None
+    for t in range(max(1, trials)):
+        cuts = []
+        for comp in comps:
+            sub = forest.subgraph(comp)
+            nodes = sorted(comp)
+            if t == 0:
+                root = nodes[0]
+                order = "small"
+            elif t == 1:
+                root = nodes[0]
+                order = "big"
+            else:
+                root = nodes[int(rng.integers(len(nodes)))]
+                order = ("small", "big", "random")[t % 3]
+            cuts += _grow_partition(sub, pos, max_w, max_h, root, order, rng)
+        if best_cuts is None or len(cuts) < len(best_cuts):
+            best_cuts = cuts
+            if not cuts:
+                break                   # already one piece per component
 
-    while splits < max_splits:
-        bad = [c for c in nx.connected_components(forest)
-               if not fits(comp_pts(c), max_w, max_h)]
-        if not bad:
-            break
-        comp = max(bad, key=len)
-        sub = forest.subgraph(comp).copy()
-        if sub.number_of_edges() == 0:
-            break                       # a single face larger than the bed
-
-        best, best_score = None, None
-        for u, v in list(sub.edges()):
-            sub.remove_edge(u, v)
-            half = nx.node_connected_component(sub, u)
-            other = set(comp) - half
-            sub.add_edge(u, v)
-            if not other:
-                continue
-            a = min_rect_size(comp_pts(half))
-            b = min_rect_size(comp_pts(other))
-            # minimise the worse half's overflow, then prefer an even split
-            over = max(max(a) / max_w, min(a) / max_h,
-                       max(b) / max_w, min(b) / max_h)
-            score = (over, abs(len(half) - len(other)))
-            if best_score is None or score < best_score:
-                best, best_score = (u, v), score
-        if best is None:
-            break
-        forest.remove_edge(*best)
-        splits += 1
+    best_cuts = (best_cuts or [])[:max_splits]
+    forest.remove_edges_from(best_cuts)
 
     pos, _ = _forest_positions(pm, forest)
     still = [c for c in nx.connected_components(forest)
-             if not fits(comp_pts(c), max_w, max_h)]
-    return forest, pos, splits, len(still)
+             if not fits(np.vstack([pos[f] for f in c]), max_w, max_h)]
+    return forest, pos, len(best_cuts), len(still)
 
 
 # ------------------------------------------------------------ island build
@@ -486,7 +624,8 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
     G_full = pm.dual_graph()
     G, notes = apply_constraints(G_full, forced_cuts, forced_folds)
 
-    forest, pos, bad, used = search(pm, G, trials=trials, seed=seed, verbose=verbose)
+    forest, pos, bad, used = search(pm, G, trials=trials, seed=seed,
+                                    verbose=verbose, max_size=max_size)
     extra = 0
     if bad:
         forest, pos, bad, extra = repair(pm, forest, bad)

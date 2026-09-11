@@ -7,6 +7,7 @@ on net-like geometry and is the obvious upgrade, but bbox shelving is 60
 lines and gets a first model onto the machine.
 """
 from __future__ import annotations
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -16,7 +17,7 @@ from shapely.geometry import MultiLineString, LineString, Polygon, box
 from shapely.ops import unary_union
 
 from .material import Material
-from .unfold import Island
+from .unfold import Island, min_area_rect
 from .folds import plan_folds, apply_relief, kerf_compensate
 from .tabs import place_tabs, seam_labels, part_labels
 
@@ -30,6 +31,7 @@ class Part:
     engrave: MultiLineString           # labels
     warnings: list = field(default_factory=list)
     sheet: int = -1
+    xform: np.ndarray = field(default_factory=lambda: np.eye(3))
 
     def apply(self, fn):
         self.cut = fn(self.cut)
@@ -39,9 +41,33 @@ class Part:
 
     def rotate(self, deg, origin=(0, 0)):
         self.apply(lambda g: affinity.rotate(g, deg, origin=origin))
+        a = math.radians(deg)
+        c, s = math.cos(a), math.sin(a)
+        ox, oy = float(origin[0]), float(origin[1])
+        self._compose(np.array([[c, -s, ox - c * ox + s * oy],
+                                [s, c, oy - s * ox - c * oy],
+                                [0.0, 0.0, 1.0]]))
 
     def translate(self, dx, dy):
         self.apply(lambda g: affinity.translate(g, dx, dy))
+        self._compose(np.array([[1.0, 0.0, dx],
+                                [0.0, 1.0, dy],
+                                [0.0, 0.0, 1.0]]))
+
+    def _compose(self, M: np.ndarray) -> None:
+        """Track where packing put this part.
+
+        The geometry alone is not enough to show the packing anywhere else:
+        the net UV layer needs the same rigid motion applied to the island's
+        faces, or the 2D view shows a layout that has nothing to do with the
+        sheets actually being cut - parts straddling sheet boundaries and
+        ignoring the margins.
+        """
+        self.xform = M @ self.xform
+
+    def place(self, pts: np.ndarray) -> np.ndarray:
+        """Push island-space points through the packing transform."""
+        return pts @ self.xform[:2, :2].T + self.xform[:2, 2]
 
     @property
     def bounds(self):
@@ -126,15 +152,19 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
 
 
 def orient_min_bbox(part: Part) -> None:
-    """Rotate a part onto its minimum-area bounding box, so it packs tightly."""
-    mrr = part.cut.minimum_rotated_rectangle
-    if mrr.geom_type != "Polygon":
+    """Rotate a part onto its minimum-area bounding box, so it packs tightly.
+
+    Uses the core's own rotated-rectangle rather than the GEOS one, which
+    degenerates on some nets - see min_area_rect. A bogus angle here does not
+    fail loudly, it just quietly wastes sheet.
+    """
+    pts = shapely.get_coordinates(part.cut)
+    w, h, angle, centre = min_area_rect(pts)
+    if w <= 0.0 or h <= 0.0:
         return
-    c = np.asarray(mrr.exterior.coords)[:4]
-    edges = np.diff(np.vstack([c, c[:1]]), axis=0)
-    lengths = np.linalg.norm(edges, axis=1)
-    e = edges[int(np.argmax(lengths))]
-    part.rotate(-np.degrees(np.arctan2(e[1], e[0])), origin=tuple(mrr.centroid.coords)[0])
+    if h > w:                          # bring the long side onto x
+        angle += np.pi / 2.0
+    part.rotate(-np.degrees(angle), origin=centre)
 
 
 def pack(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
