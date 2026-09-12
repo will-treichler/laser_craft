@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 115 core invariants (~30 s)
+python -m pytest tests -q               # 125 core invariants (~30 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -55,6 +55,44 @@ edge lengths survive to ~1e-15. There is no solver. Parameterisation tools
 faces that shared a 40.00 mm edge must still share one or the model won't
 close. Any change that makes `test_unfold_is_exactly_isometric` fail is wrong,
 not the test.
+
+**Which side of a seam a face goes is combinatorial, not geometric.** Two
+faces of a consistently wound mesh traverse their shared edge in *opposite*
+directions, so `_face_local` already hands each one a signed `h` pointing away
+from the other: place both with `k = +1` and they land on opposite sides.
+`unfold_tree` used to infer the side from `np.sign(np.sum(...))` of the
+vertices' signed offsets, which is a centroid test, not a side test. A concave
+ring can have its vertex sum on the far side of its own seam - and the child
+was then placed on top of its parent.
+
+That is not merely an overlap. Flipping the side *reflects* the face, so the
+exported part is the mirror image of the real one and will not fold up - and
+`isometry_error` cannot see it, because a reflection preserves every edge
+length. Measured on pikachu at 150 mm: **5 of 277 faces mirrored** at an
+isometry error of 2.7e-05, 7 folds back-folded, and the spurious overlaps drove
+`repair` to 32 extra cuts and **15 confetti islands of one or two faces** -
+44% of the islands holding 1.4% of the area. Reading the two windings against
+each other rather than trusting the mesh globally also absorbs a locally
+flipped ring. After: 24 islands, 23 cuts, 5 tiny, 0 mirrored, 0 back-folds.
+Every synthetic mesh in the corpus is bit-identical, because the bug only
+bites concave n-gons and primitives have none after the coplanar merge.
+
+`mirrored_faces` is the missing invariant and belongs next to
+`isometry_error` in any check of a net. Regressions:
+`test_no_face_is_placed_mirrored`,
+`test_a_concave_child_is_not_reflected_onto_its_parent`,
+`test_a_locally_flipped_face_still_places_correctly`.
+
+**GEOS mis-intersects two faces that share an edge.** This is how the above
+was nearly mis-diagnosed. Two faces reach their shared corner down different
+tree paths and land **one ulp** apart; `a.intersection(b)` then returns the
+*whole of the smaller triangle* for two triangles that only touch along that
+edge. A correct net measures as catastrophically back-folded. `set_precision`
+at 1e-9 - or the small negative buffer `overlapping_pairs` already applies -
+returns the right answer, 0. Same class of failure as
+`minimum_rotated_rectangle`; never measure an overlap on raw unfolded
+coordinates. Regression:
+`test_geos_needs_set_precision_to_intersect_faces_sharing_an_edge`.
 
 **Shapely unions need `set_precision`.** Faces are placed independently, so a
 shared corner computed via two tree paths lands ~1e-14 apart. Without snapping

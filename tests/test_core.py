@@ -11,6 +11,8 @@ import numpy as np
 import networkx as nx
 import trimesh
 import pytest
+from shapely.geometry import Polygon
+from shapely import set_precision
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -18,7 +20,8 @@ from cardboard_unfolder import Material, PolyMesh
 from cardboard_unfolder import mesh as mesh_mod
 from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs,
                                        search, min_rect_size, min_area_rect, fits,
-                                       split_to_fit, split_island)
+                                       split_to_fit, split_island, unfold_tree,
+                                       mirrored_faces, _face_local)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, kerf_compensate,
                                       fold_intervals, flute_warning)
@@ -120,6 +123,104 @@ def test_unfold_is_exactly_isometric(name, tm):
     pm = PolyMesh.from_trimesh(tm)
     islands, rep = unfold(pm, trials=120)
     assert rep["isometry_error"] < 1e-12, rep
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_no_face_is_placed_mirrored(name, tm):
+    """The invariant isometry_error cannot see.
+
+    Placing a face on the wrong side of its seam reflects it. A reflection
+    preserves every edge length, so the isometry check measures perfect while
+    the part is the mirror image of the real face and will not fold up.
+    """
+    pm = PolyMesh.from_trimesh(tm)
+    T, pos, bad, _ = search(pm, trials=120)
+    assert mirrored_faces(pm, pos) == []
+
+
+def _concave_pair():
+    """Two faces whose child is concave enough to fool a centroid test.
+
+    The child's seam runs x 0->10. Its body is at +y, but it has a leg
+    reaching to y = -6 out at x 10.5..13 - past the end of the seam, so the leg
+    misses the parent entirely and the correct placement has no overlap at all.
+    The sum of the child's signed offsets is still negative, which is exactly
+    what a sign-of-the-sum side test gets wrong.
+    """
+    c, s = math.cos(math.radians(60.0)), math.sin(math.radians(60.0))
+    parent = [(0, 0, 0), (0, -3, 0), (10, -3, 0), (10, 0, 0)]
+    child2d = [(0, 0), (10, 0), (10.5, -6), (13, -6), (13, 2), (0, 2)]
+    verts = list(parent)
+    rings = [[0, 1, 2, 3]]
+    ring = []
+    for u, v in child2d:
+        pt = (u, v * c, v * s)
+        for i, w in enumerate(verts):
+            if np.allclose(w, pt, atol=1e-12):
+                ring.append(i)
+                break
+        else:
+            verts.append(pt)
+            ring.append(len(verts) - 1)
+    rings.append(ring)
+    # merge off: the two faces are not coplanar, but nothing here should be
+    # rewritten under the test's feet.
+    return PolyMesh.from_rings(np.array(verts, float), rings, merge=False)
+
+
+def test_a_concave_child_is_not_reflected_onto_its_parent():
+    pm = _concave_pair()
+    G = pm.dual_graph()
+    assert G.number_of_edges() == 1, "the fixture must share exactly one edge"
+    ev = list(G.edges(data=True))[0][2]["verts"]
+
+    # The fixture is only worth having if it actually trips the old rule.
+    _t, h, _L = _face_local(pm, 1, ev[0], ev[1])
+    assert h.sum() < 0 < np.abs(h).max(),         "fixture no longer fools a sign-of-the-sum side test"
+
+    pos = unfold_tree(pm, G, 0)
+    assert mirrored_faces(pm, pos) == [], "the child was reflected"
+
+    a = Polygon(pos[0]).buffer(0)
+    b = Polygon(pos[1]).buffer(0)
+    a, b = set_precision(a, 1e-9), set_precision(b, 1e-9)
+    assert a.intersection(b).area < 1e-9, "the child was folded back over it"
+    assert isometry_error(pm, pos) < 1e-12
+
+
+def test_a_locally_flipped_face_still_places_correctly():
+    """The side is read from the two windings against each other, not from the
+    mesh being globally consistent - so one reversed ring costs nothing."""
+    pm = _concave_pair()
+    flipped = PolyMesh.from_rings(pm.vertices,
+                                  [pm.faces[0], list(reversed(pm.faces[1]))],
+                                  merge=False)
+    G = flipped.dual_graph()
+    pos = unfold_tree(flipped, G, 0)
+    a = set_precision(Polygon(pos[0]).buffer(0), 1e-9)
+    b = set_precision(Polygon(pos[1]).buffer(0), 1e-9)
+    assert a.intersection(b).area < 1e-9
+    assert isometry_error(flipped, pos) < 1e-12
+
+
+def test_geos_needs_set_precision_to_intersect_faces_sharing_an_edge():
+    """Why every overlap measurement here snaps first.
+
+    Two faces reach their shared corner down different tree paths and land one
+    ulp apart. GEOS then returns the WHOLE of the smaller triangle as the
+    intersection of two triangles that only touch along that edge - so a
+    perfectly good net measures as catastrophically back-folded. This is the
+    same class of GEOS failure as minimum_rotated_rectangle.
+    """
+    a = Polygon([(0.8410296852764221, -14.660246626375063),
+                 (-2.825933799914169, -10.978942271621378),
+                 (-4.754465724754761, -12.942846048485386)])
+    b = Polygon([(-2.825933799914169, -10.978942271621378),
+                 (0.8410296852764222, -14.660246626375063),   # 1 ulp apart
+                 (6.968610201863562, -9.426195684)])
+    assert a.intersection(b).area == pytest.approx(a.area),         "GEOS no longer mis-evaluates this; the snapping may be simplifiable"
+    assert set_precision(a, 1e-9).intersection(
+        set_precision(b, 1e-9)).area == 0.0
 
 
 @pytest.mark.parametrize("name,tm", ALL, ids=IDS)

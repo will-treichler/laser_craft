@@ -125,6 +125,12 @@ def _face_local(pm: PolyMesh, face: int, v0: int, v1: int):
     return r @ d3, r @ e3, L
 
 
+def _edge_dir(ring, a: int, b: int) -> int:
+    """+1 if the ring traverses a -> b, -1 if b -> a."""
+    n = len(ring)
+    return 1 if ring[(ring.index(a) + 1) % n] == b else -1
+
+
 def unfold_tree(pm: PolyMesh, tree: nx.Graph, root: int) -> dict[int, np.ndarray]:
     """Place every face of one connected dual-tree component into the plane."""
     pos: dict[int, np.ndarray] = {}
@@ -146,11 +152,25 @@ def unfold_tree(pm: PolyMesh, tree: nx.Graph, root: int) -> dict[int, np.ndarray
         d = d / np.linalg.norm(d)
         e = np.array([-d[1], d[0]])
 
-        # which side of the seam does the parent occupy?
-        s_par = np.sign(np.sum((pos[parent] - P2) @ e))
+        # Which side of the seam the child goes is a combinatorial fact, not
+        # something to infer from the geometry. Two faces of a consistently
+        # wound mesh traverse their shared edge in OPPOSITE directions, so
+        # _face_local hands each of them a signed h that already points away
+        # from the other; placing both with k = +1 puts them on opposite
+        # sides. Reading the two directions against each other rather than
+        # trusting the mesh globally also absorbs a locally flipped face.
+        #
+        # The sums of signed offsets this replaced were a centroid test, not a
+        # side test. A concave ring can have its vertex sum on the far side of
+        # its own seam, and the child was then placed on top of its parent -
+        # which is not merely an overlap but a REFLECTION, the mirror image of
+        # the true face, and it will not fold up. isometry_error cannot see it
+        # because a reflection keeps every edge length. Measured on pikachu at
+        # 150 mm: 5 of 277 faces mirrored, 7 folds back-folded, and the
+        # spurious overlaps drove repair to 32 extra cuts and 15 confetti
+        # islands of one or two faces.
         t, h, L = _face_local(pm, child, ev[0], ev[1])
-        hm = np.sign(np.sum(h)) or 1.0
-        k = -s_par * hm                       # flip the child to the far side
+        k = -1.0 if _edge_dir(pr, *ev) == _edge_dir(cr, *ev) else 1.0
 
         pos[child] = P2 + np.outer(t, d) + k * np.outer(h, e)
     return pos
@@ -169,6 +189,30 @@ def isometry_error(pm: PolyMesh, pos: dict[int, np.ndarray]) -> float:
             if l3 > 1e-12:
                 worst = max(worst, abs(l3 - l2) / l3)
     return worst
+
+
+def mirrored_faces(pm: PolyMesh, pos: dict[int, np.ndarray]) -> list[int]:
+    """Faces whose placement is a reflection rather than a rigid motion.
+
+    The companion to isometry_error, which is blind to this: a reflection
+    preserves every edge length, so a mirrored face measures perfect and is
+    still the wrong part - it will not fold up. Signed area is the test. Each
+    face's own winding fixes the handedness of the frame _face_local builds,
+    so a placement that preserves orientation keeps the sign that frame gives
+    it.
+    """
+    bad = []
+    for f, p in pos.items():
+        ring = pm.faces[f]
+        t, h, _ = _face_local(pm, f, ring[0], ring[1])
+        if np.sign(_signed_area(np.column_stack([t, h]))) !=                 np.sign(_signed_area(p)):
+            bad.append(f)
+    return bad
+
+
+def _signed_area(p: np.ndarray) -> float:
+    x, y = p[:, 0], p[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
 
 
 def overlapping_pairs(forest: nx.Graph, pos: dict[int, np.ndarray],
