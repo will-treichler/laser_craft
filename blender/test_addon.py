@@ -849,6 +849,83 @@ check(obj.name in ops._LAST, "unfold cached a result to export")
 check(obj.name in overlay._fingerprints, "unfold fingerprinted the geometry")
 check(not overlay.geometry_changed(obj), "an untouched mesh reads as unchanged")
 
+# ------------------------------------------ Opacity is a view setting
+# It used to be baked into the vertex colours at build time and never read
+# again, so the slider did nothing until the next unfold - and CBU_OT_unfold
+# did not pass the setting at all, so in practice it was welded to 0.55. The
+# island index is cached instead of the colour, so changing opacity re-colours
+# geometry already in hand.
+#
+# There is no GPU in background mode, so overlay._batches is always empty here
+# (available() is False and rebuild returns early). The colour rule and the
+# re-colour bookkeeping are therefore tested directly, and the wiring is
+# asserted on the code objects.
+check(not overlay.available(), "background mode has no GPU, as assumed below")
+
+check(overlay.island_color(3, 0.25)[3] == 0.25,
+      "island_color honours the alpha it is handed")
+_cols = overlay.island_colors([0, 1, 0, 2], 0.25)
+check(len(_cols) == 4 and all(c[3] == 0.25 for c in _cols),
+      "island_colors gives every vertex the requested opacity")
+check(_cols[0] == _cols[2] and _cols[0] != _cols[1],
+      "and keeps one colour per island, not per vertex")
+check(overlay.island_colors([0, 1], 0.9)[0][:3]
+      == overlay.island_colors([0, 1], 0.2)[0][:3],
+      "opacity changes the alpha only - an island keeps its hue")
+
+# set_alpha re-colours what is cached. Stand in for the batch the GPU would
+# have built, since there is none here.
+overlay._batches["__probe__"] = {"pos": [], "ids": [0, 1], "alpha": 0.55,
+                                 "tris": None, "lines": None}
+overlay.set_alpha(0.2)
+check(overlay._batches["__probe__"]["alpha"] == 0.2,
+      "set_alpha re-colours a cached annotation")
+overlay._batches["__probe__"]["tris"] = "sentinel"
+overlay.set_alpha(0.2)
+check(overlay._batches["__probe__"]["tris"] == "sentinel",
+      "an unchanged opacity rebuilds nothing - a dragged slider fires "
+      "continuously")
+overlay.set_alpha(0.9)
+check(overlay._batches["__probe__"]["tris"] != "sentinel",
+      "a changed one does rebuild")
+del overlay._batches["__probe__"]
+
+# Re-colouring must stay a pure cache operation: no mesh read, nothing that is
+# unsafe to do from a property update while the user is dragging.
+_sa = overlay.set_alpha.__code__.co_names
+check("rebuild" not in _sa and "data" not in _sa,
+      f"set_alpha does not touch the mesh ({_sa})")
+check("overlay_alpha" in props.restyle_overlay.__code__.co_names
+      and "set_alpha" in props.restyle_overlay.__code__.co_names,
+      "the slider's update callback is what calls it")
+
+# What rebuild actually caches can only be seen with a shader in hand, so
+# stand one in. This is the half headless mode cannot reach: that the island
+# index and the opacity are stored at all, which is what makes set_alpha work.
+_real_sh, _real_batch = overlay._shaders, overlay.batch_for_shader
+overlay._shaders = lambda: ("tri", "line")
+overlay.batch_for_shader = lambda sh, kind, data: (kind, len(data["pos"]))
+try:
+    _pm, _isl = ops._LAST[obj.name][0], ops._LAST[obj.name][1]
+    overlay.rebuild(obj, _pm, _isl, 0.3)
+    _b = overlay._batches[obj.name]
+    check(_b["alpha"] == 0.3, "rebuild records the opacity it built at")
+    check(len(_b["pos"]) > 0 and len(_b["ids"]) == len(_b["pos"]),
+          f"and one island index per vertex ({len(_b['ids'])} of {len(_b['pos'])})")
+    check(set(_b["ids"]) == {i.id for i in _isl},
+          "covering every island, so nothing is left uncoloured")
+    overlay.set_alpha(0.8)
+    check(overlay._batches[obj.name]["alpha"] == 0.8,
+          "and set_alpha re-colours that cache in place")
+finally:
+    overlay._shaders, overlay.batch_for_shader = _real_sh, _real_batch
+    overlay._batches.pop(obj.name, None)
+
+# Both rebuild call sites must pass the setting; one of them silently did not.
+for _fn in (ops.CBU_OT_unfold.execute, ops.CBU_OT_edit_seam._separate):
+    check("overlay_alpha" in _fn.__code__.co_names,
+          f"{_fn.__qualname__} passes the opacity setting through")
+
 # Marking a seam writes an edge attribute. The depsgraph calls that a geometry
 # update, but it must NOT count as modifying the object - otherwise the island
 # colours vanish at the exact moment you are marking against them.

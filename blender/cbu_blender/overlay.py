@@ -148,7 +148,7 @@ def rebuild(obj, pm, islands, alpha: float = 0.55) -> None:
         _batches.pop(obj.name, None)
         return
 
-    verts, cols = [], []
+    verts, ids = [], []
     cut_pts, cut_cols = [], []
 
     island_of = {}
@@ -158,12 +158,15 @@ def rebuild(obj, pm, islands, alpha: float = 0.55) -> None:
 
     eps = lift_amount(obj)
     for f, ring in enumerate(pm.faces):
-        col = island_color(island_of.get(f, 0), alpha)
+        i = island_of.get(f, 0)
         co = lift([obj.data.vertices[v].co[:] for v in ring], eps)
         for tri in _fan(co):
             for p in tri:
                 verts.append(p[:])
-                cols.append(col)
+                # The island index, not the colour. Opacity is a view setting
+                # and has to be changeable without re-running the unfold, so
+                # the colour is resolved in _tris - see set_alpha.
+                ids.append(i)
 
     # forced marks, straight off the mesh attribute
     attr = obj.data.attributes.get("cbu_constraint")
@@ -179,12 +182,53 @@ def rebuild(obj, pm, islands, alpha: float = 0.55) -> None:
             cut_cols += [c, c]
 
     _batches[obj.name] = {
-        "tris": batch_for_shader(tri_s, "TRIS", {"pos": verts, "color": cols})
-        if verts else None,
+        "pos": verts,
+        "ids": ids,
+        "alpha": alpha,
+        "tris": _tris(verts, ids, alpha),
         "lines": batch_for_shader(line_s, "LINES",
                                   {"pos": cut_pts, "color": cut_cols})
         if cut_pts else None,
     }
+    _tag_redraw()
+
+
+def island_colors(ids, alpha: float):
+    """Resolve one colour per vertex from cached island indices.
+
+    Pure, and deliberately separate from the batch: there is no GPU in
+    background mode, so `_batches` is always empty under
+    `blender --background` and the colour rule can only be tested here.
+    """
+    lut = {i: island_color(i, alpha) for i in set(ids)}
+    return [lut[i] for i in ids]
+
+
+def _tris(verts, ids, alpha: float):
+    """Colour the cached triangles at a given opacity."""
+    tri_s, _ = _shaders()
+    if tri_s is None or not verts:
+        return None
+    return batch_for_shader(tri_s, "TRIS",
+                            {"pos": verts, "color": island_colors(ids, alpha)})
+
+
+def set_alpha(alpha: float) -> None:
+    """Re-colour every cached annotation, without re-unfolding.
+
+    The alpha used to be baked into the vertex colours when the batch was
+    built and never read again, so the Opacity slider did nothing at all until
+    the next unfold - and the Unfold operator did not even pass the setting,
+    so it was permanently 0.55. The island index is cached instead of the
+    colour, which makes this a re-colour of geometry already in hand: no
+    bmesh, no mesh read, nothing that could be unsafe to touch from a property
+    update.
+    """
+    for b in _batches.values():
+        if b.get("alpha") == alpha:
+            continue
+        b["alpha"] = alpha
+        b["tris"] = _tris(b.get("pos") or [], b.get("ids") or [], alpha)
     _tag_redraw()
 
 

@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 149 checks, real Blender API
+python blender/test_addon.py            # 165 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -163,6 +163,23 @@ flag alone wipes the island colours at the exact moment you are marking
 against them. `overlay.geometry_changed` compares element counts and vertex
 positions - which marking does not touch. Regression:
 `marking a seam does NOT count as modifying the object`.
+
+**A view setting baked into a batch is a dead control.** `overlay_alpha` was
+resolved to vertex colours in `rebuild` and never read again, so the Opacity
+slider did nothing until the next unfold - and `CBU_OT_unfold` did not pass the
+setting at all, so it was welded to the 0.55 default no matter what the slider
+said. The cache now holds the island *index* per vertex, not the colour, and
+`set_alpha` re-colours geometry already in hand: no mesh read, nothing unsafe
+to run from a property update while a slider is being dragged. It short-circuits
+on an unchanged value because `update=` fires continuously during a drag. Any
+new view setting has the same shape - if it is consumed at build time, wire an
+`update=` that restyles, or it is decoration.
+
+Note **`_batches` is always empty under `blender --background`**: `available()`
+is False without a GPU and `rebuild` returns early, so nothing about the cached
+batches can be asserted headless. Test the pure part (`island_colors`) directly,
+and stand a stub in for `_shaders` / `batch_for_shader` to reach `rebuild`'s
+bookkeeping.
 
 **The island tint must be lifted off the mesh.** It is drawn on the *same*
 planes as the faces it colours, so coplanar triangles leave the depth test to

@@ -184,7 +184,10 @@ class CBUSettings(bpy.types.PropertyGroup):
         description="Draw the laser bed, at true size, behind the net in the "
                     "UV editor. The net is in millimetres, so islands can be "
                     "read straight against it")
-    overlay_alpha: FloatProperty(name="Opacity", default=0.55, min=0.0, max=1.0)
+    overlay_alpha: FloatProperty(
+        name="Opacity", default=0.55, min=0.0, max=1.0,
+        description="How strongly the island tint covers the mesh",
+        update=restyle_overlay)
 
     # --- last run, for the panel readout ---
     last_report: StringProperty(default="")
@@ -225,6 +228,20 @@ def material_from(s: CBUSettings):
     m.sheet_margin = s.margin
     m.part_gap = s.part_gap
     return m
+
+
+def restyle_overlay(self, context):
+    """Re-colour the viewport annotation when Opacity moves.
+
+    A re-colour of cached geometry - no mesh access, nothing that is unsafe to
+    do from a property update. Without this the slider did nothing until the
+    next unfold, because the alpha was baked into the vertex colours.
+    """
+    try:
+        from . import overlay
+        overlay.set_alpha(self.overlay_alpha)
+    except Exception:                                       # noqa: BLE001
+        pass                    # a settings tweak must never break the session
 
 
 def sync_thickness(self, context):

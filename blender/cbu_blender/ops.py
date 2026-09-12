@@ -380,7 +380,7 @@ class CBU_OT_unfold(bpy.types.Operator):
 
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             with cbulog.stage(T, "overlay"):
-                overlay.rebuild(obj, pm, islands)
+                overlay.rebuild(obj, pm, islands, s.overlay_alpha)
             LAST_TIMINGS.update(T)
             s.last_timings = T.report()
             log.info("timings: %s", s.last_timings)
