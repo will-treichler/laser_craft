@@ -246,6 +246,18 @@ class CBU_PT_uv(bpy.types.Panel):
         # Dragging then pulls single faces out of the net and scatters them,
         # which reads as the net corrupting itself.
         ts = context.scene.tool_settings
+        if not ts.use_uv_select_sync:
+            # with sync off the UV editor only draws the UVs of SELECTED faces,
+            # so an empty selection shows an empty net and nothing can be picked
+            me = obj.data
+            if not any(p.select for p in me.polygons):
+                box = lay.box()
+                box.alert = True
+                box.label(text="Nothing selected", icon="ERROR")
+                box.label(text="With UV Sync off the editor only")
+                box.label(text="shows selected faces. In Edit Mode")
+                box.label(text="press A to select all.")
+                box.operator("cbu.select_all_faces", icon="SELECT_EXTEND")
         if ts.use_uv_select_sync:
             box = lay.box()
             box.alert = True

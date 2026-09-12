@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 120 checks, real Blender API
+python blender/test_addon.py            # 124 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -378,12 +378,23 @@ on the code objects - `the draw handler does not sample live UVs`,
 the vec3 one: if the failure kills the process, test the data or the code, not
 the behaviour.
 
-**UV Sync Selection tears the net, and it defaults ON in Blender 5.x.** In
+**UV Sync Selection, both ways round.** It defaults ON in Blender 5.x, and in
 that mode the UV editor moves the loops of *selected faces* rather than whole
-islands, so dragging pulls single faces out of the net and scatters them -
+islands - so dragging pulls single faces out of the net and scatters them,
 which looks exactly like the net corrupting itself. Each face stays internally
-rigid (its own edges are still exact), it has simply left its neighbours. The
-UV panel warns and offers the toggle when sync is on.
+rigid; it has simply left its neighbours.
+
+Turn sync off and the opposite bites: the UV editor then draws only the UVs of
+*selected* faces, so an empty selection shows an empty net that cannot be
+picked at all. Any operator that borrows the face selection to drive Blender's
+own tools must give it back - `cbu.pack_uv` deselects everything and selects
+one trial subset at a time, and `cbu.split_nonplanar` selects only the bent
+faces - or it leaves most of the net invisible. Both snapshot and restore now,
+`split_nonplanar` selecting all when it has changed the face count so the old
+mask no longer lines up. The UV panel warns in both states and offers
+`cbu.select_all_faces` as the way out. Regressions:
+`unfold leaves the face selection alone`,
+`nesting gives the selection back after borrowing it`.
 
 **Measure a net against `pm.vertices`, not against a recomputed world
 transform.** Chasing that apparent corruption, a diagnostic that rebuilt world

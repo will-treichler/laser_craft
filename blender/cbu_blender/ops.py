@@ -58,6 +58,26 @@ def selected_edges(context, bm):
     return [e for e in bm.edges if e.select]
 
 
+def save_face_selection(me):
+    """Snapshot which faces are selected.
+
+    Operators here select faces to drive Blender's own tools, and with UV Sync
+    Selection off the UV editor only shows the UVs of *selected* faces. Leaving
+    a working subset selected therefore hides most of the net and makes it
+    unselectable - the tool appears to have broken the 2D view.
+    """
+    sel = np.zeros(len(me.polygons), dtype=bool)
+    me.polygons.foreach_get("select", sel)
+    return sel
+
+
+def restore_face_selection(me, sel) -> None:
+    if sel is None or len(sel) != len(me.polygons):
+        return
+    me.polygons.foreach_set("select", sel)
+    me.update()
+
+
 def publish_cuts(obj, parts, mat, pm=None, islands=None):
     """Hand the real cut outlines to the 2D overlay, in ISLAND space.
 
@@ -140,6 +160,35 @@ class CBU_OT_mark(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CBU_OT_select_all_faces(bpy.types.Operator):
+    bl_idname = "cbu.select_all_faces"
+    bl_label = "Select All Faces"
+    bl_description = ("Select every face, so the whole net is visible and "
+                      "selectable in the UV editor with UV Sync off")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH"
+
+    def execute(self, context):
+        obj = context.active_object
+        prev = context.mode
+        if prev != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        for p in obj.data.polygons:
+            p.select = True
+        obj.data.update()
+        bpy.ops.object.mode_set(mode="EDIT")
+        context.tool_settings.mesh_select_mode = (False, False, True)
+        bpy.ops.mesh.select_all(action="SELECT")
+        if prev != "EDIT_MESH":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        self.report({"INFO"}, f"selected {len(obj.data.polygons)} face(s)")
+        return {"FINISHED"}
+
+
 class CBU_OT_split_nonplanar(bpy.types.Operator):
     bl_idname = "cbu.split_nonplanar"
     bl_label = "Split Non-Planar Faces"
@@ -171,6 +220,7 @@ class CBU_OT_split_nonplanar(bpy.types.Operator):
         prev = context.mode
         if prev != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
+        keep = save_face_selection(me)
         for p in me.polygons:
             p.select = False
         for i in bad:
@@ -180,6 +230,14 @@ class CBU_OT_split_nonplanar(bpy.types.Operator):
         bpy.ops.mesh.quads_convert_to_tris(quad_method="BEAUTY",
                                            ngon_method="BEAUTY")
         bpy.ops.object.mode_set(mode="OBJECT")
+        # the mesh has new faces, so the old mask no longer lines up; select
+        # everything rather than leave the user with a hidden net
+        if len(me.polygons) == len(keep):
+            restore_face_selection(me, keep)
+        else:
+            for p in me.polygons:
+                p.select = True
+            me.update()
         if prev == "EDIT_MESH":
             bpy.ops.object.mode_set(mode="EDIT")
         self.report({"INFO"}, f"split {len(bad)} non-planar face(s)")
@@ -570,6 +628,7 @@ class CBU_OT_pack_uv(bpy.types.Operator):
         prev = context.mode
         if prev != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
+        keep = save_face_selection(obj.data)
         parts = L.build_parts(islands, mat)
         try:
             sheets, err = self._nest(context, parts, mat, sc)
@@ -580,6 +639,7 @@ class CBU_OT_pack_uv(bpy.types.Operator):
         finally:
             if context.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
+            restore_face_selection(obj.data, keep)
 
         if err or sheets > old_sheets:
             # keep whatever we had: the core's packing is always valid, and a
@@ -827,6 +887,7 @@ class CBU_OT_pack_uv(bpy.types.Operator):
 PLANAR_TOL = 1e-3      # same gate PolyMesh.check uses
 
 classes = (CBU_OT_mark, CBU_OT_clear_marks, CBU_OT_select_marked,
+           CBU_OT_select_all_faces,
            CBU_OT_split_nonplanar, CBU_OT_unfold, CBU_OT_edit_seam,
            CBU_OT_repack, CBU_OT_export, CBU_OT_pack_uv)
 

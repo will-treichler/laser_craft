@@ -288,6 +288,42 @@ _v2, _ = overlay.bed_segments((0.0, 0.0, 1e9, 1e9), 600.0, 400.0, 8.0)
 check(len(_v2) // 16 <= overlay.MAX_TILES,
       f"a runaway net is capped at {overlay.MAX_TILES} tiles")
 
+# ------------------------------------------------ face selection survives
+# With UV Sync Selection off the UV editor only draws the UVs of SELECTED
+# faces. An operator that borrows the selection to drive Blender's own tools
+# and leaves a working subset behind therefore hides most of the net and makes
+# it unpickable - the add-on looks like it broke the 2D view.
+obj = fresh("SelKeep", "ico_sphere", subdivisions=2)
+obj.scale = (0.14,) * 3
+bpy.ops.object.transform_apply(scale=True)
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+for _p in obj.data.polygons:
+    _p.select = True
+obj.data.update()
+_n = len(obj.data.polygons)
+
+bpy.ops.cbu.unfold()
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+check(sum(1 for p in obj.data.polygons if p.select) == _n,
+      "unfold leaves the face selection alone")
+
+bpy.ops.cbu.pack_uv()
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+check(sum(1 for p in obj.data.polygons if p.select) == _n,
+      "nesting gives the selection back after borrowing it")
+
+for _p in obj.data.polygons:
+    _p.select = False
+obj.data.update()
+check(bpy.ops.cbu.select_all_faces() == {"FINISHED"}, "the rescue button runs")
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+check(sum(1 for p in obj.data.polygons if p.select) == _n,
+      "and brings the whole net back into view")
+
 # ------------------------------------------------ the cut outline in 2D
 # The UV layer holds only the islands. Glue tabs are generated in the core and
 # live solely in the exported parts, so a 2D view drawn from UVs alone is
