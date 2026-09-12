@@ -22,7 +22,6 @@ _batches = {}          # object name -> dict of batches
 _net_bounds = {}       # object name -> (x0, y0, x1, y1) of the net, in mm
 _net_cuts = {}         # object name -> per-island outlines, island space
 _live_rings = {}       # object name -> resolved rings, sampled off the draw
-_live_timer = None
 _fingerprints = {}     # object name -> geometry fingerprint at unfold time
 _bed_cache = {}        # draw key -> batch, so the grid is not rebuilt per frame
 _TRI = None
@@ -207,12 +206,17 @@ def _live_uv(obj, loop_idx):
                       dtype=np.float64)
 
 
-def refresh_live_cuts() -> float:
-    """Resample the cut outlines, off the draw path. Returns the next delay.
+def refresh_live_cuts(*_args):
+    """Resample the cut outlines, at a safe point in the pipeline.
 
-    A timer rather than depsgraph_update_post because a modal transform does
-    not report until it ends, and the whole point is for the outline to move
-    with the island while it is being dragged.
+    Driven by depsgraph_update_post, NOT by a timer. Reading live Edit Mode
+    UVs needs bmesh - the mesh datablock and the depsgraph's evaluated copy
+    are both empty there - and bmesh.from_edit_mesh is only safe at well
+    defined moments. From a draw handler it freed customdata under the draw;
+    from a timer it fired in the middle of a modal transform and crashed
+    again. The depsgraph reports once the transform has finished, so the
+    outline catches up when a drag is released rather than during it. That is
+    the trade: correctness and a stable session over a live-updating overlay.
     """
     try:
         ctx = bpy.context
@@ -236,7 +240,6 @@ def refresh_live_cuts() -> float:
                     _tag_redraw()
     except Exception:                                   # noqa: BLE001
         pass                    # a cosmetic overlay must never break the session
-    return 0.15
 
 
 def live_cut_rings(obj, scale: float):
@@ -498,13 +501,9 @@ def _draw_bed():
 
 
 def register():
-    global _handle, _uv_handle, _live_timer
+    global _handle, _uv_handle
     if not available():
         return
-    if _live_timer is None:
-        bpy.app.timers.register(refresh_live_cuts, first_interval=0.3,
-                                persistent=True)
-        _live_timer = refresh_live_cuts
     if _handle is None:
         _handle = bpy.types.SpaceView3D.draw_handler_add(
             _draw, (), "WINDOW", "POST_VIEW")
@@ -516,13 +515,7 @@ def register():
 
 
 def unregister():
-    global _handle, _uv_handle, _live_timer
-    if _live_timer is not None:
-        try:
-            bpy.app.timers.unregister(_live_timer)
-        except Exception:                               # noqa: BLE001
-            pass
-        _live_timer = None
+    global _handle, _uv_handle
     if _handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_handle, "WINDOW")
         _handle = None

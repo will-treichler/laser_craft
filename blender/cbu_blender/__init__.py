@@ -44,6 +44,11 @@ def _on_depsgraph(scene, depsgraph):
     marking against. `overlay.geometry_changed` compares counts and vertex
     positions instead, which marking does not touch.
     """
+    # Catch the cut outline up with any UV edit. This is the safe moment to
+    # touch bmesh: the transform has finished. A timer doing the same thing
+    # fired mid-drag and crashed Blender.
+    overlay.refresh_live_cuts()
+
     tracked = overlay.tracked_names() | set(ops._LAST)
     if not tracked:
         return

@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 124 checks, real Blender API
+python blender/test_addon.py            # 126 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -368,15 +368,33 @@ two points recover the rigid motion cheaply, where a full fit over every loop
 would not. Reading them needs bmesh in Edit Mode, which is exactly when
 islands are being dragged (`uv_layers[...].data` is empty there).
 
-`bmesh.from_edit_mesh` inside a GPU draw handler can allocate or refresh BMesh
-customdata, freeing blocks the draw is still walking: dragging a UV island
-crashed Blender in `BLI_mempool_free`, under `BM_data_layer_add`, under
-`cb_region_draw`. So a timer samples (0.15 s) and the draw only ever reads the
-cache. A GPU crash cannot be caught at runtime, so the separation is asserted
-on the code objects - `the draw handler does not sample live UVs`,
-`the cut batch reads the cache rather than sampling`. Same shape of rule as
-the vec3 one: if the failure kills the process, test the data or the code, not
-the behaviour.
+Reading live Edit Mode UVs needs bmesh and there is no safe read-only
+alternative: the mesh datablock is empty there, and so is the depsgraph's
+evaluated copy (checked). `bmesh.from_edit_mesh` is only safe at well defined
+moments, and this took two crashes to pin down:
+
+- from inside a GPU draw handler it allocates or refreshes BMesh customdata
+  and frees blocks the draw is still walking - `BLI_mempool_free` under
+  `BM_data_layer_add` under `cb_region_draw`.
+- from a timer it fires in the middle of a modal transform, and crashes again.
+
+So the refresh is driven by `depsgraph_update_post`, which reports once the
+transform has finished: the outline catches up when a drag is released rather
+than during it. That trade - a stable session over a live-updating overlay -
+is the right way round. A GPU crash cannot be caught at runtime, so the rules
+are asserted on the code objects: `the draw handler does not sample live UVs`,
+`the overlay does not poll on a timer`,
+`the depsgraph handler is what drives the refresh`. Same shape as the vec3
+rule: if the failure kills the process, test the data or the code, not the
+behaviour.
+
+**Sticky UV select drags other islands with you.** `uv_sticky_select_mode`
+defaults to Shared Location, which selects every UV sitting at the same point
+- including ones belonging to a *different* island, which packing routinely
+leaves touching. Moving one island then takes corners of its neighbours along.
+Island select (`use_uv_select_island`, a toggle in 5.x - `uv_select_mode` is
+only VERTEX/EDGE/FACE) or Sticky set to Disabled fixes it; the UV panel shows
+both and warns.
 
 **UV Sync Selection, both ways round.** It defaults ON in Blender 5.x, and in
 that mode the UV editor moves the loops of *selected faces* rather than whole

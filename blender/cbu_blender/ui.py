@@ -258,6 +258,25 @@ class CBU_PT_uv(bpy.types.Panel):
                 box.label(text="shows selected faces. In Edit Mode")
                 box.label(text="press A to select all.")
                 box.operator("cbu.select_all_faces", icon="SELECT_EXTEND")
+            else:
+                # Sticky select defaults to Shared Location, which selects every
+                # UV sitting at the same point - including ones belonging to a
+                # different island, so dragging one island takes corners of its
+                # neighbours with it. Island mode is what you want for layout.
+                col = lay.column(align=True)
+                # Island selection is a toggle in 5.x, not a value of
+                # uv_select_mode - that enum is only VERTEX/EDGE/FACE.
+                col.prop(ts, "use_uv_select_island", text="Island select")
+                col.prop(ts, "uv_sticky_select_mode", text="Sticky")
+                if (ts.uv_sticky_select_mode == "SHARED_LOCATION"
+                        and not ts.use_uv_select_island):
+                    warn = col.box()
+                    warn.alert = True
+                    warn.label(text="Sticky: Shared Location", icon="ERROR")
+                    warn.label(text="drags corners of other islands")
+                    warn.label(text="that sit at the same point.")
+                    warn.label(text="Turn on Island select, or set")
+                    warn.label(text="Sticky to Disabled.")
         if ts.use_uv_select_sync:
             box = lay.box()
             box.alert = True

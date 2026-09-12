@@ -391,7 +391,17 @@ check("live_cut_rings" not in _batch_names and "_live_uv" not in _batch_names,
 check("_live_rings" in _batch_names, "and the cache is where it reads from")
 check("_live_uv" in overlay.refresh_live_cuts.__code__.co_names
       or "live_cut_rings" in overlay.refresh_live_cuts.__code__.co_names,
-      "the timer is what samples")
+      "refresh_live_cuts is what samples")
+
+# No timer. Reading live Edit Mode UVs needs bmesh, and bmesh.from_edit_mesh is
+# only safe at defined moments: from a draw handler it freed customdata under
+# the draw, from a timer it fired mid-transform and crashed again. The
+# depsgraph reports once a transform has finished, which is safe.
+_src = (ROOT / "cbu_blender" / "overlay.py").read_bytes().decode()
+check("bpy.app.timers" not in _src,
+      "the overlay does not poll on a timer")
+check("refresh_live_cuts" in cbu_blender._on_depsgraph.__code__.co_names,
+      "the depsgraph handler is what drives the refresh")
 
 # it has to go stale with everything else, or it paints a net that has moved
 obj.data.vertices[0].co.x += 0.02
