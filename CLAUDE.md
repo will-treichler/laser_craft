@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 135 core invariants (~34 s)
+python -m pytest tests -q               # 157 core invariants (~53 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -586,6 +586,15 @@ consumed, or the measurement invents the defect it is looking for.
 the core's float64 geometry. ~9e-5 mm error at 500 mm coordinates — 90 nm
 against a 0.3 mm kerf.
 
+**`watch.sync_vendor` compares content, not mtime.** The vendored tree is a
+pure copy, so "the copy is newer" is never a reason to keep it - and something
+else having touched it is exactly when it needs overwriting. `test_dev.py`
+edits the vendored `material.py` to prove hot reload works and restores it in a
+`finally`; a *killed* run skips that, leaving `crush = 0.61` with a fresh
+mtime, and an mtime-based sync then refuses to undo it for the rest of time.
+The next `test_dev` run fails three checks that read like real defects in the
+material model. It now self-heals from the core and says so.
+
 **Hot reload purges `__pycache__` first.** Python validates a `.pyc` from
 source mtime in whole *seconds* plus size, so a same-second edit that doesn't
 change the length silently runs old code.
@@ -635,6 +644,44 @@ remnants *are* the bridges - the material the floor exists to protect - and
 they are shorter than it by design; applying it there deleted every dash and
 the PERF layer vanished from the SVG entirely. `perf_segments` takes
 `min_connect=0.0` for that call.
+
+**A kerf offset cannot reach into a notch, and no join style fixes it.**
+Growing the part by kerf/2 is right along an edge and at a convex corner. A
+notch cut into the material is an *inner* corner: the offset fills it and the
+cut stops short of the apex by exactly `(kerf/2) / sin(theta/2)` - 0.30 mm at
+60 degrees, 0.86 at 20, 1.72 at 10, 8.59 at 2. Mitre, bevel and round shape
+only *outer* corners, so `mitre_limit` changes this by nothing at all -
+measured identical to six decimal places across all four join styles
+(`test_kerf_offset_cannot_reach_into_a_notch`). On a pikachu net: 634 notches,
+median loss 0.15 mm (fine, that is just the offset) but worst case 13.09 mm of
+material left uncut at an apex. On 3 mm board that is a fold that will not
+fold.
+
+`folds.corner_relief` reaches the apex explicitly, with a slit one beam wide
+down the notch bisector, `corner_overcut` mm past it. Take the direction from
+`nearest_points(cut.boundary, apex)` rather than from angle arithmetic - that
+point IS the offset apex, so the segment between them is the bisector, and
+nothing has to reason about winding or which side the material lies on. Only
+notches losing more than a whole kerf are touched; below that the beam already
+covers the apex. Worst case 13.09 mm -> 0.30 mm, for 0.13% of the net's area.
+
+Two things it must not do, both found by measuring rather than by the suite:
+
+- **Never break a part in two.** At a near-pinch the neck is held together
+  only by the material the offset added - which is exactly what relief removes
+  - so a slit there severs the part: 24 parts became 48 loose pieces on the
+  first measurement. The slits are applied together, and only if that raises
+  the piece count are they re-applied one at a time, dropping the ones at
+  fault. `narrow_necks` still warns about the pinch.
+- **Keep only the areal result.** A slit landing exactly along an edge leaves
+  a stray LineString and `difference` returns a GeometryCollection, which has
+  no `.exterior` - every consumer of `Part.cut` then breaks. It happens on a
+  real pikachu net and on nothing in the synthetic corpus.
+
+Cost: the core suite went 34 s to 89 s when this was a per-vertex Python loop,
+because nearly every vertex is an ordinary one sitting the offset distance
+away. `shapely.contains` / `shapely.distance` over a point array, with the cut
+prepared, brings it back to 41 s.
 
 `round_cut_ends` radiuses slot ends, because a square internal corner
 concentrates stress and is where a fold starts to tear. Note shapely draws a
