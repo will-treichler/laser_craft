@@ -56,6 +56,14 @@ class Material:
                                     # almost nothing holding it; this floor is what
                                     # stops small joints tearing off. EMPIRICAL.
     round_cut_ends: bool = True     # radius slot ends instead of leaving them square.
+
+    # Growing the part by kerf/2 cannot reach into a notch: the cut stops
+    # short of the apex by (kerf/2)/sin(theta/2). corner_relief runs a slit
+    # down the bisector to reach it. Empirical only in the sense that how
+    # far PAST the apex to go depends on the board - 0 is enough for B
+    # flute, a thicker board may want a little more.
+    corner_relief: bool = True
+    corner_overcut: float = 0.0     # mm past the apex
                                     # A square internal corner is a crack starter, and
                                     # the beam dwells there anyway.
     # Period must stay well under the flute pitch or consecutive flutes get very

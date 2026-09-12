@@ -43,8 +43,15 @@ def sync_vendor() -> None:
         return
     for f in src.glob("*.py"):
         t = dst / f.name
-        if not t.exists() or t.stat().st_mtime < f.stat().st_mtime:
-            t.write_bytes(f.read_bytes())
+        # Content, not mtime. The vendored tree is a pure copy, so "the copy is
+        # newer" is never a reason to keep it - and something else touching it
+        # is exactly when it needs overwriting. test_dev.py edits the vendored
+        # material.py to prove hot reload works; a killed run leaves that edit
+        # in place with a fresh mtime, and an mtime sync then refuses to undo it
+        # forever. The files are a few KB each.
+        data = f.read_bytes()
+        if not t.exists() or t.read_bytes() != data:
+            t.write_bytes(data)
 
 
 def run(addon: bool) -> bool:

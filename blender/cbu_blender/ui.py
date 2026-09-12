@@ -131,6 +131,11 @@ class CBU_PT_folds(_Base, bpy.types.Panel):
         lay.prop(s, "connect_ratio")
         lay.prop(s, "min_connect")
         lay.prop(s, "round_cut_ends")
+        lay.separator()
+        lay.prop(s, "corner_relief")
+        sub = lay.column()
+        sub.enabled = s.corner_relief
+        sub.prop(s, "corner_overcut")
 
 
 class CBU_PT_machine(_Base, bpy.types.Panel):

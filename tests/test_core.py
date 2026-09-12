@@ -11,7 +11,8 @@ import numpy as np
 import networkx as nx
 import trimesh
 import pytest
-from shapely.geometry import Polygon, MultiLineString, box
+from shapely.geometry import (Polygon, MultiLineString, box,
+                              Point)
 from shapely import set_precision
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,7 +25,8 @@ from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs
                                        mirrored_faces, _face_local)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, kerf_compensate,
-                                      fold_intervals, flute_warning)
+                                      fold_intervals, flute_warning,
+                                      corner_relief)
 from cardboard_unfolder.tabs import place_tabs
 from cardboard_unfolder.layout import (build_parts, pack, narrow_necks,
                                        Part, tighten, find_spot,
@@ -315,6 +317,107 @@ def test_packing_leaves_no_overlap_and_nothing_off_the_sheet(name, tm):
             assert x0 >= m - 1e-6 and y0 >= m - 1e-6
             assert x1 <= mat.bed[0] - m + 1e-6
             assert y1 <= mat.bed[1] - m + 1e-6
+
+
+def _slab_with_notch(deg, top=30.0):
+    """Slab x[-30,30] y[-10,top] with a V cut down from the top, apex at (0,0)."""
+    h = math.radians(deg / 2.0)
+    w = top * math.tan(h)
+    return Polygon([(-30, -10), (30, -10), (30, top), (w, top), (0.0, 0.0),
+                    (-w, top), (-30, top)])
+
+
+@pytest.mark.parametrize("deg,expect", [(90, 0.21), (60, 0.30), (30, 0.58),
+                                        (20, 0.86), (10, 1.72), (5, 3.44)])
+def test_kerf_offset_cannot_reach_into_a_notch(deg, expect):
+    """The defect corner_relief exists for, stated as the geometry it is.
+
+    A notch is an INNER corner, so join style is irrelevant - mitre, bevel and
+    round only shape outer corners. The cut stops short by (kerf/2)/sin(t/2)
+    whatever you pass.
+    """
+    body = _slab_with_notch(deg)
+    apex = Point(0, 0)
+    seen = set()
+    for js, ml in ((2, 8.0), (2, 1.0), (3, 8.0), (1, 8.0)):
+        cut = body.buffer(0.15, join_style=js, mitre_limit=ml)
+        seen.add(round(apex.distance(cut.boundary), 6))
+    assert len(seen) == 1, f"join style changed the notch: {seen}"
+    assert seen.pop() == pytest.approx(expect, abs=0.01)
+
+
+@pytest.mark.parametrize("deg", [60, 30, 20, 10, 5, 2])
+def test_corner_relief_reaches_the_apex(deg):
+    body = _slab_with_notch(deg)
+    kerf = 0.30
+    cut = kerf_compensate(body, kerf)
+    before = Point(0, 0).distance(cut.boundary)
+    relieved = corner_relief(body, cut, kerf)
+    after = Point(0, 0).distance(relieved.boundary)
+    assert after <= kerf + 1e-6, (
+        f"{deg} deg notch: cut still stops {after:.2f} mm short")
+    if before > kerf:
+        assert after < before
+
+
+def test_corner_relief_leaves_ordinary_corners_alone():
+    """A notch the beam already covers must not be cut at."""
+    body = _slab_with_notch(120.0)
+    kerf = 0.30
+    cut = kerf_compensate(body, kerf)
+    assert Point(0, 0).distance(cut.boundary) < kerf
+    assert corner_relief(body, cut, kerf).equals(cut)
+
+
+def test_corner_overcut_runs_past_the_apex():
+    body = _slab_with_notch(20.0)
+    kerf = 0.30
+    cut = kerf_compensate(body, kerf)
+    deep = corner_relief(body, cut, kerf, overcut=2.0)
+    # 2 mm past the apex, on the far side, must now be outside the part
+    assert not deep.contains(Point(0.0, -1.5))
+    assert corner_relief(body, cut, kerf, overcut=0.0).contains(Point(0.0, -1.5))
+
+
+def test_corner_relief_never_breaks_a_part_in_two():
+    """A slit through a near-pinch would sever it: the neck is held together
+    only by the material the kerf offset added, which is what relief removes.
+    Better an unreachable apex than two pieces where the user expects one."""
+    kerf = 0.30
+    # an hourglass: two lobes joined by a neck thinner than the kerf fill
+    neck = 0.05
+    body = Polygon([(-20, -20), (20, -20), (20, -0.5), (neck, 0.0), (20, 0.5),
+                    (20, 20), (-20, 20), (-20, 0.5), (-neck, 0.0),
+                    (-20, -0.5)])
+    assert body.is_valid
+    cut = kerf_compensate(body, kerf)
+    out = corner_relief(body, cut, kerf)
+    n_before = 1 if cut.geom_type == "Polygon" else len(cut.geoms)
+    n_after = 1 if out.geom_type == "Polygon" else len(out.geoms)
+    assert n_after <= n_before, "relief cut the part into pieces"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_corner_relief_keeps_parts_whole_and_costs_almost_nothing(name, tm):
+    mat = Material.from_flute("B")
+    mat.bed = (300.0, 300.0)
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=40)
+
+    mat.corner_relief = False
+    plain = build_parts(islands, mat)
+    mat.corner_relief = True
+    relieved = build_parts(islands, mat)
+
+    def pieces(ps):
+        return sum(len(p.cut.geoms) if p.cut.geom_type == "MultiPolygon" else 1
+                   for p in ps)
+
+    assert pieces(relieved) == pieces(plain), "relief fragmented a part"
+    a0 = sum(p.cut.area for p in plain)
+    a1 = sum(p.cut.area for p in relieved)
+    assert a1 <= a0 + 1e-9, "relief added material"
+    assert a1 > a0 * 0.98, f"relief ate {100 * (1 - a1 / a0):.1f}% of the net"
 
 
 def test_geos_needs_set_precision_to_intersect_faces_sharing_an_edge():

@@ -45,6 +45,19 @@ target = ROOT / "cbu_blender" / "vendor" / "cardboard_unfolder" / "material.py"
 # Windows the restore in the finally block would rewrite every LF as CRLF and
 # leave the vendored file permanently dirty in git.
 original = target.read_bytes()
+# Self-heal. The edit below is undone in a finally, but a KILLED process skips
+# that and leaves the vendored copy reading 0.61 - and the next run then fails
+# three checks that look like real defects in the material model rather than
+# like leftover state. Put it back from the top-level core, which is the source
+# of truth for the vendored copy anyway.
+if b"crush: float = 0.75" not in original:
+    core = (ROOT.parent / "cardboard_unfolder" / "material.py").read_bytes()
+    assert b"crush: float = 0.75" in core, "the core itself is edited"
+    target.write_bytes(core)
+    original = core
+    dev.reload_all()            # the stale value is already imported
+    print("  note  vendored material.py was left edited by an interrupted "
+          "run; restored from the core")
 try:
     from cbu_blender.vendor.cardboard_unfolder.material import Material
     before = Material().crush

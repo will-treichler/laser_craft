@@ -26,8 +26,8 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 import shapely
-from shapely.geometry import LineString, Polygon, MultiPolygon
-from shapely.ops import unary_union
+from shapely.geometry import LineString, Point, Polygon, MultiPolygon
+from shapely.ops import unary_union, nearest_points
 
 from .material import Material
 from .unfold import Island, Fold
@@ -238,6 +238,124 @@ def apply_relief(outline, plans: list[FoldPlan], grid: float = 1e-9):
         return outline
     cut = shapely.set_precision(unary_union(slots), grid)
     return shapely.set_precision(outline, grid).difference(cut)
+
+
+def corner_relief(body, cut, kerf: float, overcut: float = 0.0,
+                  grid: float = 1e-9):
+    """Sever the sharp notches the kerf offset cannot reach into.
+
+    Growing the part by kerf/2 is right along an edge and at a convex corner,
+    but a notch cut into the material is an inner corner: the offset fills it,
+    and the cut stops short of the apex by exactly (kerf/2) / sin(theta/2).
+    That is 0.30 mm at a 60 degree notch, 0.86 mm at 20, 1.72 mm at 10 and
+    8.59 mm at 2 - and the join style makes no difference whatsoever, because
+    mitre, bevel and round only apply to *outer* corners. Measured on a
+    pikachu net: 634 notches, median loss 0.15 mm but worst case 13.09 mm of
+    material left uncut at the apex. On 3 mm board that is a fold that will
+    not fold, which is the opposite of what a sharp bend needs.
+
+    So the apex is reached explicitly, with a slit one beam wide run down the
+    notch bisector from the offset boundary to the apex, and `overcut` mm past
+    it. The direction comes from the nearest point on the cut boundary rather
+    than from angle arithmetic - that point IS the offset apex, so the segment
+    between them is the bisector, and it needs no reasoning about winding or
+    which side the material lies on.
+
+    Only notches losing more than a whole kerf are touched; below that the
+    beam itself already covers the apex.
+    """
+    if kerf <= 0 or cut.is_empty or body.is_empty:
+        return cut
+    slits = _relief_slits(body, cut, kerf, overcut)
+    if not slits:
+        return cut
+
+    out = _cut_slits(cut, slits, kerf, grid)
+    if _piece_count(out) <= _piece_count(cut):
+        return out
+
+    # A slit through a near-pinch severs the part - the neck was only held
+    # together by the material the kerf offset added, which is exactly what
+    # this removes. Relief must never break a part into two, so where that
+    # would happen the notch keeps its uncut apex and narrow_necks still warns
+    # about the pinch. Re-applied one at a time, since only some are at fault.
+    out = cut
+    for s in slits:
+        trial = _cut_slits(out, [s], kerf, grid)
+        if _piece_count(trial) <= _piece_count(out):
+            out = trial
+    return out
+
+
+def _relief_slits(body, cut, kerf: float, overcut: float) -> list:
+    """One bisector segment per notch the beam cannot reach into."""
+    coords = []
+    for ring in _rings(body):
+        coords.extend(list(ring.coords)[:-1])
+    if not coords:
+        return []
+    pts = shapely.points(np.asarray(coords, dtype=float))
+    bnd = cut.boundary
+    shapely.prepare(cut)
+    # Vectorised, because nearly every vertex is an ordinary one sitting the
+    # offset distance away: doing this per vertex in Python cost more than the
+    # whole rest of the core suite.
+    keep = shapely.contains(cut, pts) & (shapely.distance(bnd, pts) > kerf)
+    slits = []
+    for i in np.nonzero(keep)[0]:
+        v = coords[int(i)]
+        near = nearest_points(bnd, pts[int(i)])[0]
+        dx, dy = v[0] - near.x, v[1] - near.y
+        n = (dx * dx + dy * dy) ** 0.5
+        if n < 1e-12:
+            continue
+        slits.append(LineString([(near.x, near.y),
+                                 (v[0] + dx / n * overcut,
+                                  v[1] + dy / n * overcut)]))
+    return slits
+
+
+def _cut_slits(cut, slits: list, kerf: float, grid: float):
+    slot = unary_union(slits).buffer(kerf / 2.0, cap_style=2, join_style=2)
+    out = shapely.set_precision(
+        shapely.set_precision(cut, grid).difference(
+            shapely.set_precision(slot, grid)), grid)
+    return _polygonal(out)
+
+
+def _polygonal(geom):
+    """Keep only the areal part of a difference.
+
+    A slit that lands exactly along an edge leaves a stray LineString behind
+    and the result comes back as a GeometryCollection - which has no
+    .exterior, so every consumer of Part.cut breaks on it. Measured: this
+    happens on a real pikachu net, and on no mesh in the synthetic corpus, so
+    it will not be caught by the shapes anyone tests with.
+    """
+    if geom.geom_type in ("Polygon", "MultiPolygon"):
+        return geom
+    polys = [g for g in getattr(geom, "geoms", []) if g.geom_type == "Polygon"]
+    if not polys:
+        return Polygon()
+    return polys[0] if len(polys) == 1 else MultiPolygon(polys)
+
+
+def _piece_count(geom) -> int:
+    if geom.geom_type == "Polygon":
+        return 1
+    return sum(1 for g in getattr(geom, "geoms", [])
+               if g.geom_type == "Polygon")
+
+
+def _rings(geom):
+    """Every boundary ring of a Polygon or MultiPolygon, holes included."""
+    out = []
+    for g in (geom.geoms if geom.geom_type == "MultiPolygon" else [geom]):
+        if g.is_empty:
+            continue
+        out.append(g.exterior)
+        out.extend(g.interiors)
+    return out
 
 
 def kerf_compensate(geom, kerf: float, grid: float = 1e-9):

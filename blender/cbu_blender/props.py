@@ -113,6 +113,18 @@ class CBUSettings(bpy.types.PropertyGroup):
         name="Radius cut ends", default=True,
         description=("Round the ends of relief slots. A square internal corner "
                      "concentrates stress and is where a fold starts to tear"))
+    corner_relief: BoolProperty(
+        name="Reach sharp corners", default=True,
+        description=("Run a slit down the bisector of a sharp notch so the cut "
+                     "reaches its apex. Growing the part by half a kerf cannot: "
+                     "it fills the notch, leaving material at the apex that "
+                     "stops the fold - 0.9 mm at a 20 degree notch, 1.7 mm at "
+                     "10, and metres of it at a near-pinch"))
+    corner_overcut: FloatProperty(
+        name="Corner overcut", default=0.0, min=0.0, max=5.0,
+        description=("Run the corner slit this far PAST the apex, in mm. 0 "
+                     "reaches it exactly, which is enough for B flute; thicker "
+                     "board folding sharply may want a little more"))
 
     # --- machine ---
     bed_x: FloatProperty(name="Bed X", default=600.0, min=50.0,
@@ -224,6 +236,8 @@ def material_from(s: CBUSettings):
     m.connect_ratio = s.connect_ratio
     m.min_connect = s.min_connect
     m.round_cut_ends = s.round_cut_ends
+    m.corner_relief = s.corner_relief
+    m.corner_overcut = s.corner_overcut
     m.bed = (s.bed_x, s.bed_y)
     m.sheet_margin = s.margin
     m.part_gap = s.part_gap
