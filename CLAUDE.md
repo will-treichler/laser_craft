@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 131 checks, real Blender API
+python blender/test_addon.py            # 149 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -163,6 +163,30 @@ flag alone wipes the island colours at the exact moment you are marking
 against them. `overlay.geometry_changed` compares element counts and vertex
 positions - which marking does not touch. Regression:
 `marking a seam does NOT count as modifying the object`.
+
+**The island tint must be lifted off the mesh.** It is drawn on the *same*
+planes as the faces it colours, so coplanar triangles leave the depth test to
+decide per pixel - the object's own polygons punch through the colour and the
+viewport looks corrupt. GPU state exposes no polygon offset to Python, so
+`rebuild` lifts each ring along its own normal at build time
+(`overlay.lift`, `LIFT` = 0.0015 of the object's local bounding box).
+`lift_amount` reads `bound_box`, not `dimensions`: the box is local and
+excludes object scale, and the overlay draws under `matrix_world`, so the
+offset then scales with the geometry instead of being fixed in world units -
+which matters a lot when an STL import leaves a 0.001 scale on the object. The
+normal comes from Newell over the whole ring, not a cross product of the first
+three corners, which is numerically junk on an n-gon whose first corners are
+nearly collinear.
+
+**Hiding the annotation must not cost you the seam marks.** `show_overlay`
+gated the tint and the forced marks together, and lived in a *closed* Solver
+sub-panel next to the output directory. The marks are precisely what you want
+visible while marking seams; the tint is what hides the selection highlight and
+the shading. So `overlay_fill` switches the colour on its own, and both sit on
+the main panel. Regression: `and honours overlay_fill separately`, which reads
+`_draw.__code__.co_names` - a `getattr(s, "overlay_fill", True)` puts the name
+in `co_consts` instead and the check will not see it, so read the attribute
+directly.
 
 **GPU batches need vec3 positions even for 2D draws.** The builtin
 `FLAT_COLOR` / `POLYLINE_FLAT_COLOR` shaders declare `pos` as vec3. Handing

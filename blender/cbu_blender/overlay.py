@@ -58,6 +58,50 @@ def island_color(i: int, alpha: float = 0.55):
     return (r, g, b, alpha)
 
 
+# The island tint is drawn on the *same* planes as the mesh faces, so without
+# a nudge the two are exactly coplanar and the depth test decides per pixel -
+# classic z-fighting, which reads as the object's own polygons punching through
+# the colour. GPU state has no polygon-offset knob exposed to Python, so the
+# triangles are lifted off their own plane at build time instead. A fraction of
+# the object's local bounding box, so it works whatever the model is scaled to.
+LIFT = 0.0015
+
+
+def face_normal(co):
+    """Unit normal of a ring, by Newell's method.
+
+    Newell rather than a cross product of the first three corners: an n-gon
+    whose first corners are nearly collinear gives a cross product that is
+    numerically junk, and Newell averages over the whole ring instead.
+    Degenerate rings come back as a zero vector, which lifts nothing.
+    """
+    a = np.asarray(co, dtype=float)
+    b = np.roll(a, -1, axis=0)
+    n = np.array([
+        np.sum((a[:, 1] - b[:, 1]) * (a[:, 2] + b[:, 2])),
+        np.sum((a[:, 2] - b[:, 2]) * (a[:, 0] + b[:, 0])),
+        np.sum((a[:, 0] - b[:, 0]) * (a[:, 1] + b[:, 1])),
+    ])
+    ln = float(np.linalg.norm(n))
+    return n / ln if ln > 1e-12 else np.zeros(3)
+
+
+def lift(co, amount: float):
+    """Push a face ring off its own plane, so the tint clears the mesh."""
+    return np.asarray(co, dtype=float) + face_normal(co) * amount
+
+
+def lift_amount(obj) -> float:
+    """How far to lift, in the object's own space.
+
+    bound_box is local and excludes the object's scale, which is right: the
+    overlay is drawn under matrix_world, so an offset derived here scales with
+    the object exactly as the geometry does.
+    """
+    bb = np.asarray(obj.bound_box, dtype=float)
+    return LIFT * float(np.linalg.norm(bb.max(axis=0) - bb.min(axis=0)))
+
+
 def _fan(ring):
     """Triangulate a convex-ish ring for display only."""
     return [(ring[0], ring[i], ring[i + 1]) for i in range(1, len(ring) - 1)]
@@ -112,9 +156,10 @@ def rebuild(obj, pm, islands, alpha: float = 0.55) -> None:
         for f in isl.faces:
             island_of[f] = isl.id
 
+    eps = lift_amount(obj)
     for f, ring in enumerate(pm.faces):
         col = island_color(island_of.get(f, 0), alpha)
-        co = [obj.data.vertices[v].co for v in ring]
+        co = lift([obj.data.vertices[v].co[:] for v in ring], eps)
         for tri in _fan(co):
             for p in tri:
                 verts.append(p[:])
@@ -303,6 +348,11 @@ def _draw():
     tri_s, line_s = _shaders()
     if tri_s is None:
         return
+    # The fill is what makes the mesh hard to read - it hides the selection
+    # highlight and the shading. The forced marks are the opposite: they are
+    # the reason to have the overlay up while marking seams. So they are
+    # switched separately, and turning the colour off never costs you the marks.
+    fill = s.overlay_fill
     gpu.state.blend_set("ALPHA")
     gpu.state.depth_test_set("LESS_EQUAL")
     try:
@@ -312,7 +362,7 @@ def _draw():
                 continue
             with gpu.matrix.push_pop():
                 gpu.matrix.multiply_matrix(obj.matrix_world)
-                if b["tris"] is not None:
+                if b["tris"] is not None and fill:
                     tri_s.bind()
                     b["tris"].draw(tri_s)
                 if b["lines"] is not None:

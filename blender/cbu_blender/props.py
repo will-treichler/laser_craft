@@ -170,7 +170,15 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "their glue tabs and kerf. The UV net alone shows only "
                      "the islands, which is about 20% smaller"))
 
-    show_overlay: BoolProperty(name="Show islands", default=True)
+    show_overlay: BoolProperty(
+        name="Show islands", default=True,
+        description=("Draw the island annotation in the 3D viewport. Off "
+                     "hides the tint and the forced seam marks together"))
+    overlay_fill: BoolProperty(
+        name="Tint faces", default=True,
+        description=("Fill each island with its colour. Off keeps the forced "
+                     "seam marks but leaves the mesh itself unpainted, so the "
+                     "selection highlight and the shading stay readable"))
     show_bed: BoolProperty(
         name="Show bed", default=True,
         description="Draw the laser bed, at true size, behind the net in the "

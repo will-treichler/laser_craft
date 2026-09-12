@@ -428,6 +428,60 @@ check(all(abs(d[0] - 40.0) < 1e-3 and abs(d[1] - 25.0) < 1e-3 for d in _moved),
       f"and it moved by exactly the drag (got {_moved[0] if _moved else None})")
 check(bool(_still), "the islands that were not dragged stayed put")
 
+# ------------------------------------------------ the tint clears the mesh
+# The island tint lies on the same planes as the mesh faces, so drawn
+# unmodified it z-fights and the object's own polygons punch through the
+# colour. GPU state exposes no polygon offset to Python, so the triangles are
+# lifted off their own plane when the batch is built.
+_sq = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.0, 3.0, 0.0), (0.0, 3.0, 0.0)]
+_n = overlay.face_normal(_sq)
+check(abs(abs(_n[2]) - 1.0) < 1e-12 and abs(_n[0]) < 1e-12,
+      f"face_normal finds the plane of a ring ({_n})")
+check(abs(np.linalg.norm(overlay.face_normal(
+          [(0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (2.0, 2.0, 2.0)]))) < 1e-9,
+      "a degenerate ring has no normal rather than a NaN one")
+
+_lifted = overlay.lift(_sq, 0.25)
+_d = _lifted - np.asarray(_sq, dtype=float)
+check(np.allclose(np.linalg.norm(_d, axis=1), 0.25),
+      "lift moves every corner by exactly the amount asked for")
+check(np.allclose(_d, _d[0]),
+      "and moves them all the same way, so the face stays flat and rigid")
+check(abs(float(np.dot(_d[0], _n)) - 0.25) < 1e-12,
+      "along the face normal, so it clears the surface it sits on")
+# A ring wound the other way must still lift *off* its own plane, not into it.
+check(float(np.dot(overlay.lift(_sq[::-1], 0.25)[0] - np.asarray(_sq[::-1][0]),
+                   overlay.face_normal(_sq[::-1]))) > 0,
+      "reversed winding lifts along its own normal too")
+
+_a1 = overlay.lift_amount(obj)
+check(_a1 > 0.0, f"lift_amount is positive for a real object ({_a1:.6g})")
+# It comes from bound_box, which is local and excludes object scale - the
+# overlay draws under matrix_world, so the offset must scale with the geometry
+# rather than being fixed in world units.
+_names = overlay.lift_amount.__code__.co_names
+check("bound_box" in _names and "dimensions" not in _names,
+      f"lift_amount measures the local box, not world dimensions ({_names})")
+check("lift" in overlay.rebuild.__code__.co_names,
+      "rebuild lifts the tint it caches")
+
+# ------------------------------------------------ hiding the tint keeps the marks
+# Turning the annotation off used to be all or nothing, and it lived in a
+# closed sub-panel next to the output directory. The forced seam marks are the
+# reason to have the overlay up while marking, so they switch separately from
+# the colour that makes the mesh hard to read.
+check(hasattr(bpy.context.scene.cbu, "overlay_fill"),
+      "there is a separate switch for the face tint")
+check(bpy.context.scene.cbu.overlay_fill is True,
+      "and it is on by default, so nothing changes unasked")
+_dn = overlay._draw.__code__.co_names
+check("show_overlay" in _dn, "the 3D draw honours show_overlay")
+check("overlay_fill" in _dn, "and honours overlay_fill separately")
+_ui = (ROOT / "cbu_blender" / "ui.py").read_bytes().decode()
+_main = _ui.split("class CBU_PT_main")[1].split(chr(10) + "class ")[0]
+check("show_overlay" in _main and "overlay_fill" in _main,
+      "both switches are on the main panel, not buried in a closed one")
+
 # Sampling live UVs needs bmesh, and bmesh.from_edit_mesh inside a draw handler
 # can allocate or refresh BMesh customdata - freeing blocks the draw is still
 # walking. Dragging a UV island crashed Blender in BLI_mempool_free under

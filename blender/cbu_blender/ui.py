@@ -59,6 +59,18 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         row.operator("cbu.pack_uv", icon="UV_ISLANDSEL")
         row.operator("cbu.export", icon="EXPORT")
 
+        # These are view controls, not solver settings - they were buried in a
+        # closed sub-panel next to the output directory, which is not where you
+        # look when the annotation is in the way of the thing you are editing.
+        lay.separator()
+        row = lay.row(align=True)
+        row.prop(s, "show_overlay", text="", icon="HIDE_OFF" if s.show_overlay
+                 else "HIDE_ON")
+        sub = row.row(align=True)
+        sub.enabled = s.show_overlay
+        sub.prop(s, "overlay_fill", toggle=True, icon="SHADING_SOLID")
+        sub.prop(s, "overlay_alpha", text="", slider=True)
+
 
 class CBU_PT_seams(_Base, bpy.types.Panel):
     bl_label = "Seams"
@@ -157,10 +169,6 @@ class CBU_PT_solver(_Base, bpy.types.Panel):
         lay.prop(s, "trials")
         lay.prop(s, "seed")
         lay.prop(s, "limit_to_bed")
-        lay.separator()
-        lay.prop(s, "show_overlay")
-        lay.prop(s, "overlay_alpha")
-        lay.prop(s, "show_bed")
         lay.separator()
         lay.prop(s, "out_dir")
         lay.prop(s, "write_dxf")
