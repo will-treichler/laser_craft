@@ -403,6 +403,24 @@ check("bpy.app.timers" not in _src,
 check("refresh_live_cuts" in cbu_blender._on_depsgraph.__code__.co_names,
       "the depsgraph handler is what drives the refresh")
 
+# The overlay must never touch bmesh. Reading live Edit Mode UVs needs it, and
+# it crashed Blender from every context tried - draw handler (customdata freed
+# under the draw), timer (mid modal transform), and depsgraph_update_post
+# (access violation in tbbmalloc). There is no fourth context, so the outline
+# simply is not sampled in Edit Mode. A GPU/allocator crash cannot be caught at
+# runtime, so this is asserted on the source.
+check("import bmesh" not in _src, "the overlay does not import bmesh")
+# On the code objects, not the source: a docstring explaining why bmesh is
+# banned mentions from_edit_mesh, and a substring search fails on its own
+# documentation. Same trap as the self.report check on the reload operator.
+import types as _types
+_reaches = [n for n, f in vars(overlay).items()
+            if isinstance(f, _types.FunctionType)
+            and "from_edit_mesh" in f.__code__.co_names]
+check(not _reaches, f"no overlay function reads the edit-mode bmesh ({_reaches})")
+check(overlay._live_uv(obj, [0]) is None or bpy.context.mode != "EDIT_MESH",
+      "sampling returns nothing in Edit Mode rather than reaching for bmesh")
+
 # it has to go stale with everything else, or it paints a net that has moved
 obj.data.vertices[0].co.x += 0.02
 obj.data.update()

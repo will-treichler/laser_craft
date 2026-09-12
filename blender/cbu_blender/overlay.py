@@ -166,39 +166,27 @@ def set_net_cuts(name: str, groups) -> None:
 
 
 def _live_uv(obj, loop_idx):
-    """Current UV of specific loops, working in Edit Mode too.
+    """Current UV of specific loops. Object Mode only - None in Edit Mode.
 
-    uv_layers[...].data is empty in Edit Mode - the live values are in the
-    BMesh - and Edit Mode is exactly when islands are being dragged.
+    There is no safe way to read live Edit Mode UVs from an automatic hook.
+    The values live in the BMesh - the mesh datablock is empty there, and so is
+    the depsgraph's evaluated copy, both checked - and reading it crashed
+    Blender from every context tried:
 
-    NEVER call this from a draw handler. bmesh.from_edit_mesh can allocate or
-    refresh BMesh customdata, which frees blocks the draw is still walking:
-    dragging a UV island crashed Blender in BLI_mempool_free, under
-    BM_data_layer_add, under cb_region_draw. It is sampled from a timer
-    instead and the draw only ever reads the cache.
+      * a GPU draw handler: frees customdata under the draw, BLI_mempool_free
+        under BM_data_layer_add under cb_region_draw
+      * a timer: fires in the middle of a modal transform
+      * depsgraph_update_post: access violation inside tbbmalloc
+
+    So the outline is not sampled while in Edit Mode at all. It keeps the
+    positions from the last unfold, nest, or Object Mode refresh and catches up
+    the moment Edit Mode is left. Three crashes is enough evidence that this
+    particular overlay cannot be made live safely, and a cosmetic overlay is
+    never worth a crash.
     """
-    me = obj.data
     if obj.mode == "EDIT":
-        try:
-            import bmesh
-            bm = bmesh.from_edit_mesh(me)
-            lay = bm.loops.layers.uv.get(NET_UV)
-            if lay is None:
-                return None
-            flat = [None] * len(loop_idx)
-            want = {li: k for k, li in enumerate(loop_idx)}
-            i = 0
-            for f in bm.faces:
-                for l in f.loops:
-                    k = want.get(i)
-                    if k is not None:
-                        flat[k] = tuple(l[lay].uv)
-                    i += 1
-            if any(v is None for v in flat):
-                return None
-            return np.asarray(flat, dtype=np.float64)
-        except Exception:                               # noqa: BLE001
-            return None
+        return None
+    me = obj.data
     uv = me.uv_layers.get(NET_UV)
     if uv is None or not len(uv.data):
         return None
@@ -207,37 +195,33 @@ def _live_uv(obj, loop_idx):
 
 
 def refresh_live_cuts(*_args):
-    """Resample the cut outlines, at a safe point in the pipeline.
+    """Resolve the cut outlines against the current layout, into the cache.
 
-    Driven by depsgraph_update_post, NOT by a timer. Reading live Edit Mode
-    UVs needs bmesh - the mesh datablock and the depsgraph's evaluated copy
-    are both empty there - and bmesh.from_edit_mesh is only safe at well
-    defined moments. From a draw handler it freed customdata under the draw;
-    from a timer it fired in the middle of a modal transform and crashed
-    again. The depsgraph reports once the transform has finished, so the
-    outline catches up when a drag is released rather than during it. That is
-    the trade: correctness and a stable session over a live-updating overlay.
+    Called when parts are published and from depsgraph_update_post. It is a
+    no-op in Edit Mode by design - _live_uv refuses to reach for the BMesh
+    there, because doing so crashed Blender from every context available.
     """
     try:
         ctx = bpy.context
         scene = getattr(ctx, "scene", None)
         s = getattr(scene, "cbu", None) if scene else None
-        if s is not None and _net_cuts:
-            from . import bridge
-            sc = bridge.uv_scale(s.bed_x, s.bed_y)
-            for name in list(_net_cuts):
-                obj = bpy.data.objects.get(name)
-                if obj is None or obj.type != "MESH":
-                    _live_rings.pop(name, None)
-                    continue
-                rings = live_cut_rings(obj, sc)
-                if rings is None:
-                    continue
-                before = _live_rings.get(name)
-                _live_rings[name] = rings
-                if before is None or len(before) != len(rings) or any(
-                        not np.array_equal(a, b) for a, b in zip(before, rings)):
-                    _tag_redraw()
+        if s is None or not _net_cuts:
+            return
+        from . import bridge
+        sc = bridge.uv_scale(s.bed_x, s.bed_y)
+        for name in list(_net_cuts):
+            obj = bpy.data.objects.get(name)
+            if obj is None or obj.type != "MESH":
+                _live_rings.pop(name, None)
+                continue
+            rings = live_cut_rings(obj, sc)
+            if rings is None:
+                continue                  # Edit Mode: keep what we last had
+            before = _live_rings.get(name)
+            _live_rings[name] = rings
+            if before is None or len(before) != len(rings) or any(
+                    not np.array_equal(a, b) for a, b in zip(before, rings)):
+                _tag_redraw()
     except Exception:                                   # noqa: BLE001
         pass                    # a cosmetic overlay must never break the session
 

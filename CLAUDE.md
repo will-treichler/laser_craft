@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 126 checks, real Blender API
+python blender/test_addon.py            # 129 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -368,24 +368,33 @@ two points recover the rigid motion cheaply, where a full fit over every loop
 would not. Reading them needs bmesh in Edit Mode, which is exactly when
 islands are being dragged (`uv_layers[...].data` is empty there).
 
-Reading live Edit Mode UVs needs bmesh and there is no safe read-only
-alternative: the mesh datablock is empty there, and so is the depsgraph's
-evaluated copy (checked). `bmesh.from_edit_mesh` is only safe at well defined
-moments, and this took two crashes to pin down:
+**The overlay must never touch bmesh - there is no safe context for it.**
+Live Edit Mode UVs live only in the BMesh: the mesh datablock is empty there,
+and so is the depsgraph's evaluated copy (both checked). Reading it crashed
+Blender from every context available, three times:
 
-- from inside a GPU draw handler it allocates or refreshes BMesh customdata
-  and frees blocks the draw is still walking - `BLI_mempool_free` under
-  `BM_data_layer_add` under `cb_region_draw`.
-- from a timer it fires in the middle of a modal transform, and crashes again.
+- a GPU draw handler: allocates or refreshes BMesh customdata and frees blocks
+  the draw is still walking - `BLI_mempool_free` under `BM_data_layer_add`
+  under `cb_region_draw`.
+- a timer: fires in the middle of a modal transform.
+- `depsgraph_update_post`: access violation inside `tbbmalloc`.
 
-So the refresh is driven by `depsgraph_update_post`, which reports once the
-transform has finished: the outline catches up when a drag is released rather
-than during it. That trade - a stable session over a live-updating overlay -
-is the right way round. A GPU crash cannot be caught at runtime, so the rules
-are asserted on the code objects: `the draw handler does not sample live UVs`,
-`the overlay does not poll on a timer`,
-`the depsgraph handler is what drives the refresh`. Same shape as the vec3
-rule: if the failure kills the process, test the data or the code, not the
+There is no fourth context, so the outline is simply **not sampled in Edit
+Mode**. `_live_uv` returns None there; the cache keeps the positions from the
+last unfold, nest or Object Mode refresh and catches up the moment Edit Mode
+is left. `publish_cuts` resolves once immediately, or the outline would not
+appear until something else happened to change. A cosmetic overlay is never
+worth a crash, and three crashes is enough evidence that this one cannot be
+made live safely.
+
+An allocator or GPU crash cannot be caught at runtime, so the rules are
+asserted on the **code objects**: `the draw handler does not sample live UVs`,
+`the overlay does not poll on a timer`, `the overlay does not import bmesh`,
+`no overlay function reads the edit-mode bmesh`. That last one must inspect
+`co_names`, not the source - the docstring explaining why bmesh is banned
+mentions `from_edit_mesh`, and a substring search fails on its own
+documentation, exactly like the `self.report` check on the reload operator.
+If the failure kills the process, test the data or the code, not the
 behaviour.
 
 **Sticky UV select drags other islands with you.** `uv_sticky_select_mode`

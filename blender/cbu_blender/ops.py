@@ -122,6 +122,10 @@ def publish_cuts(obj, parts, mat, pm=None, islands=None):
                            "ref_pts": (src_pts[0], src_pts[j]),
                            "rings": rings})
     overlay.set_net_cuts(obj.name, groups)
+    # Resolve them straight away. The cache is what the draw handler reads, and
+    # it is only otherwise filled on a depsgraph update - so without this the
+    # outline does not appear until something else happens to change.
+    overlay.refresh_live_cuts()
 
 
 class CBU_OT_mark(bpy.types.Operator):
