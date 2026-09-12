@@ -337,6 +337,19 @@ USABLE_RGBA = (0.95, 0.62, 0.15, 0.32)     # usable area inside the margins
 MAX_TILES = 400                            # a runaway net must not stall drawing
 
 
+def bed_grid(bounds, bed_w: float, bed_h: float):
+    """The rectangle the sheet grid must cover, anchored at the sheet origin.
+
+    Never the net's own bounding box. The net starts at the margin, so tiling
+    from its min corner shifts every sheet - and its inner margin line - by
+    exactly one margin: parts sitting correctly at x=8 then appear 8 mm outside
+    a line drawn at 16, and a perfectly good layout reads as ignoring the
+    margin. Measured on a pikachu net: the grid spanned x[8.1, 308.1] instead
+    of x[0, 300].
+    """
+    return (0.0, 0.0, max(bounds[2], bed_w), max(bounds[3], bed_h))
+
+
 def bed_segments(bounds, bed_w, bed_h, margin):
     """Line segments for a grid of sheets covering the net: (verts, colours).
 
@@ -454,10 +467,11 @@ def _draw_bed():
     # in scaled UV units, so the sheet has to be scaled to match.
     from . import bridge
     sc = bridge.uv_scale(s.bed_x, s.bed_y)
-    key = (obj.name, bounds, s.bed_x, s.bed_y, s.margin, sc)
+    grid = bed_grid(bounds, s.bed_x * sc, s.bed_y * sc)
+    key = (obj.name, grid, s.bed_x, s.bed_y, s.margin, sc)
     if key not in _bed_cache:
         _bed_cache.clear()
-        _bed_cache[key] = _bed_batch(bounds, s.bed_x * sc, s.bed_y * sc,
+        _bed_cache[key] = _bed_batch(grid, s.bed_x * sc, s.bed_y * sc,
                                      s.margin * sc)
     batch = _bed_cache[key]
     if batch is None:

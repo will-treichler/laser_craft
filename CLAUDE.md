@@ -239,6 +239,17 @@ rows widen to fit an island bigger than a sheet, since bed splitting cannot
 cut one of those down anyway (milestone 4). The bed itself is
 `overlay.bed_segments`, toggled by `show_bed`.
 
+**Anchor the sheet grid at the origin, never at the net's bounding box.** The
+net starts at the margin, so tiling sheets from the net's min corner shifts
+every sheet - and its inner margin line - by exactly one margin. Parts sitting
+correctly at x=8 then draw 8 mm *outside* a line drawn at 16, and a layout the
+packer got right reads as ignoring the margin entirely. On a pikachu net the
+grid spanned x[8.1, 308.1] against a 300 mm bed. Nothing measurable was wrong:
+parts 0.00 mm past the margin, the net -0.15 mm, the cut outline 0.00 mm - only
+the reference drawn underneath them. `overlay.bed_grid` is that decision on its
+own, so it can be asserted (`the sheet grid starts at the origin, not the
+net`). When the 2D view and the numbers disagree, suspect the view.
+
 **A bent face must be split in the MESH, not in the core.** `source_faces`
 has to stay a 1:1 partition of the caller's polygons, because `write_net_uv`
 writes whole polygons through it. Letting `PolyMesh.from_rings` split a bent

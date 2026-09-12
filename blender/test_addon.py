@@ -324,6 +324,28 @@ if bpy.context.mode == "EDIT_MESH":
 check(sum(1 for p in obj.data.polygons if p.select) == _n,
       "and brings the whole net back into view")
 
+# ------------------------------------------------ the bed grid is anchored
+# The net starts at the margin, so tiling the sheet grid from the net's own
+# bounding box shifts every sheet - and its inner margin line - by exactly one
+# margin. Parts sitting correctly at x=8 then appear 8 mm outside a line drawn
+# at 16, and a perfectly good layout reads as ignoring the margin. Measured on
+# a pikachu net: the grid spanned x[8.1, 308.1] instead of x[0, 300].
+_bw, _bh = 0.586, 0.586
+_offset_net = (0.0159, 0.016, 0.5567, 1.1052)     # a real net, margin included
+_g = overlay.bed_grid(_offset_net, _bw, _bh)
+check(_g[0] == 0.0 and _g[1] == 0.0,
+      f"the sheet grid starts at the origin, not the net ({_g[0]}, {_g[1]})")
+check(_g[2] >= _offset_net[2] and _g[3] >= _offset_net[3],
+      "and still covers the whole net")
+check(overlay.bed_grid((0.0, 0.0, 0.1, 0.1), _bw, _bh)[2] >= _bw,
+      "a net smaller than one sheet still gets a whole sheet drawn")
+
+_v, _c = overlay.bed_segments(_g, _bw, _bh, 0.0156)
+_xs = [q[0] for q in _v]
+_ys = [q[1] for q in _v]
+check(min(_xs) == 0.0 and min(_ys) == 0.0,
+      f"the drawn rectangles start at the origin ({min(_xs)}, {min(_ys)})")
+
 # ------------------------------------------------ bed changes keep the net honest
 # uv_scale is derived from the bed, so the same stored UVs mean different
 # millimetres once the bed changes - a net laid out on a 300 mm bed read as
