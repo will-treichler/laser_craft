@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 125 core invariants (~30 s)
+python -m pytest tests -q               # 135 core invariants (~34 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -159,6 +159,49 @@ whole gap, so every candidate is rejected and parts silently never share a
 sheet. Tree scoring is also budgeted (`size_candidates`, and few split trials
 while scoring); at 12 candidates x 24 trials the core suite ran 158 s for
 identical piece counts.
+
+**Every packer here places a part once and never looks at it again.** Shelf
+packing commits to a shelf, `nest` is greedy bottom-left, and the add-on's
+Nest Sheets re-runs Blender's packer over the whole candidate set on every
+trial - so a part is dropped to the next sheet whenever that *global* re-solve
+fails, which is not the same as there being no room for it. `layout.tighten`
+is the pass that reconsiders: it moves parts off the later sheets into space
+left on the earlier ones, never moving anything already placed, so it can only
+tie or improve. Measured on pikachu at 150 mm: Nest Sheets left 35 parts on a
+sheet 44% full and one 44.6 x 92.2 mm part alone on a second sheet. Now one
+sheet, 0 overlaps, closest approach 3.33 mm against a 3.00 mm gap.
+
+**`tighten` must seat before it measures**, and does it itself rather than
+trusting the caller. The free region is computed over `[m, m+W] x [m, m+H]`,
+so a sheet whose parts have not been put on their margin yet is being measured
+in a frame it does not live in: the stray lands correctly inside that box and
+the seating shift that follows drags it out of the bed. That is how this first
+appeared - `part 31 ended up outside sheet 0`. For the same reason the add-on's
+bed check runs after tightening and seating, never before.
+
+**Corner candidates cannot see a pocket.** `_corner_candidates` offers the
+cross product of the placed parts' x and y edges, which is the right heuristic
+for building a packing against a skyline and the wrong one for slotting into a
+sheet that is already full, where the opening is bounded by parts on several
+sides at once. On that pikachu sheet the stray had exactly one home - a 5 x 2
+mm window of valid positions at a single rotation, 7 placements on a 1 mm grid
+- and not one of the 4900 corner candidates landed in it. `find_pocket`
+therefore works off the *free region* (`sheet - union(placed).buffer(gap)`) and
+tries each corner of the part's box against each corner of the pocket.
+
+Generate those candidates from a **simplified** copy of the free region and
+verify against the exact one: 3.06 s -> 0.50 s on that sheet for the same
+answer, and it cannot go wrong, because a simplification that strays outward
+can only cost a position, never place a part on top of another. The free
+region traces round every part outline, so it carries ~3400 vertices of
+crevice detail that no part can ever occupy.
+
+Cost, honestly: on this corpus `tighten` changes no sheet count in the core
+`pack()` path - the shelf and nest layouts strand parts that genuinely do not
+fit - and it adds ~1.2 s to a pikachu pack inside a ~6 s Unfold, all of it
+spent *proving* there is no room. It earns its keep in Nest Sheets, where it
+turns 2 sheets into 1. `POCKET_BUDGET` caps the deep searches per call and the
+free region is cached per sheet.
 
 **Overlap checks must be component-aware.** After splitting, separate islands
 sit on top of each other in raw coordinates — meaningless, they get packed onto

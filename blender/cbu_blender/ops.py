@@ -679,6 +679,7 @@ class CBU_OT_pack_uv(bpy.types.Operator):
         is cut, so the fit test is a direct answer.
         """
         from shapely.geometry import Polygon
+        _, L, _ = _core()
 
         rings = [self._ring(p) for p in parts]
         if any(len(r) < 3 for r in rings):
@@ -720,7 +721,16 @@ class CBU_OT_pack_uv(bpy.types.Operator):
                 sheet += 1
 
             err = self._apply(parts, rings, placed, mat)
-            return sheet, err
+            if err:
+                return sheet, err
+            # Every trial above re-packs the whole candidate set from scratch,
+            # so a part is dropped to the next sheet whenever Blender's global
+            # re-solve fails - which is not the same as there being no room.
+            # Measured on pikachu at 150 mm: 35 parts on a sheet 44% full and
+            # one 44.6 x 92.2 mm part alone on a second. Slot the strays into
+            # the space already there, without moving anything down.
+            sheet = L.tighten(parts, sheet, mat)
+            return sheet, self._within_bed(parts, mat)
         finally:
             bpy.data.objects.remove(proxy, do_unlink=True)
 
@@ -859,7 +869,6 @@ class CBU_OT_pack_uv(bpy.types.Operator):
     def _apply(parts, rings, placed, mat):
         """Push each nested position onto its Part as a rigid motion."""
         from shapely import affinity as _aff
-        m0 = mat.sheet_margin
         by_sheet = {}
         for i, (sheet, pts) in placed.items():
             M, res = bridge._kabsch2d(rings[i], pts)
@@ -872,13 +881,17 @@ class CBU_OT_pack_uv(bpy.types.Operator):
             part.xform = M.copy()
             part.sheet = sheet
             by_sheet.setdefault(sheet, []).append(part)
+        return None
 
-        for group in by_sheet.values():          # sit each sheet on its margin
-            x0 = min(p.bounds[0] for p in group)
-            y0 = min(p.bounds[1] for p in group)
-            for part in group:
-                part.translate(m0 - x0, m0 - y0)
+    @staticmethod
+    def _within_bed(parts, mat):
+        """Every part inside its sheet's usable area, or the complaint.
 
+        Runs after tightening and seating, never before: seating is what puts
+        a sheet on its margin, so checking first reports a good layout as
+        outside the bed.
+        """
+        m0 = mat.sheet_margin
         for part in parts:
             x0, y0, x1, y1 = part.bounds
             if (x0 < m0 - 1e-3 or y0 < m0 - 1e-3

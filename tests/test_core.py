@@ -11,7 +11,7 @@ import numpy as np
 import networkx as nx
 import trimesh
 import pytest
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, MultiLineString, box
 from shapely import set_precision
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -26,7 +26,10 @@ from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, kerf_compensate,
                                       fold_intervals, flute_warning)
 from cardboard_unfolder.tabs import place_tabs
-from cardboard_unfolder.layout import build_parts, pack, narrow_necks
+from cardboard_unfolder.layout import (build_parts, pack, narrow_necks,
+                                       Part, tighten, find_spot,
+                                       find_pocket, free_region,
+                                       seat_sheets)
 from cardboard_unfolder import strokefont
 
 
@@ -201,6 +204,117 @@ def test_a_locally_flipped_face_still_places_correctly():
     b = set_precision(Polygon(pos[1]).buffer(0), 1e-9)
     assert a.intersection(b).area < 1e-9
     assert isometry_error(flipped, pos) < 1e-12
+
+
+def _blank(cut, sheet):
+    """A Part carrying nothing but an outline, for packing tests."""
+    empty = MultiLineString([])
+    return Part(island_id=id(cut) % 1000, cut=cut, perf_m=empty, perf_v=empty,
+                engrave=empty, sheet=sheet)
+
+
+def _sheet_with_a_pocket(mat):
+    """A sheet walled in except for one opening, plus a stray that fits it.
+
+    The opening is reachable only from inside, so its bottom-left corner is
+    not on any placed part's skyline - which is exactly the case the corner
+    candidates cannot offer and find_pocket exists for.
+    """
+    W, H = mat.usable_bed
+    m, gap = mat.sheet_margin, mat.part_gap
+    stray_w, stray_h = 40.0, 25.0
+    pocket = box(m + 100.0, m + 100.0,
+                 m + 100.0 + stray_w + 2 * gap + 1.0,
+                 m + 100.0 + stray_h + 2 * gap + 1.0)
+    # one big part with the pocket punched out of it
+    slab = box(m, m, m + W, m + H).difference(pocket)
+    stray = box(0.0, 0.0, stray_w, stray_h)
+    return [_blank(slab, 0), _blank(stray, 1)]
+
+
+def test_tighten_slots_a_stray_into_a_pocket_the_skyline_hides():
+    mat = Material.from_flute("B")
+    mat.bed = (300.0, 300.0)
+    W, H = mat.usable_bed
+    m, gap = mat.sheet_margin, mat.part_gap
+    parts = _sheet_with_a_pocket(mat)
+    stray = parts[1]
+
+    # The cheap search must genuinely fail here, or the test proves nothing.
+    assert find_spot(stray, [parts[0].cut], [parts[0].bounds],
+                     W, H, gap, m) is None,         "corner candidates now find it; this fixture no longer tests find_pocket"
+    assert find_pocket(stray, free_region([parts[0].cut], W, H, gap, m),
+                       tol=gap / 4.0) is not None
+
+    assert tighten(parts, 2, mat) == 1
+    assert {p.sheet for p in parts} == {0}
+    assert parts[0].cut.intersection(stray.cut).area < 1e-9
+    assert stray.cut.distance(parts[0].cut) >= gap - 1e-6
+
+
+def test_tighten_seats_before_it_measures():
+    """Regression: it used to trust the caller to have done that.
+
+    The free region is measured over [m, m+W]; parts handed in unseated live
+    in a different frame, so the stray landed correctly in the box and the
+    seating that followed dragged it outside the bed. Reported by the add-on's
+    nester as "part 31 ended up outside sheet 0".
+    """
+    mat = Material.from_flute("B")
+    mat.bed = (300.0, 300.0)
+    m = mat.sheet_margin
+    parts = _sheet_with_a_pocket(mat)
+    for p in parts:                              # shove everything off-margin
+        p.translate(-m + 3.0, -m - 5.0)
+
+    tighten(parts, 2, mat)
+    for p in parts:
+        x0, y0, x1, y1 = p.bounds
+        assert x0 >= m - 1e-6 and y0 >= m - 1e-6
+        assert x1 <= mat.bed[0] - m + 1e-6 and y1 <= mat.bed[1] - m + 1e-6
+
+
+def test_tighten_never_moves_a_part_it_cannot_place():
+    """No room means no change - and certainly no overlap."""
+    mat = Material.from_flute("B")
+    mat.bed = (300.0, 300.0)
+    W, H = mat.usable_bed
+    m = mat.sheet_margin
+    full = box(m, m, m + W, m + H)
+    parts = [_blank(full, 0), _blank(box(m, m, m + W, m + H), 1)]
+    before = [p.cut.bounds for p in parts]
+    assert tighten(parts, 2, mat) == 2
+    assert [p.sheet for p in parts] == [0, 1]
+    assert [p.cut.bounds for p in parts] == before
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_packing_leaves_no_overlap_and_nothing_off_the_sheet(name, tm):
+    """The property tighten must not break: it moves parts between finished
+    sheets, so it is the one step that could drop a part onto another."""
+    mat = Material.from_flute("B")
+    mat.bed = (300.0, 300.0)
+    m = mat.sheet_margin
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=40)
+    parts = build_parts(islands, mat)
+    pack(parts, mat)
+
+    by = {}
+    for p in parts:
+        if p.sheet >= 0:
+            by.setdefault(p.sheet, []).append(p)
+    assert sorted(by) == list(range(len(by))), "sheet numbers have a hole"
+    for group in by.values():
+        geos = [set_precision(p.cut.buffer(0), 1e-9) for p in group]
+        for i in range(len(geos)):
+            for j in range(i + 1, len(geos)):
+                assert geos[i].intersection(geos[j]).area < 1e-6
+        for p in group:
+            x0, y0, x1, y1 = p.bounds
+            assert x0 >= m - 1e-6 and y0 >= m - 1e-6
+            assert x1 <= mat.bed[0] - m + 1e-6
+            assert y1 <= mat.bed[1] - m + 1e-6
 
 
 def test_geos_needs_set_precision_to_intersect_faces_sharing_an_edge():

@@ -194,6 +194,219 @@ def _corner_candidates(placed_boxes, x0: float, y0: float, gap: float) -> list:
     return sorted(((y, x) for y in sorted(ys) for x in sorted(xs)))
 
 
+NEST_ANGLES = (0.0, 90.0, 180.0, 270.0)
+
+
+def find_spot(part: Part, placed_geo: list, placed_box: list, W: float,
+              H: float, gap: float, m: float, angles=NEST_ANGLES):
+    """Where this part can go among what is already down, or None.
+
+    Returns (angle, geometry as placed). Nothing already down is consulted for
+    anything but collision, so a caller can use this to slot a part into a
+    finished sheet without disturbing it.
+    """
+    cands = _corner_candidates(placed_box, m, m, gap)
+    tree = STRtree(placed_geo) if placed_geo else None
+    for angle in angles:
+        cand = affinity.rotate(part.cut, angle, origin="centroid")
+        bx0, by0, bx1, by1 = cand.bounds
+        cw, ch = bx1 - bx0, by1 - by0
+        if cw > W or ch > H:
+            continue
+        # Buffer once per rotation, not once per candidate position. Buffering
+        # is the expensive call here and there are hundreds of positions; doing
+        # it inside the loop took the core suite from 36 s to 156 s on its own.
+        # One side buffered by the full gap is equivalent to both by half.
+        grown = cand.buffer(gap, join_style=2)
+        for y, x in cands:
+            if x + cw > m + W or y + ch > m + H:
+                continue
+            dx, dy = x - bx0, y - by0
+            probe = affinity.translate(grown, dx, dy)
+            if tree is not None:
+                hit = False
+                for k in tree.query(probe):
+                    if probe.intersects(placed_geo[int(k)]):
+                        hit = True
+                        break
+                if hit:
+                    continue
+            return angle, affinity.translate(cand, dx, dy)
+    return None
+
+
+POCKET_BUDGET = 16          # deep searches per tighten call
+
+
+def free_region(placed_geo: list, W: float, H: float, gap: float,
+                m: float) -> list:
+    """What is left of one sheet once the placed parts and their gap are out.
+
+    Buffering the obstacles by the whole gap (rather than the candidate by
+    half of it on each side) means a part that fits inside one of these pieces
+    is already the full gap clear of everything - the same rule find_spot uses.
+    """
+    sheet = box(m, m, m + W, m + H)
+    if not placed_geo:
+        return [sheet]
+    free = sheet.difference(unary_union(placed_geo).buffer(gap))
+    if free.is_empty:
+        return []
+    return [free] if free.geom_type == "Polygon" else list(free.geoms)
+
+
+def find_pocket(part: Part, pieces: list, angles=NEST_ANGLES,
+                tol: float = 0.75):
+    """Thread a part into a pocket the corner candidates cannot see.
+
+    find_spot offers the cross product of the placed parts' x and y edges.
+    That is the right heuristic for building a packing against a skyline and
+    the wrong one for slotting into a sheet that is already finished, where the
+    opening is bounded by parts on several sides at once. Measured on pikachu
+    at 150 mm: a 44.6 x 92.2 mm part had exactly one home on a sheet 44% full -
+    a 5 x 2 mm window of positions at a single rotation - and not one of the
+    4900 corner candidates landed in it, so a whole second sheet was spent.
+
+    Candidates are the corners of the free region. Taking them from a
+    SIMPLIFIED copy is 6x cheaper (3.06 s -> 0.50 s on that sheet) and risks
+    nothing: the placement is still verified against the exact piece, so a
+    simplification that strays outward can only cost a position, never put a
+    part on top of another.
+
+    Returns (angle, geometry as placed) like find_spot, or None.
+    """
+    area = part.cut.area
+    for angle in angles:
+        cand = affinity.rotate(part.cut, angle, origin="centroid")
+        bx0, by0, bx1, by1 = cand.bounds
+        cw, ch = bx1 - bx0, by1 - by0
+        for piece in pieces:
+            qx0, qy0, qx1, qy1 = piece.bounds
+            if (piece.area < area or qx1 - qx0 < cw - 1e-9
+                    or qy1 - qy0 < ch - 1e-9):
+                continue                        # cannot hold it, whatever else
+            shapely.prepare(piece)
+            simp = piece.simplify(tol)
+            verts = list(simp.exterior.coords)
+            for ring in simp.interiors:
+                verts += list(ring.coords)
+            # Each corner of the part's box against each corner of the pocket:
+            # which side of the part the opening is bounded on is not known.
+            for vx, vy in verts:
+                for ax, ay in ((0.0, 0.0), (cw, 0.0), (0.0, ch), (cw, ch)):
+                    ox, oy = vx - ax, vy - ay
+                    if (ox < qx0 - 1e-9 or oy < qy0 - 1e-9
+                            or ox + cw > qx1 + 1e-9 or oy + ch > qy1 + 1e-9):
+                        continue
+                    moved = affinity.translate(cand, ox - bx0, oy - by0)
+                    if piece.contains(moved):
+                        return angle, moved
+    return None
+
+
+def _put(part: Part, angle: float, moved) -> None:
+    """Apply a find_spot result to the part, keeping Part.xform in step."""
+    part.rotate(angle, origin=tuple(part.cut.centroid.coords)[0])
+    b = part.bounds
+    part.translate(moved.bounds[0] - b[0], moved.bounds[1] - b[1])
+
+
+def seat_sheets(parts: list[Part], mat: Material) -> None:
+    """Sit each sheet's parts on their margin, together.
+
+    Per sheet, not per part: the arrangement within a sheet is the packing and
+    must not be disturbed.
+    """
+    m = mat.sheet_margin
+    by: dict[int, list[Part]] = {}
+    for p in parts:
+        if p.sheet >= 0:
+            by.setdefault(p.sheet, []).append(p)
+    for group in by.values():
+        x0 = min(p.bounds[0] for p in group)
+        y0 = min(p.bounds[1] for p in group)
+        if abs(x0 - m) > 1e-9 or abs(y0 - m) > 1e-9:
+            for p in group:
+                p.translate(m - x0, m - y0)
+
+
+def tighten(parts: list[Part], sheets: int, mat: Material) -> int:
+    """Move parts off the later sheets into room left on the earlier ones.
+
+    Every packer here places a part once and never looks at it again. Shelf
+    packing commits to a shelf; true-shape nesting is greedy bottom-left; and
+    the add-on's Nest Sheets re-runs Blender's packer over the whole candidate
+    set on every trial, so a part is dropped to the next sheet whenever that
+    global re-solve happens to fail - which is not the same as there being no
+    room for it.
+
+    Measured on pikachu at 150 mm: 35 parts on a sheet only 44% full, and one
+    44.6 x 92.2 mm part alone on a second sheet that fitted the first at 270
+    degrees. A whole sheet of cardboard for a part that had a home.
+
+    Nothing already placed is moved, so this can only tie or improve. Sheets
+    left empty are renumbered away; returns the new sheet count.
+    """
+    W, H = mat.usable_bed
+    gap, m = mat.part_gap, mat.sheet_margin
+
+    by: dict[int, list[Part]] = {}
+    for p in parts:
+        if p.sheet >= 0:
+            by.setdefault(p.sheet, []).append(p)
+    if len(by) < 2:
+        return sheets
+
+    # Seat first, always. The free region is measured over
+    # [m, m+W] x [m, m+H], so a sheet whose parts have not been put on
+    # their margin yet is being measured in a frame it does not live
+    # in: the new part lands correctly in that box, and the seating
+    # shift that follows then drags it out of the bed. That is exactly
+    # how this arrived - "part 31 ended up outside sheet 0" from the
+    # add-on's nester, which seated after packing rather than before.
+    seat_sheets(parts, mat)
+
+    # Latest sheet first: emptying it is what removes a sheet, and its parts
+    # have the most earlier sheets to choose from.
+    budget = POCKET_BUDGET
+    # The free region costs a union of everything on the sheet, and it only
+    # changes when something is actually put down there. Cache it per sheet;
+    # several strays usually fail against the same one.
+    pockets: dict[int, list] = {}
+    for src in sorted(by, reverse=True):
+        targets = sorted(k for k in by if k < src)
+        for part in list(by[src]):
+            for dst in targets:
+                geo = [q.cut for q in by[dst]]
+                spot = find_spot(part, geo, [q.bounds for q in by[dst]],
+                                 W, H, gap, m)
+                if spot is None and budget > 0:
+                    # The cheap search only offers positions on the skyline,
+                    # which is not where a pocket inside a finished sheet is.
+                    budget -= 1
+                    if dst not in pockets:
+                        pockets[dst] = free_region(geo, W, H, gap, m)
+                    spot = find_pocket(part, pockets[dst],
+                                       tol=max(gap / 4.0, 1e-3))
+                if spot is None:
+                    continue
+                pockets.pop(dst, None)          # the sheet just changed
+                _put(part, *spot)
+                part.sheet = dst
+                by[dst].append(part)
+                by[src].remove(part)
+                break
+        if not by[src]:
+            del by[src]
+
+    remap = {old: new for new, old in enumerate(sorted(by))}
+    for old, group in by.items():
+        for part in group:
+            part.sheet = remap[old]
+    seat_sheets(parts, mat)     # a sheet that lost parts may have lost its edge
+    return len(by)
+
+
 def nest(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
     """True-shape bottom-left nesting. Returns (sheet count, oversized parts).
 
@@ -228,45 +441,11 @@ def nest(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
         placed_box: list = []
         leftovers = []
         for p in remaining:
-            spot = None
-            cands = _corner_candidates(placed_box, m, m, gap)
-            tree = STRtree(placed_geo) if placed_geo else None
-            for angle in (0.0, 90.0, 180.0, 270.0):
-                cand = affinity.rotate(p.cut, angle, origin="centroid")
-                bx0, by0, bx1, by1 = cand.bounds
-                cw, ch = bx1 - bx0, by1 - by0
-                if cw > W or ch > H:
-                    continue
-                # Buffer once per rotation, not once per candidate position.
-                # Buffering is the expensive call here and there are hundreds
-                # of positions; doing it inside the loop took the core suite
-                # from 36 s to 156 s on its own. One side buffered by the full
-                # gap is equivalent to both sides by half.
-                grown = cand.buffer(gap, join_style=2)
-                for y, x in cands:
-                    if x + cw > m + W or y + ch > m + H:
-                        continue
-                    dx, dy = x - bx0, y - by0
-                    probe = affinity.translate(grown, dx, dy)
-                    if tree is not None:
-                        hit = False
-                        for k in tree.query(probe):
-                            if probe.intersects(placed_geo[int(k)]):
-                                hit = True
-                                break
-                        if hit:
-                            continue
-                    spot = (angle, dx, dy, affinity.translate(cand, dx, dy))
-                    break
-                if spot is not None:
-                    break
+            spot = find_spot(p, placed_geo, placed_box, W, H, gap, m)
             if spot is None:
                 leftovers.append(p)
                 continue
-            angle, dx, dy, moved = spot
-            p.rotate(angle, origin=tuple(p.cut.centroid.coords)[0])
-            b = p.bounds
-            p.translate(moved.bounds[0] - b[0], moved.bounds[1] - b[1])
+            _put(p, *spot)
             p.sheet = sheet
             placed_geo.append(p.cut)
             placed_box.append(p.bounds)
@@ -344,6 +523,11 @@ def pack(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
         for p in parts:
             p.xform = np.eye(3)
         sheets, over = fn(parts, mat)
+        # Tighten before comparing, not after choosing. Both strategies leave
+        # room on an earlier sheet that a later part fits, and they leave
+        # different amounts, so the winner before tightening is not
+        # necessarily the winner after it.
+        sheets = tighten(parts, sheets, mat)
         trials.append((sheets, len(over), snap()))
 
     trials.sort(key=lambda t: (t[0], t[1]))
