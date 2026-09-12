@@ -707,6 +707,27 @@ def test_part_xform_reproduces_the_packing():
             f"{np.abs(moved - pred).max():.3e} mm")
 
 
+def test_oversized_parts_are_parked_not_left_at_random_coordinates():
+    """A part too big for the bed is never placed, so without help it keeps
+    whatever coordinates the unfold gave it - routinely negative. The net is
+    written from these positions, so one oversized part drags the 2D view into
+    negative space and every margin check on the *view* fails for a layout the
+    packer never claimed to have made."""
+    m = Material.from_flute("B")
+    m.bed = (120.0, 120.0)                 # far too small on purpose
+    tm = trimesh.creation.icosphere(subdivisions=1)
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(280)
+    islands, _ = unfold(pm, trials=30)
+    parts = build_parts(islands, m)
+    _sheets, over = pack(parts, m)
+    assert over, "this bed is too small for anything - expected oversized parts"
+    for p in over:
+        x0, y0, _x1, _y1 = p.bounds
+        assert x0 == pytest.approx(m.sheet_margin, abs=1e-6),             f"island {p.island_id} parked at x={x0:.1f}, not the margin"
+        assert y0 == pytest.approx(m.sheet_margin, abs=1e-6)
+        assert p.sheet < 0, "and it must still be flagged as not placed"
+
+
 def test_packed_parts_sit_inside_the_margins():
     """Nothing may stray into the sheet margin or across a sheet boundary -
     that is clamped material the laser cannot reach."""

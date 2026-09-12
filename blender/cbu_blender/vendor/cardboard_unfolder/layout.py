@@ -349,4 +349,16 @@ def pack(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
     trials.sort(key=lambda t: (t[0], t[1]))
     sheets, _, winner = trials[0]
     restore(winner)
-    return sheets, [p for p in parts if p.sheet < 0]
+
+    # A part too big for the bed is never placed, so it keeps whatever
+    # coordinates the unfold happened to give it - which are routinely
+    # negative. Nothing downstream expects that: the net is written from these
+    # positions, so an oversized part drags the 2D view off into negative
+    # space and every margin check on the *view* then fails for a layout the
+    # packer never claimed to have made. Park it on the margin instead, still
+    # flagged by sheet < 0.
+    over = [p for p in parts if p.sheet < 0]
+    for p in over:
+        x0, y0, _x1, _y1 = p.bounds
+        p.translate(mat.sheet_margin - x0, mat.sheet_margin - y0)
+    return sheets, over

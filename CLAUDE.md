@@ -10,12 +10,12 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 114 core invariants (~30 s)
+python -m pytest tests -q               # 115 core invariants (~30 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 129 checks, real Blender API
+python blender/test_addon.py            # 131 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -422,6 +422,24 @@ mask no longer lines up. The UV panel warns in both states and offers
 `cbu.select_all_faces` as the way out. Regressions:
 `unfold leaves the face selection alone`,
 `nesting gives the selection back after borrowing it`.
+
+**Changing the bed silently rescales the 2D view.** `uv_scale` is derived
+from the bed, so the *same* stored UVs mean different millimetres once the bed
+changes - a net laid out on a 300 mm bed read as half size on a 600 mm one,
+while the bed reference redrew at the new size immediately. The view then
+showed the net sitting outside a margin the packer had respected, which reads
+as "packing is ignoring the margin". `props.rewrite_net` re-emits the net on
+any bed change, keeping millimetres fixed and only changing the scale they are
+stored at. The layout is still for the old bed - that is what Re-pack is for.
+
+**An oversized part keeps whatever coordinates the unfold gave it.** It is
+never placed, so it is never translated, and those coordinates are routinely
+negative - a repack onto a bed too small produced a net spanning
+x[-136.3, 226.8]. Everything downstream reads positions from the parts, so one
+oversized part drags the whole 2D view into negative space and every margin
+check on the *view* fails for a layout the packer never claimed to have made.
+`pack()` now parks them on the margin, still flagged by `sheet < 0`.
+Regression: `test_oversized_parts_are_parked_not_left_at_random_coordinates`.
 
 **Measure a net against `pm.vertices`, not against a recomputed world
 transform.** Chasing that apparent corruption, a diagnostic that rebuilt world

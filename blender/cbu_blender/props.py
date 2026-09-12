@@ -32,6 +32,39 @@ FLUTE_ITEMS = [
 ]
 
 
+def rewrite_net(self, context):
+    """Re-emit the 2D net when the bed changes.
+
+    uv_scale is derived from the bed, so the *same* stored UVs mean different
+    millimetres after the bed is changed - a net laid out on a 300 mm bed reads
+    as half size on a 600 mm one. The bed reference redraws at the new size
+    immediately, so without this the view shows the net sitting outside a
+    margin that the packer did respect. Positions in mm are untouched; only
+    the scale they are stored at changes. The layout itself is still for the
+    old bed, which is what Re-pack is for.
+    """
+    obj = context.active_object if context else None
+    if obj is None or obj.type != "MESH":
+        return
+    try:
+        from . import bridge, overlay, ops
+        cached = ops._LAST.get(obj.name)
+        if not cached:
+            return
+        pm, islands, parts, _sheets, _rep = cached
+        if obj.mode != "OBJECT":
+            return                      # uv_layers data is empty in Edit Mode
+        mat = material_from(self)
+        bridge.write_net_uv(obj.data, pm, islands,
+                            scale=bridge.uv_scale(*mat.bed),
+                            placement={p.island_id: p for p in parts},
+                            sheet_height=mat.bed[1])
+        overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+        overlay.refresh_live_cuts()
+    except Exception:                                   # noqa: BLE001
+        pass                    # a settings tweak must never break the session
+
+
 class CBUSettings(bpy.types.PropertyGroup):
     # --- material ---
     flute: EnumProperty(name="Flute", items=FLUTE_ITEMS, default="B")
@@ -82,8 +115,10 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "concentrates stress and is where a fold starts to tear"))
 
     # --- machine ---
-    bed_x: FloatProperty(name="Bed X", default=600.0, min=50.0)
-    bed_y: FloatProperty(name="Bed Y", default=400.0, min=50.0)
+    bed_x: FloatProperty(name="Bed X", default=600.0, min=50.0,
+                         update=rewrite_net)
+    bed_y: FloatProperty(name="Bed Y", default=400.0, min=50.0,
+                         update=rewrite_net)
     margin: FloatProperty(name="Sheet margin", default=8.0, min=0.0)
     part_gap: FloatProperty(
         name="Part gap", default=3.0, min=0.0,

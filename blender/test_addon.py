@@ -324,6 +324,36 @@ if bpy.context.mode == "EDIT_MESH":
 check(sum(1 for p in obj.data.polygons if p.select) == _n,
       "and brings the whole net back into view")
 
+# ------------------------------------------------ bed changes keep the net honest
+# uv_scale is derived from the bed, so the same stored UVs mean different
+# millimetres once the bed changes - a net laid out on a 300 mm bed read as
+# half size on a 600 mm one. The bed reference redraws at the new size
+# immediately, so the view showed the net outside a margin the packer had
+# respected.
+obj = fresh("BedChange", "ico_sphere", subdivisions=1)
+obj.scale = (0.14,) * 3
+bpy.ops.object.transform_apply(scale=True)
+_s = bpy.context.scene.cbu
+_s.bed_x, _s.bed_y = 300.0, 300.0
+bpy.ops.cbu.unfold()
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def _net_mm():
+    _m = props.material_from(bpy.context.scene.cbu)
+    return bridge.read_net(obj.data, bridge.uv_scale(*_m.bed))
+
+
+_before = _net_mm()
+_s.bed_x, _s.bed_y = 600.0, 400.0
+_after = _net_mm()
+check(abs(_after[:, 0].max() - _before[:, 0].max()) < 1e-3,
+      f"the net keeps its millimetres when the bed changes "
+      f"({_before[:, 0].max():.1f} -> {_after[:, 0].max():.1f})")
+check(_after[:, 0].min() >= _s.margin - 1e-3,
+      "and still starts on the margin")
+
 # ------------------------------------------------ the cut outline in 2D
 # The UV layer holds only the islands. Glue tabs are generated in the core and
 # live solely in the exported parts, so a 2D view drawn from UVs alone is
