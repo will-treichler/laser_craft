@@ -113,6 +113,13 @@ class CBUSettings(bpy.types.PropertyGroup):
         name="Radius cut ends", default=True,
         description=("Round the ends of relief slots. A square internal corner "
                      "concentrates stress and is where a fold starts to tear"))
+    edge_offset: FloatProperty(
+        name="Edge offset", default=0.0, min=-5.0, max=5.0,
+        description=("How far the cut sits off the part's own edge, in mm. "
+                     "0 puts the beam on the line. Positive compensates for "
+                     "the kerf so the part comes out nominal size. NEGATIVE "
+                     "cuts it back, which is what thick board wants where two "
+                     "panels have to meet at a shared edge"))
     corner_relief: BoolProperty(
         name="Reach sharp corners", default=True,
         description=("Run a slit down the bisector of a sharp notch so the cut "
@@ -236,6 +243,7 @@ def material_from(s: CBUSettings):
     m.connect_ratio = s.connect_ratio
     m.min_connect = s.min_connect
     m.round_cut_ends = s.round_cut_ends
+    m.edge_offset = s.edge_offset
     m.corner_relief = s.corner_relief
     m.corner_overcut = s.corner_overcut
     m.bed = (s.bed_x, s.bed_y)

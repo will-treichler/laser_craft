@@ -62,6 +62,12 @@ class Material:
     # down the bisector to reach it. Empirical only in the sense that how
     # far PAST the apex to go depends on the board - 0 is enough for B
     # flute, a thicker board may want a little more.
+    # How far the cut sits off the part's own edge, in mm. Positive is kerf
+    # compensation; NEGATIVE cuts the part back, which is what thick board
+    # wants where two panels meet. 0 puts the beam on the line, which is right
+    # for cardboard at costume tolerance and keeps sharp notches honest.
+    edge_offset: float = 0.0
+
     corner_relief: bool = True
     corner_overcut: float = 0.0     # mm past the apex
                                     # A square internal corner is a crack starter, and

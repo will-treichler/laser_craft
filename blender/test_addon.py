@@ -399,9 +399,31 @@ _cut = np.vstack(_rings)
 _d = np.zeros(len(obj.data.loops) * 2)
 obj.data.uv_layers[bridge.UV_LAYER].data.foreach_get("uv", _d)
 _net = _d.reshape(-1, 2) / _sc
-check(_cut[:, 0].max() >= _net[:, 0].max() - 1e-6
-      and _cut[:, 1].max() >= _net[:, 1].max() - 1e-6,
-      "the cut outline reaches past the islands - that is the tabs")
+# With the defaults - edge_offset 0, tabs off - the cut IS the island outline,
+# so this compares two views of one shape. The net UVs are float32, hence the
+# 1e-3 mm tolerance rather than 1e-6: at 500 mm coordinates the storage error
+# alone is ~9e-5 mm, and an exact comparison here measures that and nothing
+# else.
+check(abs(_cut[:, 0].max() - _net[:, 0].max()) < 1e-3
+      and abs(_cut[:, 1].max() - _net[:, 1].max()) < 1e-3,
+      "at the defaults the cut sits on the island outline")
+
+# ...and the things that DO make it bigger still do. Measured on the parts
+# rather than the overlay, so it costs no second unfold.
+_pmx, _islx, _partsx, _shx, _repx = ops._LAST[obj.name]
+_L = ops._core()[1]
+_flush = sum(p.cut.area for p in _partsx)
+_m2 = props.material_from(bpy.context.scene.cbu)
+_m2.edge_offset = 0.5
+check(sum(p.cut.area for p in _L.build_parts(_islx, _m2)) > _flush,
+      "a positive edge offset grows the cut")
+_m2.edge_offset = -0.5
+check(sum(p.cut.area for p in _L.build_parts(_islx, _m2)) < _flush,
+      "and a negative one cuts the part back, for thick board")
+_m3 = props.material_from(bpy.context.scene.cbu)
+_m3.use_tabs = True
+check(sum(p.cut.area for p in _L.build_parts(_islx, _m3)) > _flush,
+      "glue tabs still reach past the islands")
 
 # vec3 or Blender dies on the draw, and this cannot be caught at draw time
 _v, _c = overlay.cut_segments(_rings, _sc)
@@ -544,7 +566,16 @@ bpy.ops.cbu.unfold()
 _mat = props.material_from(bpy.context.scene.cbu)
 _before_sheets = bpy.context.scene.cbu.last_sheets
 
-check(bpy.ops.cbu.pack_uv() == {"FINISHED"}, "bed-aware UV nesting runs")
+# CANCELLED is a normal answer: the nester declines any layout needing more
+# sheets than the one already in hand, and since tighten the core packing is
+# often already as good as it gets. The invariant is that nesting never makes
+# things worse, not that it always takes over.
+_res = bpy.ops.cbu.pack_uv()
+check(_res in ({"FINISHED"}, {"CANCELLED"}),
+      f"bed-aware UV nesting returns cleanly ({_res})")
+check(bpy.context.scene.cbu.last_sheets <= _before_sheets,
+      "nesting never takes a layout needing more sheets "
+      f"({bpy.context.scene.cbu.last_sheets} vs {_before_sheets})")
 _pm, _isl, _parts, _sheets, _rep = ops._LAST[obj.name]
 
 # Every part inside its own sheet. Nesting works on island outlines, but a

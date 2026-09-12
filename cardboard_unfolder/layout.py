@@ -20,7 +20,7 @@ from shapely.strtree import STRtree
 
 from .material import Material
 from .unfold import Island, min_area_rect
-from .folds import (plan_folds, apply_relief, kerf_compensate,
+from .folds import (plan_folds, apply_relief, offset_cut,
                     corner_relief)
 from .tabs import place_tabs, seam_labels, part_labels
 
@@ -136,10 +136,16 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
         for lab in slabels.get(isl.id, []) + plabels.get(isl.id, []):
             strokes.extend(lab.strokes)
 
-        cut = kerf_compensate(body, mat.kerf)
-        if mat.corner_relief:
-            cut = corner_relief(body, cut, mat.kerf,
-                                mat.corner_overcut)
+        cut = offset_cut(body, mat.edge_offset)
+        if cut.is_empty:
+            warns.append(
+                f"edge offset {mat.edge_offset:+.2f}mm removed this part "
+                f"entirely; cutting it at its own edge instead")
+            cut = body
+        # Only an OUTWARD offset buries a notch apex, so there is nothing to
+        # relieve without one.
+        if mat.corner_relief and mat.edge_offset > 0:
+            cut = corner_relief(body, cut, mat.kerf, mat.corner_overcut)
         necks = narrow_necks(cut, max(3.0, 2.0 * mat.thickness))
         if necks:
             warns.append(

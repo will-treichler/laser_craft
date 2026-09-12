@@ -10,12 +10,12 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 157 core invariants (~53 s)
+python -m pytest tests -q               # 161 core invariants (~41 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 165 checks, real Blender API
+python blender/test_addon.py            # 169 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -644,6 +644,24 @@ remnants *are* the bridges - the material the floor exists to protect - and
 they are shorter than it by design; applying it there deleted every dash and
 the PERF layer vanished from the SVG entirely. `perf_segments` takes
 `min_connect=0.0` for that call.
+
+**The cut sits ON the part edge by default.** `Material.edge_offset` is 0:
+positive is kerf compensation so the part comes out nominal size, negative
+cuts it back - which is what thick board usually wants, since two panels
+meeting at a shared edge collide at 3 mm unless each gives a little. It used
+to be hard-wired to +kerf/2, which at 0.15 mm is below what costume tolerance
+needs and was the sole cause of the notch problem below. Zero also makes
+`corner_relief` inert, because nothing buries a notch apex without an outward
+offset - so the default carries none of that machinery. Regressions:
+`test_the_cut_sits_on_the_part_edge_by_default`,
+`test_corner_relief_is_inert_without_an_outward_offset`.
+
+Note this changes what `Part.cut` means at the defaults: it is now exactly the
+island outline with relief slots taken out, so anything asserting the cut is
+*bigger* than the net is only true with tabs on or a positive offset. Two
+add-on checks assumed otherwise. And compare the cut against the net UVs at
+1e-3 mm, not 1e-6: the UV layer is float32 and carries ~9e-5 mm of storage
+error, so a tight comparison measures that and nothing else.
 
 **A kerf offset cannot reach into a notch, and no join style fixes it.**
 Growing the part by kerf/2 is right along an edge and at a convex corner. A

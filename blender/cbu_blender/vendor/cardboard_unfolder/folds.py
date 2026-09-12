@@ -358,14 +358,25 @@ def _rings(geom):
     return out
 
 
-def kerf_compensate(geom, kerf: float, grid: float = 1e-9):
-    """Grow the part by half a kerf so the cut lands on the drawn line.
+def offset_cut(geom, amount: float, grid: float = 1e-9):
+    """Move the cut line off the part's own edge by `amount` mm.
 
-    Interior holes shrink automatically because a negative offset of a hole
-    boundary is an outward offset of the part. Mitre joins keep corners sharp
-    rather than rounding them off.
+    Positive is outward - kerf compensation, so the beam's far side lands on
+    the drawn edge and the part comes out nominal size. Negative is inward,
+    which is what thick board often wants: two panels meeting at a fold have
+    to share the same edge, and at 3 mm they collide unless each is cut back
+    a little.
+
+    Zero by default. At costume tolerance neither compensation is needed, and
+    an outward offset is what makes a cut stop short of a sharp notch
+    (corner_relief) - so paying that complexity for 0.15 mm is a poor trade
+    unless the user asks for it.
+
+    Interior holes move the opposite way automatically, because an outward
+    offset of the part is an inward offset of a hole boundary. Mitre joins
+    keep corners sharp rather than rounding them off.
     """
-    if kerf <= 0:
+    if amount == 0.0 or geom.is_empty:
         return geom
-    g = geom.buffer(kerf / 2.0, join_style=2, mitre_limit=8.0)
+    g = geom.buffer(amount, join_style=2, mitre_limit=8.0)
     return shapely.set_precision(g, grid)

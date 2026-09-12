@@ -132,10 +132,15 @@ class CBU_PT_folds(_Base, bpy.types.Panel):
         lay.prop(s, "min_connect")
         lay.prop(s, "round_cut_ends")
         lay.separator()
-        lay.prop(s, "corner_relief")
+        lay.prop(s, "edge_offset")
+        # Nothing buries a notch apex without an OUTWARD offset, so the corner
+        # controls have nothing to do at 0 or below.
         sub = lay.column()
-        sub.enabled = s.corner_relief
-        sub.prop(s, "corner_overcut")
+        sub.enabled = s.edge_offset > 0
+        sub.prop(s, "corner_relief")
+        row = sub.column()
+        row.enabled = s.corner_relief
+        row.prop(s, "corner_overcut")
 
 
 class CBU_PT_machine(_Base, bpy.types.Panel):

@@ -24,7 +24,7 @@ from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs
                                        split_to_fit, split_island, unfold_tree,
                                        mirrored_faces, _face_local)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
-                                      apply_relief, kerf_compensate,
+                                      apply_relief, offset_cut,
                                       fold_intervals, flute_warning,
                                       corner_relief)
 from cardboard_unfolder.tabs import place_tabs
@@ -319,6 +319,61 @@ def test_packing_leaves_no_overlap_and_nothing_off_the_sheet(name, tm):
             assert y1 <= mat.bed[1] - m + 1e-6
 
 
+def test_the_cut_sits_on_the_part_edge_by_default():
+    """No offset unless asked for. A 0.15 mm kerf compensation is below what
+    this is built for, and it is what makes a cut stop short of a notch."""
+    mat = Material.from_flute("B")
+    assert mat.edge_offset == 0.0
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosahedron())
+    islands, _ = unfold(pm, trials=40)
+    for part, isl in zip(build_parts(islands, mat), islands):
+        body = apply_relief(isl.outline(), plan_folds(isl, mat))
+        assert part.cut.area == pytest.approx(body.area, rel=1e-12)
+
+
+def test_a_negative_edge_offset_cuts_the_part_back():
+    """Thick board: two panels meeting at a shared edge collide unless each is
+    cut back a little."""
+    mat = Material.from_flute("B")
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosahedron())
+    islands, _ = unfold(pm, trials=40)
+
+    mat.edge_offset = 0.0
+    flush = sum(p.cut.area for p in build_parts(islands, mat))
+    mat.edge_offset = -0.5
+    smaller = sum(p.cut.area for p in build_parts(islands, mat))
+    mat.edge_offset = 0.5
+    bigger = sum(p.cut.area for p in build_parts(islands, mat))
+    assert smaller < flush < bigger
+
+
+def test_an_edge_offset_that_would_erase_a_part_falls_back_and_says_so():
+    mat = Material.from_flute("B")
+    mat.edge_offset = -500.0                     # far wider than any island
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosahedron())
+    islands, _ = unfold(pm, trials=40)
+    parts = build_parts(islands, mat)
+    assert all(not p.cut.is_empty for p in parts)
+    assert any("edge offset" in w for p in parts for w in p.warnings)
+
+
+def test_corner_relief_is_inert_without_an_outward_offset():
+    """Nothing buries a notch apex at 0 or below, so relief must not fire -
+    it would only cut slits into a part that never lost its corners."""
+    mat = Material.from_flute("B")
+    mat.corner_relief = True
+    pm = PolyMesh.from_trimesh(trimesh.creation.cylinder(radius=1, height=2,
+                                                         sections=16))
+    pm = pm.scale_to_height(200.0)
+    islands, _ = unfold(pm, trials=40)
+    for off in (0.0, -0.3):
+        mat.edge_offset = off
+        for part, isl in zip(build_parts(islands, mat), islands):
+            body = apply_relief(isl.outline(), plan_folds(isl, mat))
+            expect = offset_cut(body, off)
+            assert part.cut.area == pytest.approx(expect.area, rel=1e-9)
+
+
 def _slab_with_notch(deg, top=30.0):
     """Slab x[-30,30] y[-10,top] with a V cut down from the top, apex at (0,0)."""
     h = math.radians(deg / 2.0)
@@ -350,7 +405,7 @@ def test_kerf_offset_cannot_reach_into_a_notch(deg, expect):
 def test_corner_relief_reaches_the_apex(deg):
     body = _slab_with_notch(deg)
     kerf = 0.30
-    cut = kerf_compensate(body, kerf)
+    cut = offset_cut(body, kerf / 2)
     before = Point(0, 0).distance(cut.boundary)
     relieved = corner_relief(body, cut, kerf)
     after = Point(0, 0).distance(relieved.boundary)
@@ -364,7 +419,7 @@ def test_corner_relief_leaves_ordinary_corners_alone():
     """A notch the beam already covers must not be cut at."""
     body = _slab_with_notch(120.0)
     kerf = 0.30
-    cut = kerf_compensate(body, kerf)
+    cut = offset_cut(body, kerf / 2)
     assert Point(0, 0).distance(cut.boundary) < kerf
     assert corner_relief(body, cut, kerf).equals(cut)
 
@@ -372,7 +427,7 @@ def test_corner_relief_leaves_ordinary_corners_alone():
 def test_corner_overcut_runs_past_the_apex():
     body = _slab_with_notch(20.0)
     kerf = 0.30
-    cut = kerf_compensate(body, kerf)
+    cut = offset_cut(body, kerf / 2)
     deep = corner_relief(body, cut, kerf, overcut=2.0)
     # 2 mm past the apex, on the far side, must now be outside the part
     assert not deep.contains(Point(0.0, -1.5))
@@ -390,7 +445,7 @@ def test_corner_relief_never_breaks_a_part_in_two():
                     (20, 20), (-20, 20), (-20, 0.5), (-neck, 0.0),
                     (-20, -0.5)])
     assert body.is_valid
-    cut = kerf_compensate(body, kerf)
+    cut = offset_cut(body, kerf / 2)
     out = corner_relief(body, cut, kerf)
     n_before = 1 if cut.geom_type == "Polygon" else len(cut.geoms)
     n_after = 1 if out.geom_type == "Polygon" else len(out.geoms)
@@ -891,8 +946,8 @@ def test_kerf_grows_the_part():
     pm = PolyMesh.from_trimesh(trimesh.creation.box()).scale_to_height(100)
     islands, _ = unfold(pm, trials=20)
     o = islands[0].outline()
-    assert kerf_compensate(o, m.kerf).area > o.area
-    assert kerf_compensate(o, 0.0).area == pytest.approx(o.area)
+    assert offset_cut(o, m.kerf / 2).area > o.area
+    assert offset_cut(o, 0.0).area == pytest.approx(o.area)
 
 
 # ------------------------------------------------------------------- tabs
