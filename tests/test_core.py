@@ -391,6 +391,34 @@ def test_every_label_is_between_the_floor_and_the_cap(name, tm):
         assert lab.height >= mat.label_min_height - 1e-9, lab.text
 
 
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_no_engraved_stroke_is_bigger_than_the_text_it_claims(name, tm):
+    """Measure the geometry, not the height field it was built from.
+
+    Rotation makes a bounding box useless here - the y extent of a rotated
+    glyph is its box at that angle and reads up to 2.5x the real height, which
+    is how a 4 mm cap once measured as 9.94 mm. Diameter is what a ruler
+    measures and no rigid motion changes it: no single stroke of text `h` tall
+    can exceed the cell diagonal.
+    """
+    mat = Material.from_flute("B")
+    mat.model_id = "ID"
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=40)
+    cap = math.hypot(strokefont.CELL_W / strokefont.CELL_H * mat.label_height,
+                     mat.label_height)
+    worst = 0.0
+    for lab in _all_labels(islands, mat):
+        for st in lab.strokes:
+            a = np.asarray(st, dtype=float)
+            worst = max(worst, float(
+                np.linalg.norm(a[:, None] - a[None, :], axis=-1).max()))
+    assert worst <= cap + 1e-9, (
+        f"a stroke spans {worst:.2f} mm; {mat.label_height} mm text cannot "
+        f"exceed {cap:.2f}")
+    assert worst > mat.label_min_height, "nothing was engraved at all"
+
+
 def test_fit_height_divides_rather_than_searches():
     mat = Material.from_flute("B")
     mat.label_height, mat.label_min_height = 4.0, 2.0

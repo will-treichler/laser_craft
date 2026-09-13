@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 176 core invariants (~45 s)
+python -m pytest tests -q               # 183 core invariants (~47 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -764,7 +764,22 @@ of islands carry one, and every label lands between 2.00 and 4.00 mm.
 afterwards - they are rotated, so their y extent is the glyph's *box* at that
 angle and reads up to 2.5x the real height. A probe that measured the strokes
 reported 9.94 mm glyphs from a 4 mm cap, which is a measurement bug that looks
-exactly like a real one.
+exactly like a real one. Path length is the other wrong metric: a `P` is one
+polyline that walks 8.8 mm around a 4 mm glyph. **Diameter** - the largest
+distance between any two of a stroke's points - is what a ruler measures and
+what no rigid motion changes; no stroke of text `h` tall can exceed the cell
+diagonal, `hypot(0.6h, h)`. Verified end to end at 4 mm: core 4.000 median,
+the draw buffer 4.665 max against a 4.665 ceiling with 0 of 1378 over, and
+the SVG the same. Regression:
+`test_no_engraved_stroke_is_bigger_than_the_text_it_claims`.
+
+**The UV unit square is the bed rounded UP to a power of two, and that
+changes with the bed.** A 300 mm bed gives 1/512, so 1 UV unit is 512 mm; a
+600 mm bed gives 1/1024. Reading a glyph as 0.0078 UV and multiplying by the
+1024 from this file's `uv_scale` example returns exactly 8.00 mm for 4 mm
+text - a clean factor of two, and a very easy thing to conclude is a bug in
+the text. The UV panel prints the live figure (`1 UV unit = N mm`); trust
+that over any remembered constant.
 
 **Island labels need a point and an angle, not just a point.** The centroid of
 an L-shaped or horseshoe island is frequently outside it and
