@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 230 checks, real Blender API
+python blender/test_addon.py            # 232 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -286,12 +286,28 @@ the main panel. Regression: `and honours overlay_fill separately`, which reads
 in `co_consts` instead and the check will not see it, so read the attribute
 directly.
 
-**The swatch on the Cut / Fold buttons is the colour key.** `COLOR_RED` and
-`COLOR_BLUE` are Blender's own swatch icons, so the button carries its own
-legend and nothing has to be remembered - and `ui.mark_key` repeats it in both
-panels, including outside Edit Mode where the buttons themselves are not drawn.
-If the mark colours ever change, change them here too; the test only asserts
-that the cut colour is redder than it is blue and the fold colour the reverse.
+**The colour key has to be a real swatch, and the same value the overlay
+draws with.** An `icon=` on a button is tinted by the theme and reads as a
+letter with a smudge beside it - not a key. `ui.mark_key` draws
+`mark_cut_color` / `mark_fold_color` as COLOR properties, which render as
+actual colour fields, and `overlay.mark_colors` reads those same properties -
+so the legend cannot drift from the thing it explains, and the colours can be
+changed when the defaults clash with a model. The constants stay as the
+defaults and as the headless fallback.
+
+Compare against `mark_colors()`, never against the constants: Blender stores a
+colour as **float32**, so a default of 0.85 comes back as 0.8500000238 and an
+exact comparison with the constant never matches.
+
+The key belongs *beside the buttons that make the marks* - the Cut/Weld pair
+in the UV panel is `cbu.edit_seam`, which calls `cbu.mark`, so it writes
+exactly the same red and blue as the Seams panel. Putting the legend at the
+top of the UV panel, several boxes away from those buttons, is not a key.
+
+**Four switches in a row truncate to nothing.** Blender gives each item in
+an aligned row an equal share of the panel width, so `Show bed / Show cut /
+Annotation / Marks` side by side reads as `Sho..` four times at any sane
+width. The UV layer switches are a `column`.
 
 **A typo'd icon name only fails inside `draw()`**, which needs a real UI
 region - so no headless suite ever reaches it and the panel is simply broken

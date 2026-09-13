@@ -501,9 +501,18 @@ bpy.ops.object.mode_set(mode="OBJECT")
 
 _mp, _mc = overlay.mark_lines(obj, _eps)
 check(len(_mp) == 4, f"two marked edges give four vertices ({len(_mp)})")
-check({tuple(c) for c in _mc} == {overlay.CUT_MARK_RGBA,
-                                  overlay.FOLD_MARK_RGBA},
+# Against the LIVE colours, not the constants: the panel swatch drives these
+# now, and Blender stores a colour as float32 - 0.85 comes back as
+# 0.8500000238, which no exact comparison with the default will ever match.
+_ck, _fk = overlay.mark_colors()
+check({tuple(c) for c in _mc} == {_ck, _fk},
       "each mark carries its own colour")
+check(_ck != _fk, "and the two are distinguishable")
+_cbu5 = bpy.context.scene.cbu
+_cbu5.mark_cut_color = (1.0, 0.0, 1.0)
+check(overlay.mark_colors()[0][:3] == (1.0, 0.0, 1.0),
+      "the panel swatch is what the overlay draws with - the key cannot drift")
+_cbu5.mark_cut_color = overlay.CUT_MARK_RGBA[:3]
 _co = np.asarray([v.co[:] for v in obj.data.vertices])
 _off = [float(np.linalg.norm(_co - np.asarray(q), axis=1).min()) for q in _mp]
 check(min(_off) > _eps * 1.5,

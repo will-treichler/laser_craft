@@ -219,6 +219,18 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "their glue tabs and kerf. The UV net alone shows only "
                      "the islands, which is about 20% smaller"))
 
+    # The panel swatch IS the colour key, so it has to be the same value the
+    # overlay draws with - a legend that can drift from the thing it explains
+    # is worse than none. These feed overlay.mark_colors.
+    mark_cut_color: FloatVectorProperty(
+        name="Cut", subtype="COLOR", size=3, min=0.0, max=1.0,
+        default=(0.85, 0.18, 0.10), update=restyle_marks,
+        description="Colour of a forced CUT, in the viewport and over the net")
+    mark_fold_color: FloatVectorProperty(
+        name="Weld", subtype="COLOR", size=3, min=0.0, max=1.0,
+        default=(0.12, 0.45, 0.95), update=restyle_marks,
+        description="Colour of a forced FOLD - the weld - in both views")
+
     show_net_marks: BoolProperty(
         name="Marks", default=True,
         description=("Draw your forced cut and fold marks over the net, the "
@@ -332,6 +344,19 @@ def material_from(s: CBUSettings, obj=None):
     m.label_folds = s.label_folds
     m.model_id = model_id_for(s, obj)
     return m
+
+
+def restyle_marks(self, context):
+    """Re-colour the forced marks when their swatch changes.
+
+    The 2D batch keys itself on the colours so it rebuilds on the next draw;
+    the 3D one is cached geometry and has to be told.
+    """
+    try:
+        from . import overlay
+        overlay.refresh_marks()
+    except Exception:                                       # noqa: BLE001
+        pass                    # a settings tweak must never break a session
 
 
 def restyle_overlay(self, context):

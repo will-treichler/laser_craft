@@ -72,16 +72,18 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         sub.prop(s, "overlay_alpha", text="", slider=True)
 
 
-def mark_key(lay):
-    """The colour key for forced marks, drawn wherever they can be confused.
+def mark_key(lay, s):
+    """The colour key for forced marks, beside the buttons that make them.
 
-    Shown in both modes on purpose - the buttons that carry the swatches only
-    appear in Edit Mode, and the marks themselves are visible from everywhere.
+    Real swatches, not icons: an icon is tinted by the theme and reads as a
+    letter with a smudge next to it, which is not a key. These are the very
+    values the overlay draws with (`overlay.mark_colors`), so the legend
+    cannot drift from the thing it explains - and they can be changed if the
+    defaults clash with a model's own colours.
     """
-    row = lay.row(align=True)
-    row.label(text="Cut", icon="COLOR_RED")
-    row.label(text="Fold", icon="COLOR_BLUE")
-    row.label(text="Auto", icon="RADIOBUT_OFF")
+    col = lay.column(align=True)
+    col.prop(s, "mark_cut_color")
+    col.prop(s, "mark_fold_color")
 
 
 class CBU_PT_seams(_Base, bpy.types.Panel):
@@ -90,6 +92,7 @@ class CBU_PT_seams(_Base, bpy.types.Panel):
 
     def draw(self, context):
         lay = self.layout
+        s = context.scene.cbu
         if context.mode != "EDIT_MESH":
             lay.label(text="Enter Edit Mode to mark seams", icon="INFO")
             lay.label(text="Alt-click selects an edge loop")
@@ -105,7 +108,7 @@ class CBU_PT_seams(_Base, bpy.types.Panel):
             row.operator("cbu.mark", text="Auto",
                          icon="RADIOBUT_OFF").mode = "AUTO"
             lay.operator("cbu.select_marked", icon="RESTRICT_SELECT_OFF")
-        mark_key(lay)
+        mark_key(lay, s)
         lay.operator("cbu.clear_marks", icon="X")
 
 
@@ -296,17 +299,17 @@ class CBU_PT_uv(bpy.types.Panel):
         mm = 1.0 / bridge.uv_scale(s.bed_x, s.bed_y)
         lay.label(text=f'UV layer "{bridge.UV_LAYER}" is the net')
         lay.label(text=f"1 UV unit = {mm:.0f} mm  (bed {s.bed_x:.0f}x{s.bed_y:.0f})")
-        row = lay.row(align=True)
-        row.prop(s, "show_bed")
-        row.prop(s, "show_cut")
-        row.prop(s, "show_net_labels", text="Annotation")
-        row.prop(s, "show_net_marks")
-        if s.show_net_marks:
-            mark_key(lay)
-        row = lay.row(align=True)
-        sub = row.row(align=True)
+        # Stacked, not in a row. Four switches side by side truncate to
+        # "Sho.." at any sane panel width, and the key that goes with the
+        # marks belongs beside the buttons that make them, further down.
+        col = lay.column(align=True)
+        col.prop(s, "show_bed")
+        sub = col.column(align=True)
         sub.enabled = s.show_bed
         sub.prop(s, "show_bed_ruler")
+        col.prop(s, "show_cut")
+        col.prop(s, "show_net_labels", text="Annotation")
+        col.prop(s, "show_net_marks")
 
         # UV Sync Selection defaults ON in Blender 5.x, and in that mode the UV
         # editor moves the loops of *selected faces* rather than whole islands.
@@ -358,12 +361,16 @@ class CBU_PT_uv(bpy.types.Panel):
         if context.mode != "EDIT_MESH":
             box.label(text="Enter Edit Mode to pick edges", icon="INFO")
         else:
+            # Same swatches as the Seams panel, because these write the same
+            # marks: cbu.edit_seam calls cbu.mark, so Cut is the red forced
+            # cut and Weld the blue forced fold.
             row = box.row(align=True)
-            op = row.operator("cbu.edit_seam", text="Cut", icon="UNLINKED")
+            op = row.operator("cbu.edit_seam", text="Cut", icon="COLOR_RED")
             op.mode = "CUT"
             op.separate = s.separate_on_cut
-            op = row.operator("cbu.edit_seam", text="Weld", icon="LINKED")
+            op = row.operator("cbu.edit_seam", text="Weld", icon="COLOR_BLUE")
             op.mode = "FOLD"
+            mark_key(box, s)
             box.prop(s, "separate_on_cut")
             if not context.scene.tool_settings.use_uv_select_sync:
                 box.label(text="reading the UV selection", icon="UV")

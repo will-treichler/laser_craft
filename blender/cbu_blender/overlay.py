@@ -191,6 +191,21 @@ def _lines_batch(pts, cols):
     return batch_for_shader(line_s, "LINES", {"pos": pts, "color": cols})
 
 
+def mark_colors():
+    """(cut, fold) RGBA for the forced marks, from the scene if it has them.
+
+    The panel draws these same values as its colour key, so the legend cannot
+    drift from the thing it explains. Falls back to the constants when there
+    is no scene - which is every headless test.
+    """
+    try:
+        s = bpy.context.scene.cbu
+        return (tuple(s.mark_cut_color) + (1.0,),
+                tuple(s.mark_fold_color) + (1.0,))
+    except Exception:                                   # noqa: BLE001
+        return CUT_MARK_RGBA, FOLD_MARK_RGBA
+
+
 def mark_lines(obj, eps: float):
     """Forced cut / fold marks in object space, lifted clear of the tint.
 
@@ -212,10 +227,11 @@ def mark_lines(obj, eps: float):
     if not len(hit):
         return [], []
     lift_by = eps * MARK_LIFT
+    cut_rgba, fold_rgba = mark_colors()
     pts, cols = [], []
     for i in hit:
         a, b = me.edges[int(i)].vertices
-        c = CUT_MARK_RGBA if vals[i] == 1 else FOLD_MARK_RGBA
+        c = cut_rgba if vals[i] == 1 else fold_rgba
         for v in (a, b):
             co = np.asarray(me.vertices[v].co[:], dtype=float)
             n = np.asarray(me.vertices[v].normal[:], dtype=float)
@@ -647,14 +663,15 @@ def _marks_batch(obj, scale: float):
     line_s = _shaders()[1]
     if not segs or line_s is None:
         return None
-    key = ("marks", obj.name, scale, len(segs),
+    cut_rgba, fold_rgba = mark_colors()
+    key = ("marks", obj.name, scale, len(segs), cut_rgba, fold_rgba,
            float(np.round(sum(float(a[0]) + float(b[1])
                               for a, b, _v in segs), 4)))
     hit = _bed_cache.get(key)
     if hit is None:
         verts, cols = [], []
         for a, b, v in segs:
-            c = CUT_MARK_RGBA if v == 1 else FOLD_MARK_RGBA
+            c = cut_rgba if v == 1 else fold_rgba
             verts.append((float(a[0] * scale), float(a[1] * scale), 0.0))
             verts.append((float(b[0] * scale), float(b[1] * scale), 0.0))
             cols.append(c)
