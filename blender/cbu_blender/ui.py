@@ -279,6 +279,10 @@ class CBU_PT_uv(bpy.types.Panel):
         row.prop(s, "show_bed")
         row.prop(s, "show_cut")
         row.prop(s, "show_net_labels", text="Annotation")
+        row = lay.row(align=True)
+        sub = row.row(align=True)
+        sub.enabled = s.show_bed
+        sub.prop(s, "show_bed_ruler")
 
         # UV Sync Selection defaults ON in Blender 5.x, and in that mode the UV
         # editor moves the loops of *selected faces* rather than whole islands.

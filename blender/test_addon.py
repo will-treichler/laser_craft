@@ -450,6 +450,49 @@ check(all(abs(d[0] - 40.0) < 1e-3 and abs(d[1] - 25.0) < 1e-3 for d in _moved),
       f"and it moved by exactly the drag (got {_moved[0] if _moved else None})")
 check(bool(_still), "the islands that were not dragged stayed put")
 
+# ------------------------------------------------ the millimetre ruler
+# The UV editor measures in UV units and the factor is the bed rounded UP to a
+# power of two - 512 mm at a 300 mm bed, 1024 at 600. A length read off the
+# editor against the wrong remembered constant is out by exactly two, and that
+# reads as a bug in whatever was measured. A drawn ruler needs no remembering.
+for _span, _want in ((300.0, 50.0), (600.0, 100.0), (1200.0, 200.0),
+                     (30.0, 5.0), (3.0, 0.5)):
+    _got = overlay.nice_step(_span)
+    check(_got == _want,
+          f"nice_step({_span:g}) is a round {_want:g}, got {_got:g}")
+check(overlay.nice_step(0.0) > 0, "a zero span does not divide by zero")
+
+_sc3 = 1.0 / 512.0
+_grid3 = (0.0, 0.0, 300.0 * _sc3, 600.0 * _sc3)
+_av, _ac = overlay.axis_segments(_grid3, _sc3)
+check(len(_av) > 0 and len(_av) == len(_ac), "the ruler emits segments")
+check(all(len(q) == 3 for q in _av), "ruler vertices are vec3")
+check(all(c == overlay.AXIS_RGBA for c in _ac),
+      "and are drawn in the ruler's own colour")
+
+# Nothing may be drawn over the sheet - the ruler lives outside the origin
+# corner, or it would sit on top of the parts it is measuring.
+_xs = [q[0] for q in _av]
+_ys = [q[1] for q in _av]
+check(min(_xs) < 0.0 and min(_ys) < 0.0, "ticks hang outside the sheet")
+_inside = [q for q in _av if q[0] > 1e-9 and q[1] > 1e-9]
+check(not _inside,
+      f"nothing is drawn inside the sheet area ({len(_inside)} vert(s))")
+
+# It must scale with the bed, not with the numbers: the same physical span at
+# a different uv_scale gives the same tick count.
+_a1, _ = overlay.axis_segments((0.0, 0.0, 300.0 / 512, 300.0 / 512), 1 / 512.0)
+_a2, _ = overlay.axis_segments((0.0, 0.0, 300.0 / 1024, 300.0 / 1024), 1 / 1024.0)
+check(len(_a1) == len(_a2),
+      f"the same 300 mm reads the same at either scale ({len(_a1)} vs {len(_a2)})")
+
+_cbu3 = bpy.context.scene.cbu
+check(_cbu3.show_bed_ruler is True, "the ruler is on by default")
+_bn = overlay._draw_bed.__code__.co_names
+check("show_bed_ruler" in _bn, "the 2D draw honours show_bed_ruler")
+check("axis_segments" in overlay._bed_batch.__code__.co_names,
+      "and the bed batch is what carries it")
+
 # ------------------------------------------------ annotation in the 2D view
 # The engraving is generated in the core and lives only in the exported parts,
 # exactly like the glue tabs - so without publishing it the first place a seam

@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 191 checks, real Blender API
+python blender/test_addon.py            # 206 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -772,6 +772,16 @@ diagonal, `hypot(0.6h, h)`. Verified end to end at 4 mm: core 4.000 median,
 the draw buffer 4.665 max against a 4.665 ceiling with 0 of 1378 over, and
 the SVG the same. Regression:
 `test_no_engraved_stroke_is_bigger_than_the_text_it_claims`.
+
+**The bed layer carries a labelled mm ruler** (`overlay.axis_segments`,
+toggled by `show_bed_ruler`) for exactly the reason below: the unit is drawn
+rather than remembered. Ticks run along the bottom and left edges with a
+1/2/5 step from `nice_step`, numbered every major tick, and "MM" once at the
+corner. They sit **outside** the sheet - below and left of the origin - so
+nothing is ever drawn over the parts, which is asserted
+(`nothing is drawn inside the sheet area`). The numbers are stroke-font text
+like the engraving, so the ruler scales with the bed rather than the zoom: the
+same 300 mm span emits the same ticks at 1/512 and 1/1024.
 
 **The UV unit square is the bed rounded UP to a power of two, and that
 changes with the bed.** A 300 mm bed gives 1/512, so 1 UV unit is 512 mm; a

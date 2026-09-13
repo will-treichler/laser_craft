@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import colorsys
 import hashlib
+import math
 
 import bpy
 import gpu
@@ -446,6 +447,8 @@ def _draw():
 SHEET_RGBA = (0.95, 0.62, 0.15, 0.85)      # sheet outline
 CUT_RGBA = (0.20, 0.85, 0.45, 0.95)        # what the laser actually follows
 LABEL_RGBA = (0.55, 0.78, 1.00, 0.95)      # engraved seam / fold / part marks
+AXIS_RGBA = (0.95, 0.62, 0.15, 0.70)       # the mm ruler down the bed edges
+MAX_TICKS = 400                            # a runaway must not stall drawing
 USABLE_RGBA = (0.95, 0.62, 0.15, 0.32)     # usable area inside the margins
 MAX_TILES = 400                            # a runaway net must not stall drawing
 
@@ -584,11 +587,95 @@ def _cut_batch(obj, scale: float):
     return hit
 
 
-def _bed_batch(bounds, bed_w, bed_h, margin):
+def nice_step(span_mm: float, target: int = 6) -> float:
+    """A 1 / 2 / 5 x 10^k step giving roughly `target` labelled ticks.
+
+    Round numbers, or the ruler is no easier to read than the thing it exists
+    to explain: 50 mm on a 300 mm bed, not 42.857.
+    """
+    if span_mm <= 0:
+        return 1.0
+    raw = span_mm / max(target, 1)
+    mag = 10.0 ** math.floor(math.log10(raw))
+    for m in (1.0, 2.0, 5.0):
+        if raw <= m * mag:
+            return m * mag
+    return 10.0 * mag
+
+
+def axis_segments(grid, scale: float, label_mm: float = 6.0):
+    """A millimetre ruler along the bottom and left edges. (verts, colours).
+
+    The UV editor measures in UV units, and the factor is the bed rounded UP to
+    a power of two - 512 mm for a 300 mm bed, 1024 for a 600 mm one. A length
+    read off the editor and multiplied by the wrong remembered constant is out
+    by exactly two, and that reads as a bug in whatever was measured rather
+    than in the measuring. A ruler drawn in the view needs no remembering.
+
+    Ticks sit OUTSIDE the sheet, below and left of the origin, so nothing is
+    ever drawn over the parts.
+    """
+    from .vendor.cardboard_unfolder import strokefont
+
+    x0, y0, x1, y1 = grid
+    w_mm, h_mm = (x1 - x0) / scale, (y1 - y0) / scale
+    if w_mm <= 0 or h_mm <= 0:
+        return [], []
+    step = nice_step(max(w_mm, h_mm))
+    minor = step / 5.0
+    major_len, minor_len = 5.0 * scale, 2.5 * scale
+    gap = 2.0 * scale
+    verts, cols = [], []
+
+    def seg(ax, ay, bx, by):
+        verts.append((float(ax), float(ay), 0.0))
+        verts.append((float(bx), float(by), 0.0))
+        cols.append(AXIS_RGBA)
+        cols.append(AXIS_RGBA)
+
+    def text(s, at):
+        for st in strokefont.text_strokes(s, label_mm * scale, at,
+                                          anchor="center"):
+            for i in range(len(st) - 1):
+                seg(st[i][0], st[i][1], st[i + 1][0], st[i + 1][1])
+
+    for axis in (0, 1):
+        span = w_mm if axis == 0 else h_mm
+        n = int(round(span / minor)) + 1
+        if n > MAX_TICKS:
+            continue
+        for i in range(n):
+            mm = i * minor
+            big = abs(mm / step - round(mm / step)) < 1e-9
+            ln = major_len if big else minor_len
+            if axis == 0:
+                u = x0 + mm * scale
+                seg(u, y0, u, y0 - ln)
+                if big:
+                    text(str(int(round(mm))),
+                         (u, y0 - ln - gap - label_mm * scale / 2.0))
+            else:
+                u = y0 + mm * scale
+                seg(x0, u, x0 - ln, u)
+                if big:
+                    text(str(int(round(mm))),
+                         (x0 - ln - gap - label_mm * scale * 1.6, u))
+
+    # Say the unit once, at the corner, so nobody has to infer it.
+    text("MM", (x0 - major_len - gap - label_mm * scale * 1.6,
+                y0 - major_len - gap - label_mm * scale / 2.0))
+    return verts, cols
+
+
+def _bed_batch(bounds, bed_w, bed_h, margin, scale=None):
     line_s = _shaders()[1]
     if line_s is None:
         return None
     verts, cols_rgba = bed_segments(bounds, bed_w, bed_h, margin)
+    if scale:
+        av, ac = axis_segments(bounds, scale)
+        verts = verts + av
+        cols_rgba = cols_rgba + ac
     if not verts:
         return None
     return batch_for_shader(line_s, "LINES",
@@ -624,7 +711,8 @@ def _draw_bed():
     batch = None
     if s.show_bed:
         grid = bed_grid(bounds, s.bed_x * sc, s.bed_y * sc)
-        key = (obj.name, grid, s.bed_x, s.bed_y, s.margin, sc)
+        key = (obj.name, grid, s.bed_x, s.bed_y, s.margin, sc,
+               s.show_bed_ruler)
         if key not in _bed_cache:
             # Keep the cut and label batches: they are keyed by their own
             # tag and rebuilding them on every bed change is wasted work.
@@ -633,7 +721,8 @@ def _draw_bed():
                               and k[0] in ("cuts", "labels"))]:
                 del _bed_cache[k]
             _bed_cache[key] = _bed_batch(grid, s.bed_x * sc, s.bed_y * sc,
-                                         s.margin * sc)
+                                         s.margin * sc,
+                                         sc if s.show_bed_ruler else None)
         batch = _bed_cache[key]
 
     line_s = _shaders()[1]

@@ -212,6 +212,14 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "their glue tabs and kerf. The UV net alone shows only "
                      "the islands, which is about 20% smaller"))
 
+    show_bed_ruler: BoolProperty(
+        name="Ruler", default=True,
+        description=("Draw a labelled millimetre ruler down the bed's bottom "
+                     "and left edges. The UV editor measures in UV units and "
+                     "the factor changes with the bed - 512 mm per unit at a "
+                     "300 mm bed, 1024 at 600 - so a length read off the "
+                     "editor against the wrong constant is out by exactly two"))
+
     show_net_labels: BoolProperty(
         name="Show annotation", default=True,
         description=("Draw the engraving over the net in the UV editor - seam "
