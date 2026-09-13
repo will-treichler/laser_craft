@@ -107,6 +107,13 @@ class Material:
     # its space at the floor is left off rather than shrunk into a smudge.
     label_height: float = 4.0
     label_min_height: float = 2.0
+    # How much of an edge its own label may span. A number as long as the
+    # edge it names reads as a label for the whole part; at a quarter it reads
+    # as belonging to that edge. It is also the dominant lever on how many
+    # edges get numbered at all - on a pikachu net the median cut edge is
+    # 10.5 mm and a two-digit number at the 2 mm floor is 2.88 mm wide, so a
+    # quarter needs an 11.5 mm edge and only 41% of edges have one.
+    label_edge_frac: float = 0.25
     label_folds: bool = True        # M / V beside every fold
     model_id: str = ""              # stamped on each island with its number
 

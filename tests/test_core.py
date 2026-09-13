@@ -13,6 +13,7 @@ import trimesh
 import pytest
 from shapely.geometry import (Polygon, MultiLineString, box,
                               Point, LineString)
+from shapely.ops import unary_union
 from shapely import set_precision
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,7 +30,8 @@ from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       corner_relief)
 from cardboard_unfolder.tabs import (place_tabs, seam_labels,
                                      part_labels, fold_labels,
-                                     fit_height)
+                                     fit_height, island_labels,
+                                     short_id, ACROSS_FRAC)
 from cardboard_unfolder.layout import (build_parts, pack, narrow_necks,
                                        _mls,
                                        Part, tighten, find_spot,
@@ -534,6 +536,174 @@ def test_seam_numbers_match_across_the_pair():
     both = sum(1 for n in labelled.values() if n == 2)
     assert both >= len(labelled) * 0.8, \
         f"only {both} of {len(labelled)} seam numbers appear on both halves"
+
+
+def _labelled(islands, mat):
+    """Every island's labels, built the way build_parts builds them."""
+    out = {}
+    for isl in islands:
+        plans = plan_folds(isl, mat)
+        body = apply_relief(isl.outline(), plans)
+        out[isl.id] = (island_labels(isl, plans, mat, body), body)
+    return out
+
+
+def test_short_id_keeps_short_names_and_hashes_long_ones():
+    """Label length is the biggest lever on how many islands carry an id, and
+    an imported STL is routinely called something unengravable."""
+    assert short_id("ARM") == "ARM"
+    assert short_id("pikachu") == "PIKACHU"
+    long = "OLD_VERSION_READ_DESCRIPTION_pikachu_1gen_flowalistik"
+    got = short_id(long)
+    assert len(got) == 8
+    assert got == short_id(long), "must be stable across calls"
+    assert got != short_id(long + "2"), "and tell two models apart"
+    assert set(got) <= set("0123456789ABCDEF")
+    for ch in got:
+        assert strokefont.text_strokes(ch, 4.0), f"{ch!r} is not in the font"
+    assert short_id("") == ""
+    assert short_id("  ") == ""
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_labels_never_overlap_each_other(name, tm):
+    """Two numbers burned through each other read as a third number that means
+    nothing - worse than either being missing."""
+    mat = Material.from_flute("B")
+    mat.model_id = "T"
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=40)
+    pairs = 0
+    for labs, _body in _labelled(islands, mat).values():
+        geo = [unary_union([LineString(s) for s in l.strokes if len(s) > 1])
+               for l in labs]
+        for a in range(len(geo)):
+            for b in range(a + 1, len(geo)):
+                pairs += 1
+                assert geo[a].distance(geo[b]) > 0.0, (
+                    f"{labs[a].text!r} and {labs[b].text!r} collide")
+    assert pairs > 0, "nothing was labelled, so nothing was tested"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_a_seam_number_never_spans_more_of_its_edge_than_allowed(name, tm):
+    """The rule that makes text shrink in congested areas rather than shout."""
+    mat = Material.from_flute("B")
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=40)
+    for isl in islands:
+        by_seam = {str(c.seam): c for c in isl.cuts if c.seam >= 0}
+        plans = plan_folds(isl, mat)
+        for lab in island_labels(isl, plans, mat,
+                                 apply_relief(isl.outline(), plans)):
+            if lab.kind != "seam":
+                continue
+            c = by_seam[lab.text]
+            w = strokefont.text_width(lab.text, lab.height)
+            assert w <= c.length * mat.label_edge_frac + 1e-9, (
+                f"{lab.text!r} spans {w:.2f} mm of a {c.length:.2f} mm edge")
+
+
+def test_a_tighter_edge_fraction_shrinks_the_text_before_dropping_it():
+    """The behaviour the fraction exists for: crowd it and the text gets
+    smaller, down to the floor and no further."""
+    mat = Material.from_flute("B")
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(260.0)
+    islands, _ = unfold(pm, trials=40)
+
+    def seam_heights(frac):
+        mat.label_edge_frac = frac
+        out = []
+        for isl in islands:
+            plans = plan_folds(isl, mat)
+            out += [l.height for l in island_labels(
+                isl, plans, mat, apply_relief(isl.outline(), plans))
+                if l.kind == "seam"]
+        return out
+
+    # Derive the premise. At a loose fraction the 4 mm cap binds and nothing
+    # shrinks however hard you squeeze - a first attempt asserted shrinking at
+    # 0.2 on this mesh and found every label still at the cap, because its
+    # edges are long. Pick the fraction that puts the median edge in the band
+    # where the fit actually decides the height.
+    lens = [c.length for isl in islands for c in isl.cuts if c.seam >= 0]
+    med = float(np.median(lens))
+    tight_frac = 4.0 / med          # ~4 mm of room: a 2-digit number wants 2.8
+
+    loose = seam_heights(1.0)
+    tight = seam_heights(tight_frac)
+    assert loose and tight
+    assert max(loose) == pytest.approx(mat.label_height),         "a loose fraction should let the cap bind"
+    assert min(tight) < mat.label_height, "nothing shrank when crowded"
+    assert np.mean(tight) < np.mean(loose)
+    assert min(tight) >= mat.label_min_height - 1e-9, "shrank past the floor"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_a_fold_mark_sits_at_the_middle_of_its_fold(name, tm):
+    """Centred along the edge and aligned to it. Offset across it only far
+    enough to clear a relief slot, which is a real hole."""
+    mat = Material.from_flute("B")
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=40)
+    checked = 0
+    for isl in islands:
+        plans = plan_folds(isl, mat)
+        marks = [l for l in island_labels(isl, plans, mat,
+                                          apply_relief(isl.outline(), plans))
+                 if l.kind == "fold"]
+        for lab in marks:
+            c = np.vstack(lab.strokes).mean(axis=0)
+            # the fold it belongs to is the nearest one of its own sense
+            same = [p for p in plans
+                    if ("M" if p.is_mountain else "V") == lab.text]
+            best = min(same, key=lambda p: LineString(
+                [p.fold.a, p.fold.b]).distance(Point(c)))
+            f = best.fold
+            d = (f.b - f.a) / np.linalg.norm(f.b - f.a)
+            t = float((c - f.a) @ d) / f.length
+            assert 0.3 <= t <= 0.7, (
+                f"{lab.text} sits {t:.2f} along its fold, not at the middle")
+            across = LineString([f.a, f.b]).distance(Point(c))
+            assert across <= best.width / 2.0 + lab.height * 1.2 + 1e-6, (
+                f"{lab.text} stands {across:.2f} mm off a fold with a "
+                f"{best.width:.2f} mm slot")
+            checked += 1
+    assert checked > 0
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_no_label_is_engraved_into_a_relief_slot(name, tm):
+    """A slot is a hole. A number across one is cut in half by the fold it was
+    meant to explain, so labels are placed against the body, not the outline."""
+    mat = Material.from_flute("B")
+    mat.model_id = "T"
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=40)
+    for labs, body in _labelled(islands, mat).values():
+        room = body.buffer(1e-6)
+        for lab in labs:
+            for s in lab.strokes:
+                if len(s) > 1:
+                    assert room.contains(LineString(s)), (
+                        f"{lab.kind} {lab.text!r} crosses a slot or the edge")
+
+
+def test_the_island_id_outranks_the_fold_marks():
+    """Priority is the point of building all three together: on a crowded part
+    the id must survive and an M is what gives way."""
+    mat = Material.from_flute("B")
+    mat.model_id = "ZZ"
+    pm = PolyMesh.from_trimesh(trimesh.creation.box()).scale_to_height(70.0)
+    islands, _ = unfold(pm, trials=40)
+    for isl in islands:
+        plans = plan_folds(isl, mat)
+        labs = island_labels(isl, plans, mat,
+                             apply_relief(isl.outline(), plans))
+        kinds = [l.kind for l in labs]
+        if "part" in kinds:
+            assert kinds.index("part") == 0, "the id is placed first"
 
 
 def test_the_cut_sits_on_the_part_edge_by_default():

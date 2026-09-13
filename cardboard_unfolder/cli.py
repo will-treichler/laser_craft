@@ -2,6 +2,8 @@
 from __future__ import annotations
 import argparse
 from pathlib import Path
+
+from .tabs import short_id
 import sys
 
 from .material import Material, FLUTES
@@ -73,7 +75,8 @@ def main(argv=None) -> int:
     # The mesh's own name is the obvious identifier and beats nothing at all,
     # but it is often long - and label length is what decides whether a small
     # island can carry one, so --id is worth using.
-    mat.model_id = a.model_id if a.model_id is not None else Path(a.mesh).stem
+    mat.model_id = (a.model_id if a.model_id is not None
+                    else short_id(Path(a.mesh).stem))
     if a.text_height is not None:
         mat.label_height = a.text_height
     if a.text_min is not None:

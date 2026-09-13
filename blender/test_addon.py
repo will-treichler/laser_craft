@@ -37,6 +37,13 @@ print("blender", bpy.app.version_string)
 import cbu_blender
 from cbu_blender import bridge, dev, ops, overlay, props, ui
 
+
+def pytest_approx(v, tol=1e-6):
+    class _A:
+        def __eq__(self, other):
+            return abs(other - v) <= tol
+    return _A()
+
 cbu_blender.register()
 check(hasattr(bpy.types.Scene, "cbu"), "settings registered on Scene")
 for idname in ("cbu.unfold", "cbu.mark", "cbu.export", "cbu.pack_uv",
@@ -539,14 +546,28 @@ _s.model_id = "ARMOUR"
 check(props.model_id_for(_s, obj) == "ARMOUR", "the panel field wins")
 _s.model_id = "  PAD  "
 check(props.model_id_for(_s, obj) == "PAD", "and is trimmed")
+# The fallback goes through short_id. Label length is the biggest lever on how
+# many islands can carry an id, and an imported STL is routinely called
+# something like OLD_VERSION_READ_DESCRIPTION_pikachu_1gen_flowalistik.
+from cbu_blender.vendor.cardboard_unfolder.tabs import short_id as _short
 _s.model_id = "   "
-check(props.model_id_for(_s, obj) == obj.name,
-      f"whitespace is not an id; falls back to the object ({obj.name})")
+check(props.model_id_for(_s, obj) == _short(obj.name),
+      f"whitespace is not an id; falls back to the object ({obj.name!r} -> "
+      f"{_short(obj.name)!r})")
 _s.model_id = ""
-check(props.model_id_for(_s, obj) == obj.name,
-      "blank falls back to the object name")
-check(props.material_from(_s, obj).model_id == obj.name,
+check(props.model_id_for(_s, obj) == _short(obj.name),
+      "blank falls back to the object name, shortened")
+check(props.material_from(_s, obj).model_id == _short(obj.name),
       "and material_from carries it into the core")
+check(len(_short("OLD_VERSION_READ_DESCRIPTION_pikachu_1gen_flowalistik")) == 8,
+      "a name too long to engrave becomes 8 characters")
+
+_s.label_edge_frac = 0.4
+check(props.material_from(_s, obj).label_edge_frac == pytest_approx(0.4),
+      "the per-edge room setting reaches the material")
+_s.label_edge_frac = 0.25
+check(not (getattr(ui.CBU_PT_labels, "bl_options", set()) or set()),
+      "the Annotation panel is open - the Model ID box lives there")
 check(props.material_from(_s).model_id != obj.name or not obj.name,
       "without an object it does not invent one from the active selection")
 

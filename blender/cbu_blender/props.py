@@ -188,6 +188,13 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "not fit is left off - a burnt smudge where a seam number "
                      "should be is worse than a bare edge, because the builder "
                      "trusts it"))
+    label_edge_frac: FloatProperty(
+        name="Room per edge", default=0.25, min=0.05, max=1.0,
+        description=("How much of an edge its own number may span. Lower means "
+                     "smaller text and more edges left bare; higher means "
+                     "bigger text crowding its neighbours. This is the main "
+                     "lever on how many edges get numbered - at 0.25 a "
+                     "two-digit number at the 2 mm floor needs an 11.5 mm edge"))
     label_folds: BoolProperty(
         name="Mark folds M/V", default=True,
         description=("Engrave M or V beside every fold. Which way a crease goes "
@@ -270,18 +277,26 @@ class CBUSettings(bpy.types.PropertyGroup):
 def model_id_for(s: CBUSettings, obj=None) -> str:
     """What to stamp on the pieces.
 
-    The panel field wins; otherwise the object's name, then the .blend's. An
-    unsaved file with a default-named object gives nothing, which is correct -
-    "Cube-3" tells a builder less than the bare part number already does.
+    The panel field wins; otherwise the object's name, then the .blend's, put
+    through short_id. Label length is the biggest lever on how many islands
+    can carry an id at all, and an imported STL is routinely called something
+    like OLD_VERSION_READ_DESCRIPTION_pikachu_1gen_flowalistik, which fits
+    nowhere. A name already short enough is kept as it is; anything longer
+    becomes a stable 8-character hash. Type a shorter one and more islands
+    carry it: measured on that net, 54% at 8 characters against 75% at 4.
+
+    An unsaved file with a default-named object gives nothing, which is
+    correct - "Cube-3" tells a builder less than the bare part number does.
     """
     tag = (s.model_id or "").strip()
     if tag:
         return tag
+    from .vendor.cardboard_unfolder.tabs import short_id
     if obj is not None and obj.name and not obj.name.startswith("Mesh"):
-        return obj.name
+        return short_id(obj.name)
     import bpy
     stem = bpy.path.basename(bpy.data.filepath)
-    return stem.rsplit(".", 1)[0] if stem else ""
+    return short_id(stem.rsplit(".", 1)[0]) if stem else ""
 
 
 def material_from(s: CBUSettings, obj=None):
@@ -306,6 +321,7 @@ def material_from(s: CBUSettings, obj=None):
     m.part_gap = s.part_gap
     m.label_height = s.label_height
     m.label_min_height = s.label_min_height
+    m.label_edge_frac = s.label_edge_frac
     m.label_folds = s.label_folds
     m.model_id = model_id_for(s, obj)
     return m

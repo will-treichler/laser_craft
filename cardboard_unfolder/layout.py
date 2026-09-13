@@ -22,7 +22,7 @@ from .material import Material
 from .unfold import Island, min_area_rect
 from .folds import (plan_folds, apply_relief, offset_cut,
                     corner_relief)
-from .tabs import place_tabs, seam_labels, part_labels, fold_labels
+from .tabs import place_tabs, island_labels
 
 
 @dataclass
@@ -126,8 +126,6 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
     # Tabs are optional: most cardboard is taped or gets a glued backing strip,
     # and the flaps cost about a fifth of the sheet in area.
     tabs, skipped = place_tabs(islands, mat) if mat.use_tabs else ({}, set())
-    slabels = seam_labels(islands, mat)
-    plabels = part_labels(islands, mat)
 
     parts = []
     for isl in islands:
@@ -148,9 +146,10 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
             from .folds import perf_segments
             perf_m.extend(perf_segments(t.base[0], t.base[1], mat))
 
+        # One pass per island, so the three kinds compete for the same room
+        # instead of being laid down blind on top of one another.
         strokes = []
-        for lab in (slabels.get(isl.id, []) + plabels.get(isl.id, [])
-                    + fold_labels(isl, plans, mat)):
+        for lab in island_labels(isl, plans, mat, body):
             strokes.extend(lab.strokes)
 
         cut = offset_cut(body, mat.edge_offset)

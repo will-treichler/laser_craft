@@ -10,12 +10,12 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 183 core invariants (~47 s)
+python -m pytest tests -q               # 214 core invariants (~77 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 206 checks, real Blender API
+python blender/test_addon.py            # 209 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -724,6 +724,55 @@ Three engravings, and the net is not assemblable without the first:
   polygons whose seam numbers each start at 1. In the add-on the panel field
   wins, then the object's name, then the .blend's (`props.model_id_for`); the
   CLI takes `--id` and falls back to the mesh file's name.
+
+**Build all three kinds together, in priority order, against one occupancy
+map.** `tabs.island_labels` is that pass; `seam_labels` / `part_labels` /
+`fold_labels` are now thin filters over it. Built separately they were laid
+down blind on top of one another - two numbers burned through each other read
+as a third number that means nothing, which is worse than either being
+missing. Order decides what gives way when there is no room: island id first
+(without it two models cut the same day are one pile), then seam numbers
+(without them the net is not assemblable), then M/V (useful, and the first
+thing to drop). Collision is tested on the *card* rather than the strokes -
+two labels whose cells touch are too close to read even if their glyphs happen
+to interleave. Regression: `test_labels_never_overlap_each_other`.
+
+**Place labels against the BODY, not the outline.** Relief slots are holes,
+and a number engraved across one is cut in half by the fold it was meant to
+explain. On a 3 mm board every fold on a real net becomes a slot, so the
+outline is a poor picture of where there is material - an island id was
+landing across a fold line until `build_parts` started passing the
+relief-subtracted body in. Regression:
+`test_no_label_is_engraved_into_a_relief_slot`.
+
+**Two ceilings on how big a label may be, and the smaller wins.**
+`Material.label_edge_frac` (0.25) caps text width at a fraction of the edge it
+names - a number as long as its edge reads as a label for the whole part -
+and `ACROSS_FRAC` (0.5) caps it at half the *face's* narrow dimension, which
+is what stops a big glyph on a 3 mm spur. `Cut.face` and `Fold.f0/f1` say
+which face to measure; `min_area_rect` gives its narrow side.
+
+The edge fraction is the dominant lever on coverage and it is worth knowing
+how dominant. On a pikachu net the median cut edge is **10.5 mm** and a
+two-digit number at the 2 mm floor is 2.88 mm wide, so a quarter needs an
+11.5 mm edge and only **41% of edges have one**. Measured: 24% of edges
+numbered at 0.25, 36% at 0.35, 41% at 0.5. It is exposed in the panel because
+that trade is a judgement, not a fact.
+
+**Label length is the other lever, and it is bigger than it looks.**
+`tabs.short_id` keeps a name that is already 8 characters or fewer and hashes
+anything longer to 8 hex digits - hex because every character has to exist in
+the stroke font. An imported STL is routinely called something like
+`OLD_VERSION_READ_DESCRIPTION_pikachu_1gen_flowalistik`, which fits nowhere at
+all. Measured on that net: `3ACB3DBA-0` reaches 54% of islands, `PIKA-0` 75%,
+a bare `P0` 88%. So the panel box is not decoration - typing a short tag buys
+back a fifth of the islands.
+
+**M / V go at the middle of the fold, aligned to it.** Stepping a letter clear
+of its fold spends far more of a congested part than the letter does, so the
+offset is zero unless there is a relief slot to clear - and then it is exactly
+the slot's half width plus a little. Regression:
+`test_a_fold_mark_sits_at_the_middle_of_its_fold`.
 
 **A label must be tested where it will actually be burned.** Engraving outside
 the part is not cosmetic: the laser either cuts it off the sheet or burns it

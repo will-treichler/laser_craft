@@ -12,6 +12,8 @@ edges is not assemblable by a human; the same net with matching numbers on
 both halves of every seam is straightforward.
 """
 from __future__ import annotations
+import hashlib
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -108,6 +110,14 @@ def place_tabs(islands: list[Island], mat: Material,
     return placed, skipped
 
 
+# How much of a feature a label may occupy. Both are ceilings, and the
+# smaller wins. A number as long as the edge it names reads as a label for the
+# whole part; at a quarter it reads as belonging to that edge. The face rule
+# is what stops a big glyph on a narrow sliver: text wider than half the face
+# it sits on has nowhere to be that is not touching something.
+ACROSS_FRAC = 0.5       # of the face's narrow dimension; see Material
+
+
 def fit_height(text: str, avail: float, mat: Material) -> float | None:
     """The largest legible height for `text` in `avail` mm, or None.
 
@@ -127,6 +137,25 @@ def fit_height(text: str, avail: float, mat: Material) -> float | None:
     return h if h >= mat.label_min_height else None
 
 
+def short_id(name: str, n: int = 8) -> str:
+    """A short, stable, engravable tag from a name of any length.
+
+    Label length is the single biggest lever on how many islands can carry an
+    id at all - at the 2 mm floor every character costs 1.7 mm of clear room -
+    and a name like OLD_VERSION_READ_DESCRIPTION_pikachu_1gen_flowalistik
+    cannot be engraved anywhere. A name already short enough is kept as it is,
+    because a human-readable tag beats a hash; anything longer is hashed, which
+    is stable across runs and still tells two models apart. Hex only, so every
+    character exists in the stroke font.
+    """
+    base = re.sub(r"[^A-Za-z0-9]+", "", name or "").upper()
+    if not base:
+        return ""
+    if len(base) <= n:
+        return base
+    return hashlib.sha1(name.encode("utf-8")).hexdigest()[:n].upper()
+
+
 def _card(pt, w: float, h: float, ang: float):
     """The rectangle a label will occupy, rotated the way it will be drawn.
 
@@ -141,162 +170,190 @@ def _card(pt, w: float, h: float, ang: float):
     return g
 
 
-def _place(outline, txt: str, h: float, pt, ang: float):
-    """The strokes for `txt` at `pt`, or None if they would leave the island.
-
-    Engraving outside the part is not a cosmetic problem: the laser either
-    cuts it off the sheet or burns it into the neighbouring piece.
-
-    Two tests, cheap first. The card is the glyph cell's bounding box, so
-    fitting it is sufficient - but it is not necessary, because letters do not
-    fill their cells. Card-only cost 27 percentage points of seam coverage
-    (78% -> 51%) by refusing labels whose glyphs had room. When it fails, fall
-    back to the strokes themselves, which are exactly what gets burned.
-    """
-    strokes = strokefont.text_strokes(txt, h, pt, ang)
-    w = strokefont.text_width(txt, h)
-    if outline.contains(_card(pt, w, h, ang)):
-        return strokes
-    for s in strokes:
-        if len(s) > 1 and not outline.contains(LineString(s)):
-            return None
-    return strokes
-
-
 def _upright(ang: float) -> float:
     """Keep text readable rather than upside down."""
     return ang + np.pi if (ang > np.pi / 2 or ang < -np.pi / 2) else ang
 
 
-def seam_labels(islands: list[Island], mat: Material) -> dict[int, list[Label]]:
-    """Engrave the seam number just inside each cut edge, on both halves, so
-    the two pieces that mate can be found by matching numbers.
+def _try(outline, taken: list, txt: str, h: float, pt, ang: float):
+    """(strokes, card) for `txt` at `pt`, or (None, None) if it cannot go there.
 
-    This is the annotation that decides whether a net is assemblable at all: a
-    60-piece net with unlabelled edges is a puzzle, the same net with matching
-    numbers either side of every seam is a job.
+    Two things disqualify a spot: leaving the island, and landing on a label
+    already placed. Overlapping engraving is not a near miss - two numbers
+    burned through each other read as a third number that means nothing.
+
+    Containment is tested cheap-first. The card is the glyph cell's bounding
+    box, so fitting it is sufficient but not necessary, because letters do not
+    fill their cells; card-only cost 27 points of seam coverage by refusing
+    labels whose glyphs had room. Collision uses the card on purpose though -
+    two labels whose cells touch are too close to read even if their strokes
+    happen to interleave.
     """
-    out: dict[int, list[Label]] = {i.id: [] for i in islands}
-    for isl in islands:
-        o = isl.outline()
-        for c in isl.cuts:
-            if c.seam < 0:
-                continue
-            txt = str(c.seam)
-            # 80% of the edge, so a number never runs into the corners
-            h = fit_height(txt, c.length * 0.8, mat)
-            if h is None:
-                continue
-            d = c.b - c.a
-            d = d / np.linalg.norm(d)
-            inward = -_outward(isl, c)
-            ang = _upright(np.arctan2(d[1], d[0]))
-            # An edge long enough to hold the number says nothing about the
-            # material BEHIND it - a narrow spur, or a neighbouring cut running
-            # back at an angle, leaves none. Untested, 109 of 346 seam numbers
-            # on a pikachu net hung outside their own island, where the laser
-            # either loses them or burns them into the next part.
-            # Slide along the edge as well as away from it. The midpoint is
-            # the obvious place and often the worst one: a neighbouring cut
-            # running back at an angle takes the material right behind it while
-            # leaving plenty a quarter of the way along. Midpoint-only left
-            # 54% of seam edges numbered; this gets most of the rest.
-            strokes = None
-            for t in (0.5, 0.35, 0.65, 0.25, 0.75):
-                base = c.a + (c.b - c.a) * t
-                for k in (0.85, 1.2, 1.7, 2.4):
-                    strokes = _place(o, txt, h, base + inward * (h * k), ang)
-                    if strokes is not None:
-                        break
-                if strokes is not None:
-                    break
-            if strokes is None:
-                continue
-            out[isl.id].append(Label(strokes, txt, h, "seam"))
-    return out
+    w = strokefont.text_width(txt, h)
+    card = _card(pt, w, h, ang)
+    for t in taken:
+        if card.intersects(t):
+            return None, None
+    strokes = strokefont.text_strokes(txt, h, pt, ang)
+    if outline.contains(card):
+        return strokes, card
+    for s in strokes:
+        if len(s) > 1 and not outline.contains(LineString(s)):
+            return None, None
+    return strokes, card
 
 
-def fold_labels(island: Island, plans, mat: Material) -> list[Label]:
-    """M or V beside every fold, so the builder knows which way it bends.
+def _face_width(isl: Island, face: int, cache: dict) -> float:
+    """The narrow dimension of one face, in mm.
 
-    Which way a crease goes is not recoverable from a flat sheet, and getting
-    one wrong on an assembled shell means peeling it apart again. The mark
-    clears the relief slot - `plans` carries each fold's actual opening, so the
-    offset is measured rather than guessed - and goes on whichever side of the
-    fold is inside the island, because a fold at the island's edge has
-    material on one side only.
+    The room a label has is not the length of the edge it names; it is how
+    much material is behind that edge. A 60 mm cut along a 3 mm spur has room
+    for nothing.
     """
-    if not mat.label_folds:
+    if face in cache:
+        return cache[face]
+    ring = isl.faces.get(face)
+    if ring is None or len(ring) < 3:
+        cache[face] = float("inf")
+        return cache[face]
+    w, h, _ang, _c = min_area_rect(np.asarray(ring, dtype=float))
+    cache[face] = float(min(w, h))
+    return cache[face]
+
+
+def island_labels(isl: Island, plans, mat: Material, body=None) -> list[Label]:
+    """Every engraving for one island, in priority order and never overlapping.
+
+    Order is the point. There is not room for everything on a congested net,
+    so what gets dropped has to be the least useful thing:
+
+      1. the island id - without it two models cut the same day are one pile
+      2. seam numbers - without them the net is not assemblable at all
+      3. M / V - useful, and the first thing to give up
+
+    Placed against a shared occupancy map, so a fold mark can never land on a
+    seam number that is already there.
+    """
+    # The BODY, not the outline: relief slots are holes, and a number engraved
+    # across one is cut in half by the fold it was meant to explain. On a
+    # 3 mm board every fold on this net becomes a slot, so the outline is a
+    # poor picture of where there is material.
+    o = isl.outline() if body is None else body
+    if o.is_empty:
         return []
-    o = island.outline()
-    out = []
-    for plan in plans:
-        f = plan.fold
-        txt = "M" if plan.is_mountain else "V"
-        h = fit_height(txt, f.length * 0.5, mat)
-        if h is None:
-            continue
-        d = f.b - f.a
-        n = float(np.linalg.norm(d))
-        if n < 1e-12:
-            continue
-        d = d / n
-        perp = np.array([-d[1], d[0]])
-        mid = (f.a + f.b) / 2.0
-        clear = plan.width / 2.0 + h * 0.9
-        ang = _upright(np.arctan2(d[1], d[0]))
-        for side in (1.0, -1.0):
-            strokes = _place(o, txt, h, mid + perp * clear * side, ang)
-            if strokes is not None:
-                out.append(Label(strokes, txt, h, "fold"))
-                break
-    return out
+    big = (max(o.geoms, key=lambda g: g.area)
+           if o.geom_type == "MultiPolygon" else o)
+    taken: list = []
+    out: list[Label] = []
+    widths: dict = {}
 
-
-def part_labels(islands: list[Island], mat: Material,
-                prefix: str = "P") -> dict[int, list[Label]]:
-    """The model identifier and island number, engraved inside each island.
-
-    Cut two models on one afternoon and the pieces are indistinguishable
-    without this: both are grey polygons carrying seam numbers that each start
-    at 1. `Material.model_id` names the model, and falls back to `prefix` so
-    the old P0/P1 behaviour survives when nobody sets one.
-
-    Placed at the pole of inaccessibility, not the centroid: the centroid of an
-    L-shaped or horseshoe island is frequently outside it, and
-    representative_point only promises to be *somewhere* inside - which on a
-    long thin island is somewhere with no room. polylabel finds the point
-    furthest from any edge, which is exactly where a label wants to be.
-    """
-    out: dict[int, list[Label]] = {}
+    # ---------------------------------------------------------------- id
     tag = mat.model_id.strip()
-    for isl in islands:
-        txt = f"{tag}-{isl.id}" if tag else f"{prefix}{isl.id}"
-        o = isl.outline()
-        big = (max(o.geoms, key=lambda g: g.area)
-               if o.geom_type == "MultiPolygon" else o)
-        out[isl.id] = []
-        if big.is_empty:
-            continue
+    txt = f"{tag}-{isl.id}" if tag else f"P{isl.id}"
+    if not big.is_empty:
         try:
             pt = polylabel(big, tolerance=max(0.05, mat.label_min_height / 10))
         except Exception:                                   # noqa: BLE001
             pt = big.representative_point()
-        # Room here is two-dimensional, so unlike an edge label this one has to
-        # be tried rather than divided out. Try the island's own long axis as
-        # well as horizontal: these nets are full of long thin slivers with
-        # plenty of room along them and none across, and horizontal-only left
-        # 10 of 24 pikachu islands unlabelled.
         _w, _h, axis, _c = min_area_rect(shapely.get_coordinates(big))
+        done = False
         for h in _steps(mat.label_height, mat.label_min_height):
             for ang in _angles(axis):
-                strokes = _place(big, txt, h, (pt.x, pt.y), _upright(ang))
+                strokes, card = _try(big, taken, txt, h, (pt.x, pt.y),
+                                     _upright(ang))
                 if strokes is not None:
-                    out[isl.id] = [Label(strokes, txt, h, "part")]
+                    out.append(Label(strokes, txt, h, "part"))
+                    taken.append(card)
+                    done = True
                     break
-            if out[isl.id]:
+            if done:
                 break
+
+    # ------------------------------------------------------- seam numbers
+    for c in isl.cuts:
+        if c.seam < 0:
+            continue
+        txt = str(c.seam)
+        avail = min(c.length * mat.label_edge_frac,
+                    _face_width(isl, c.face, widths) * ACROSS_FRAC)
+        h = fit_height(txt, avail, mat)
+        if h is None:
+            continue
+        d = c.b - c.a
+        d = d / np.linalg.norm(d)
+        inward = -_outward(isl, c)
+        ang = _upright(np.arctan2(d[1], d[0]))
+        # Slide along the edge as well as away from it. The midpoint is the
+        # obvious place and often the worst one: a neighbouring cut running
+        # back at an angle takes the material right behind it while leaving
+        # plenty a quarter of the way along.
+        found = None
+        for t in (0.5, 0.35, 0.65, 0.25, 0.75):
+            base = c.a + (c.b - c.a) * t
+            for k in (0.85, 1.2, 1.7, 2.4):
+                strokes, card = _try(o, taken, txt, h, base + inward * (h * k),
+                                     ang)
+                if strokes is not None:
+                    found = (strokes, card)
+                    break
+            if found:
+                break
+        if found:
+            out.append(Label(found[0], txt, h, "seam"))
+            taken.append(found[1])
+
+    # --------------------------------------------------------- fold marks
+    if mat.label_folds:
+        for plan in plans:
+            f = plan.fold
+            txt = "M" if plan.is_mountain else "V"
+            avail = min(f.length * mat.label_edge_frac,
+                        _face_width(isl, f.f0, widths) * ACROSS_FRAC,
+                        _face_width(isl, f.f1, widths) * ACROSS_FRAC)
+            h = fit_height(txt, avail, mat)
+            if h is None:
+                continue
+            d = f.b - f.a
+            n = float(np.linalg.norm(d))
+            if n < 1e-12:
+                continue
+            d = d / n
+            perp = np.array([-d[1], d[0]])
+            mid = (f.a + f.b) / 2.0
+            ang = _upright(np.arctan2(d[1], d[0]))
+            # On the line, aligned to it. Offsetting a letter clear of the
+            # fold spends far more of a congested part than the letter does,
+            # so step aside only for a relief slot, which is a real hole.
+            clear = 0.0 if plan.width <= 0.0 else plan.width / 2.0 + h * 0.6
+            for side in (1.0, -1.0):
+                strokes, card = _try(o, taken, txt, h, mid + perp * clear * side,
+                                     ang)
+                if strokes is not None:
+                    out.append(Label(strokes, txt, h, "fold"))
+                    taken.append(card)
+                    break
+                if clear == 0.0:
+                    break                   # both sides are the same spot
     return out
+
+
+def seam_labels(islands: list[Island], mat: Material) -> dict[int, list[Label]]:
+    """Seam numbers only. island_labels is what build_parts uses; this stays
+    for callers that want one kind on its own."""
+    return {i.id: [l for l in island_labels(i, (), mat) if l.kind == "seam"]
+            for i in islands}
+
+
+def part_labels(islands: list[Island], mat: Material,
+                prefix: str = "P") -> dict[int, list[Label]]:
+    """The island id only. See island_labels."""
+    return {i.id: [l for l in island_labels(i, (), mat) if l.kind == "part"]
+            for i in islands}
+
+
+def fold_labels(island: Island, plans, mat: Material) -> list[Label]:
+    """The M / V marks only. See island_labels."""
+    return [l for l in island_labels(island, plans, mat) if l.kind == "fold"]
 
 
 def _angles(axis: float):
@@ -304,9 +361,8 @@ def _angles(axis: float):
 
     The island's own long axis and its perpendicular are where a sliver has
     room, and horizontal is easiest to read; after that just sweep. Three
-    angles left 8 of 24 pikachu islands unlabelled, three of which had
-    obvious room - a 22.4 x 17.7 mm island with a 7.5 mm inscribed circle
-    among them.
+    angles left 8 of 24 pikachu islands unlabelled, three of which had obvious
+    room - a 22.4 x 17.7 mm island with a 7.5 mm inscribed circle among them.
     """
     yield 0.0
     yield axis

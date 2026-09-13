@@ -146,7 +146,8 @@ class CBU_PT_folds(_Base, bpy.types.Panel):
 class CBU_PT_labels(_Base, bpy.types.Panel):
     bl_label = "Annotation"
     bl_parent_id = "CBU_PT_main"
-    bl_options = {"DEFAULT_CLOSED"}
+    # Open. The Model ID box is here, and a collapsed panel is where settings
+    # go to not be found.
 
     def draw(self, context):
         s = context.scene.cbu
@@ -160,6 +161,7 @@ class CBU_PT_labels(_Base, bpy.types.Panel):
                       icon="INFO")
         lay.prop(s, "label_height")
         lay.prop(s, "label_min_height")
+        lay.prop(s, "label_edge_frac", slider=True)
         lay.prop(s, "label_folds")
 
 
