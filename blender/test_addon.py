@@ -450,6 +450,44 @@ check(all(abs(d[0] - 40.0) < 1e-3 and abs(d[1] - 25.0) < 1e-3 for d in _moved),
       f"and it moved by exactly the drag (got {_moved[0] if _moved else None})")
 check(bool(_still), "the islands that were not dragged stayed put")
 
+# ------------------------------------------------ annotation in the 2D view
+# The engraving is generated in the core and lives only in the exported parts,
+# exactly like the glue tabs - so without publishing it the first place a seam
+# number appears is the SVG, and the 2D view silently shows an unannotated net.
+_groups = overlay._net_cuts.get(obj.name) or []
+check(any(g.get("labels") for g in _groups),
+      "unfold publishes the engraving to the 2D view, not just the outline")
+_nlab = sum(len(g.get("labels") or ()) for g in _groups)
+check(_nlab > 0, f"{_nlab} label stroke(s) stored in island space")
+
+_sc2 = bridge.uv_scale(*props.material_from(bpy.context.scene.cbu, obj).bed)
+_strokes = overlay.live_label_strokes(obj, _sc2)
+check(_strokes is not None and len(_strokes) == _nlab,
+      "they resolve against the current layout like the outline does")
+
+# Open polylines, NOT rings: closing a letter draws a chord through it.
+_pts = sum(len(x) for x in _strokes)
+_v, _c = overlay.stroke_segments(_strokes, _sc2)
+check(len(_v) // 2 == _pts - len(_strokes),
+      "stroke_segments leaves the polylines open")
+check(_v and all(len(q) == 3 for q in _v), "label vertices are vec3")
+
+# Each layer on its own switch. Returning early on show_bed used to hide the
+# cut outline and the engraving with it, which is not what the box says.
+_names = overlay._draw_bed.__code__.co_names
+for _n in ("show_bed", "show_cut", "show_net_labels"):
+    check(_n in _names, f"the 2D draw honours {_n}")
+check("_label_batch" in _names and "_cut_batch" in _names,
+      "and draws both layers from their caches")
+_lb = overlay._label_batch.__code__.co_names
+check("_live_labels" in _lb and "_live_uv" not in _lb,
+      "the label batch reads the cache rather than sampling live UVs")
+
+_cbu2 = bpy.context.scene.cbu
+check(_cbu2.show_net_labels is True, "annotation is shown by default")
+check(overlay.LABEL_RGBA != overlay.CUT_RGBA,
+      "engraving is drawn in its own colour, not the cut's")
+
 # ------------------------------------------------ the model identifier
 # Pieces from two models cut on the same afternoon are indistinguishable
 # without this: both are grey polygons whose seam numbers each start at 1.

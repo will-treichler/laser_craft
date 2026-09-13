@@ -117,10 +117,21 @@ def publish_cuts(obj, parts, mat, pm=None, islands=None):
                 pts = np.asarray(ring.coords)[:-1]
                 if len(pts) > 2:
                     rings.append(pts @ inv[:2, :2].T + inv[:2, 2])
+        # The engraving rides along. It is generated in the core and lives only
+        # in the exported parts, exactly like the tabs - so without this the 2D
+        # view shows no seam numbers, no M/V and no model id, and the first
+        # place they appear is the SVG.
+        labels = []
+        eng = part.engrave
+        if eng is not None and not eng.is_empty:
+            for ln in getattr(eng, "geoms", [eng]):
+                pts = np.asarray(ln.coords)
+                if len(pts) >= 2:
+                    labels.append(pts @ inv[:2, :2].T + inv[:2, 2])
         if rings:
             groups.append({"refs": [int(loop_idx[0]), int(loop_idx[j])],
                            "ref_pts": (src_pts[0], src_pts[j]),
-                           "rings": rings})
+                           "rings": rings, "labels": labels})
     overlay.set_net_cuts(obj.name, groups)
     # Resolve them straight away. The cache is what the draw handler reads, and
     # it is only otherwise filled on a depsgraph update - so without this the

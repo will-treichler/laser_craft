@@ -414,10 +414,13 @@ def test_a_label_never_leaves_its_island():
     pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
     pm = pm.scale_to_height(220.0)
     islands, _ = unfold(pm, trials=40)
+    sl = seam_labels(islands, mat)
+    pl = part_labels(islands, mat)
     for isl in islands:
         o = isl.outline().buffer(1e-6)
-        labs = (part_labels(islands, mat)[isl.id]
-                + fold_labels(isl, plan_folds(isl, mat), mat))
+        labs = sl[isl.id] + pl[isl.id] + fold_labels(isl, plan_folds(isl, mat),
+                                                     mat)
+        assert labs, f"island {isl.id} carries no annotation at all"
         for lab in labs:
             for st in lab.strokes:
                 assert o.contains(LineString(st) if len(st) > 1

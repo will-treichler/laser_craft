@@ -22,6 +22,7 @@ _batches = {}          # object name -> dict of batches
 _net_bounds = {}       # object name -> (x0, y0, x1, y1) of the net, in mm
 _net_cuts = {}         # object name -> per-island outlines, island space
 _live_rings = {}       # object name -> resolved rings, sampled off the draw
+_live_labels = {}      # object name -> resolved engraving, same treatment
 _fingerprints = {}     # object name -> geometry fingerprint at unfold time
 _bed_cache = {}        # draw key -> batch, so the grid is not rebuilt per frame
 _TRI = None
@@ -250,6 +251,7 @@ def set_net_cuts(name: str, groups) -> None:
     else:
         _net_cuts.pop(name, None)
     _live_rings.pop(name, None)
+    _live_labels.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
 
@@ -302,12 +304,14 @@ def refresh_live_cuts(*_args):
             obj = bpy.data.objects.get(name)
             if obj is None or obj.type != "MESH":
                 _live_rings.pop(name, None)
+                _live_labels.pop(name, None)
                 continue
             rings = live_cut_rings(obj, sc)
             if rings is None:
                 continue                  # Edit Mode: keep what we last had
             before = _live_rings.get(name)
             _live_rings[name] = rings
+            _live_labels[name] = live_label_strokes(obj, sc) or []
             if before is None or len(before) != len(rings) or any(
                     not np.array_equal(a, b) for a, b in zip(before, rings)):
                 _tag_redraw()
@@ -315,12 +319,13 @@ def refresh_live_cuts(*_args):
         pass                    # a cosmetic overlay must never break the session
 
 
-def live_cut_rings(obj, scale: float):
-    """Cut outlines where the islands are *now*, in UV units.
+def _resolve(obj, scale: float, key: str):
+    """Island-space polylines placed where the islands are *now*, in UV units.
 
     Two reference points per island are enough to recover the rigid motion,
     and cheap enough to redo on every redraw - a full fit over every loop
-    would not be.
+    would not be. The cut outline and the engraving travel together and move
+    together, so they share this.
     """
     groups = _net_cuts.get(obj.name)
     if not groups:
@@ -344,9 +349,20 @@ def live_cut_rings(obj, scale: float):
         c = float(u @ v) / (lu * lv)
         s = float(u[0] * v[1] - u[1] * v[0]) / (lu * lv)
         R = np.array([[c, -s], [s, c]])
-        for ring in g["rings"]:
-            out.append((ring - p0) @ R.T + q0)
+        for poly in g.get(key) or ():
+            out.append((poly - p0) @ R.T + q0)
     return out
+
+
+def live_cut_rings(obj, scale: float):
+    """Closed cut outlines where the islands are now."""
+    return _resolve(obj, scale, "rings")
+
+
+def live_label_strokes(obj, scale: float):
+    """Engraved strokes where the islands are now. Open polylines, not rings -
+    closing them would draw a chord across every letter."""
+    return _resolve(obj, scale, "labels")
 
 
 def set_net_bounds(name: str, bounds) -> None:
@@ -365,12 +381,14 @@ def clear(name: str | None = None) -> None:
         _net_bounds.clear()
         _net_cuts.clear()
         _live_rings.clear()
+        _live_labels.clear()
         _fingerprints.clear()
     else:
         _batches.pop(name, None)
         _net_bounds.pop(name, None)
         _net_cuts.pop(name, None)
         _live_rings.pop(name, None)
+        _live_labels.pop(name, None)
         _fingerprints.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
@@ -427,6 +445,7 @@ def _draw():
 
 SHEET_RGBA = (0.95, 0.62, 0.15, 0.85)      # sheet outline
 CUT_RGBA = (0.20, 0.85, 0.45, 0.95)        # what the laser actually follows
+LABEL_RGBA = (0.55, 0.78, 1.00, 0.95)      # engraved seam / fold / part marks
 USABLE_RGBA = (0.95, 0.62, 0.15, 0.32)     # usable area inside the margins
 MAX_TILES = 400                            # a runaway net must not stall drawing
 
@@ -502,6 +521,44 @@ def cut_segments(rings, scale: float):
     return verts, cols
 
 
+def stroke_segments(strokes, scale: float):
+    """Open polylines as line segments, in UV units. (verts, colours).
+
+    Deliberately not cut_segments: that wraps the last point back to the first,
+    which on a letter draws a chord straight through it.
+    """
+    verts, cols = [], []
+    for st in strokes:
+        for i in range(len(st) - 1):
+            a, b = st[i] * scale, st[i + 1] * scale
+            verts.append((float(a[0]), float(a[1]), 0.0))
+            verts.append((float(b[0]), float(b[1]), 0.0))
+            cols.append(LABEL_RGBA)
+            cols.append(LABEL_RGBA)
+    return verts, cols
+
+
+def _label_batch(obj, scale: float):
+    """Same contract as _cut_batch: read the cache, never sample live UVs."""
+    strokes = _live_labels.get(obj.name)
+    line_s = _shaders()[1]
+    if not strokes or line_s is None:
+        return None
+    key = ("labels", obj.name, scale,
+           float(np.round(np.concatenate(
+               [st.ravel() for st in strokes]).sum(), 4)))
+    hit = _bed_cache.get(key)
+    if hit is None:
+        verts, cols = stroke_segments(strokes, scale)
+        hit = (batch_for_shader(line_s, "LINES", {"pos": verts, "color": cols})
+               if verts else None)
+        for k in [k for k in _bed_cache if isinstance(k, tuple)
+                  and k and k[0] == "labels"]:
+            del _bed_cache[k]
+        _bed_cache[key] = hit
+    return hit
+
+
 def _cut_batch(obj, scale: float):
     """Rebuilt whenever the islands have actually moved, not every frame.
 
@@ -541,7 +598,10 @@ def _bed_batch(bounds, bed_w, bed_h, margin):
 def _draw_bed():
     ctx = bpy.context
     s = getattr(ctx.scene, "cbu", None)
-    if s is None or not s.show_bed:
+    # Each layer on its own switch. Returning early on show_bed meant turning
+    # the bed off also hid the cut outline and the engraving, which is not what
+    # the checkbox says.
+    if s is None or not (s.show_bed or s.show_cut or s.show_net_labels):
         return
     space = getattr(ctx, "space_data", None)
     if space is None or space.type != "IMAGE_EDITOR" or space.mode != "UV":
@@ -561,15 +621,20 @@ def _draw_bed():
     # in scaled UV units, so the sheet has to be scaled to match.
     from . import bridge
     sc = bridge.uv_scale(s.bed_x, s.bed_y)
-    grid = bed_grid(bounds, s.bed_x * sc, s.bed_y * sc)
-    key = (obj.name, grid, s.bed_x, s.bed_y, s.margin, sc)
-    if key not in _bed_cache:
-        _bed_cache.clear()
-        _bed_cache[key] = _bed_batch(grid, s.bed_x * sc, s.bed_y * sc,
-                                     s.margin * sc)
-    batch = _bed_cache[key]
-    if batch is None:
-        return
+    batch = None
+    if s.show_bed:
+        grid = bed_grid(bounds, s.bed_x * sc, s.bed_y * sc)
+        key = (obj.name, grid, s.bed_x, s.bed_y, s.margin, sc)
+        if key not in _bed_cache:
+            # Keep the cut and label batches: they are keyed by their own
+            # tag and rebuilding them on every bed change is wasted work.
+            for k in [k for k in _bed_cache
+                      if not (isinstance(k, tuple) and k
+                              and k[0] in ("cuts", "labels"))]:
+                del _bed_cache[k]
+            _bed_cache[key] = _bed_batch(grid, s.bed_x * sc, s.bed_y * sc,
+                                         s.margin * sc)
+        batch = _bed_cache[key]
 
     line_s = _shaders()[1]
     if line_s is None:
@@ -582,12 +647,17 @@ def _draw_bed():
             line_s.uniform_float("lineWidth", 1.5)
         except Exception:                               # noqa: BLE001
             pass                                        # plain FLAT_COLOR fallback
-        batch.draw(line_s)
+        if batch is not None:
+            batch.draw(line_s)
 
         if s.show_cut:
             cuts = _cut_batch(obj, sc)
             if cuts is not None:
                 cuts.draw(line_s)
+        if s.show_net_labels:
+            labels = _label_batch(obj, sc)
+            if labels is not None:
+                labels.draw(line_s)
     finally:
         gpu.state.blend_set("NONE")
 
@@ -618,5 +688,6 @@ def unregister():
     _net_bounds.clear()
     _net_cuts.clear()
     _live_rings.clear()
+    _live_labels.clear()
     _fingerprints.clear()
     _bed_cache.clear()

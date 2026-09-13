@@ -212,6 +212,13 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "their glue tabs and kerf. The UV net alone shows only "
                      "the islands, which is about 20% smaller"))
 
+    show_net_labels: BoolProperty(
+        name="Show annotation", default=True,
+        description=("Draw the engraving over the net in the UV editor - seam "
+                     "numbers, the M/V fold marks and the model id. These live "
+                     "only in the exported parts, so without this the first "
+                     "place you see them is the SVG"))
+
     show_overlay: BoolProperty(
         name="Show islands", default=True,
         description=("Draw the island annotation in the 3D viewport. Off "

@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 179 checks, real Blender API
+python blender/test_addon.py            # 191 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -725,6 +725,32 @@ Three engravings, and the net is not assemblable without the first:
   wins, then the object's name, then the .blend's (`props.model_id_for`); the
   CLI takes `--id` and falls back to the mesh file's name.
 
+**A label must be tested where it will actually be burned.** Engraving outside
+the part is not cosmetic: the laser either cuts it off the sheet or burns it
+into the neighbouring piece. Three traps, all found by measuring a real net
+rather than by the suite:
+
+- **Seam numbers had no containment test at all.** An edge long enough to hold
+  the number says nothing about the material *behind* it - a narrow spur, or a
+  neighbouring cut running back at an angle, leaves none. 109 of 346 seam
+  numbers on a pikachu net hung outside their own island.
+- **Testing an upright box and drawing rotated text is not a test.** 9 of 209
+  fold marks passed it and still hung over the edge. `_card` rotates the
+  rectangle the way the text will be drawn.
+- **The card is sufficient but not necessary.** It is the glyph *cell's*
+  bounding box and letters do not fill their cells, so card-only cost 27
+  points of seam coverage (78% -> 51%) by refusing labels whose glyphs had
+  room. `_place` tries the card first and falls back to the strokes
+  themselves, which are exactly what gets burned.
+
+**Slide a seam number along its edge before giving up.** The midpoint is the
+obvious place and often the worst one, for the same reason as above. Trying
+0.5, 0.35, 0.65, 0.25, 0.75 along the edge against four inward offsets took
+seam coverage from 54% to 62% of edges - and, the number that actually
+matters, **72% of seam ids carry their number on BOTH halves**. Honest
+coverage on that net: 62% of seam edges, 84% of folds, 75% of islands, zero
+strays. The 78% figure this replaced was inflated by the 109 strays.
+
 **The height rule is cap, floor, or omit.** `label_height` 4 mm,
 `label_min_height` 2 mm. Width is linear in height, so for an edge label the
 fitting height is one division - there is nothing to search (`fit_height`). A
@@ -752,6 +778,20 @@ degrees took it from 58% to 75%. The rest are genuinely 5-19 mm slivers.
 
 Label *length* is the real lever on coverage, which is why the tooltip says to
 keep `model_id` short - "PIKA-0" needs 9.6 x 2.0 mm of clear room at the floor.
+
+**The engraving has to be published to the 2D view, like the cut outline.**
+It is generated in the core and lives solely in the exported parts - so
+without `publish_cuts` carrying it, the first place a seam number appears is
+the SVG and the UV editor silently shows an unannotated net. It rides in the
+same per-island group as the cut rings, in island space, and `_resolve`
+recovers the rigid motion once for both. Draw it with `stroke_segments`, not
+`cut_segments`: these are OPEN polylines, and wrapping the last point back to
+the first draws a chord straight through every letter. Toggled by
+`show_net_labels` in the UV panel beside `show_bed` and `show_cut`.
+
+Each of those three is its own switch. `_draw_bed` used to return early when
+`show_bed` was off, which hid the cut outline and the engraving with it - not
+what the checkbox says.
 
 **Never reject an engraved stroke for closing on itself.** `_mls` dropped any
 stroke whose first point equalled its last, meaning to reject zero-length
