@@ -171,6 +171,10 @@ class CBU_OT_mark(bpy.types.Operator):
         if n == 0:
             self.report({"WARNING"}, "no edges selected")
             return {"CANCELLED"}
+        # The marks are the overlay's whole point while seams are being
+        # edited, and marking is deliberately NOT a geometry change - so
+        # nothing else would refresh them until the next unfold.
+        overlay.refresh_marks()
         self.report({"INFO"}, f"{n} edge(s) -> {self.mode.lower()}")
         return {"FINISHED"}
 

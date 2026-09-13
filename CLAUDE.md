@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 209 checks, real Blender API
+python blender/test_addon.py            # 225 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -285,6 +285,29 @@ the main panel. Regression: `and honours overlay_fill separately`, which reads
 `_draw.__code__.co_names` - a `getattr(s, "overlay_fill", True)` puts the name
 in `co_consts` instead and the check will not see it, so read the attribute
 directly.
+
+**Lifting the tint put it in front of the forced marks.** The island colour
+is raised off the mesh by `LIFT` to stop it z-fighting the faces - and the
+cut/fold marks are drawn on the mesh's own edges, so the colour then swallowed
+them. They are the one thing you are actually looking at while editing seams,
+so they go `MARK_LIFT` (3x) further out along the vertex normals. Further out,
+not depth-test-off: disabling the test would show marks on the far side of the
+model straight through it.
+
+**Marks need their own refresh, precisely because marking is not an edit.**
+`geometry_changed` correctly reports that writing an edge attribute did not
+modify the object - which is what stops the island colours vanishing while you
+mark against them - and that also meant the marks themselves never caught up
+until the next unfold. `overlay.refresh_marks` is the cheap half of a rebuild:
+one pass over the edges, no unfold, no island data. `cbu.mark` calls it, and
+so does `_on_depsgraph`.
+
+**The marks belong in the 2D view too**, drawn *last* so nothing can cover
+them (`show_net_marks`). Unlike the cut outline these ride on the mesh's own
+edges, so they need no island-space round trip - the net UV layer already says
+where each one is, and `live_mark_segments` reads it in Object Mode under the
+same rule as everything else. Both halves of a cut seam are emitted, because
+both are marked and both are what the builder has to match up.
 
 **GPU batches need vec3 positions even for 2D draws.** The builtin
 `FLAT_COLOR` / `POLYLINE_FLAT_COLOR` shaders declare `pos` as vec3. Handing

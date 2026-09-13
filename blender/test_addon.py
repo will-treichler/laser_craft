@@ -457,6 +457,73 @@ check(all(abs(d[0] - 40.0) < 1e-3 and abs(d[1] - 25.0) < 1e-3 for d in _moved),
       f"and it moved by exactly the drag (got {_moved[0] if _moved else None})")
 check(bool(_still), "the islands that were not dragged stayed put")
 
+# ------------------------------------------------ forced marks draw on top
+# The tint is lifted off the mesh to stop it z-fighting the faces, which put it
+# in FRONT of marks drawn on the mesh itself - so the colour swallowed the one
+# thing you are looking at while editing seams.
+check(overlay.MARK_LIFT > 1.0,
+      f"marks are lifted further than the tint (x{overlay.MARK_LIFT})")
+check(overlay.CUT_MARK_RGBA != overlay.FOLD_MARK_RGBA,
+      "a forced cut and a forced fold are different colours")
+
+_eps = overlay.lift_amount(obj)
+bpy.ops.object.mode_set(mode="EDIT")
+_bm2 = bmesh.from_edit_mesh(obj.data)
+_bm2.edges.ensure_lookup_table()
+_lay2 = bridge.edge_layer(_bm2)
+_bm2.edges[0][_lay2] = bridge.FORCE_CUT
+_bm2.edges[1][_lay2] = bridge.FORCE_FOLD
+bmesh.update_edit_mesh(obj.data)
+bpy.ops.object.mode_set(mode="OBJECT")
+
+_mp, _mc = overlay.mark_lines(obj, _eps)
+check(len(_mp) == 4, f"two marked edges give four vertices ({len(_mp)})")
+check({tuple(c) for c in _mc} == {overlay.CUT_MARK_RGBA,
+                                  overlay.FOLD_MARK_RGBA},
+      "each mark carries its own colour")
+_co = np.asarray([v.co[:] for v in obj.data.vertices])
+_off = [float(np.linalg.norm(_co - np.asarray(q), axis=1).min()) for q in _mp]
+check(min(_off) > _eps * 1.5,
+      f"marks stand clear of the tint ({min(_off):.6f} vs tint {_eps:.6f})")
+check(abs(min(_off) - _eps * overlay.MARK_LIFT) < 1e-9,
+      "lifted by exactly MARK_LIFT along the vertex normal")
+
+# ------------------------------------------------ and in the 2D view
+_sc4 = bridge.uv_scale(*props.material_from(bpy.context.scene.cbu, obj).bed)
+_segs = overlay.live_mark_segments(obj, _sc4)
+check(_segs is not None and len(_segs) >= 2,
+      f"forced marks reach the net too ({0 if _segs is None else len(_segs)})")
+check({v for _a, _b, v in _segs} <= {1, 2}, "carrying which kind they are")
+_net4 = bridge.read_net(obj.data, _sc4)
+_all4 = np.vstack([np.vstack([a, b]) for a, b, _v in _segs])
+check(_all4[:, 0].min() >= _net4[:, 0].min() - 1e-6
+      and _all4[:, 0].max() <= _net4[:, 0].max() + 1e-6
+      and _all4[:, 1].min() >= _net4[:, 1].min() - 1e-6
+      and _all4[:, 1].max() <= _net4[:, 1].max() + 1e-6,
+      "every mark lies on the net, not beside it")
+
+_mb = overlay._marks_batch.__code__.co_names
+check("_live_marks" in _mb and "_live_uv" not in _mb,
+      "the mark batch reads the cache rather than sampling live UVs")
+_dn2 = overlay._draw_bed.__code__.co_names
+check("show_net_marks" in _dn2, "the 2D draw honours show_net_marks")
+check(_dn2.index("_marks_batch") > _dn2.index("_label_batch"),
+      "and draws the marks last, so nothing can cover them")
+check(bpy.context.scene.cbu.show_net_marks is True, "shown by default")
+
+# Marking is deliberately not a geometry change, so nothing else refreshes it.
+check("refresh_marks" in ops.CBU_OT_mark.execute.__code__.co_names,
+      "marking refreshes the marks rather than waiting for the next unfold")
+_rm = overlay.refresh_marks.__code__.co_names
+check("mark_lines" in _rm and "rebuild" not in _rm,
+      "refresh_marks is the cheap half of a rebuild, not a whole one")
+
+bpy.ops.object.mode_set(mode="EDIT")
+check(overlay.live_mark_segments(obj, _sc4) is None,
+      "and it refuses to sample the net in Edit Mode, like everything else")
+bpy.ops.object.mode_set(mode="OBJECT")
+bpy.ops.cbu.clear_marks()
+
 # ------------------------------------------------ the millimetre ruler
 # The UV editor measures in UV units and the factor is the bed rounded UP to a
 # power of two - 512 mm at a 300 mm bed, 1024 at 600. A length read off the

@@ -48,6 +48,7 @@ def _on_depsgraph(scene, depsgraph):
     # touch bmesh: the transform has finished. A timer doing the same thing
     # fired mid-drag and crashed Blender.
     overlay.refresh_live_cuts()
+    overlay.refresh_marks()
 
     tracked = overlay.tracked_names() | set(ops._LAST)
     if not tracked:

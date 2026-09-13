@@ -219,6 +219,13 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "their glue tabs and kerf. The UV net alone shows only "
                      "the islands, which is about 20% smaller"))
 
+    show_net_marks: BoolProperty(
+        name="Marks", default=True,
+        description=("Draw your forced cut and fold marks over the net, the "
+                     "same red and blue as the 3D view. They are what you are "
+                     "looking at while editing seams, so they draw last - "
+                     "nothing else can cover them"))
+
     show_bed_ruler: BoolProperty(
         name="Ruler", default=True,
         description=("Draw a labelled millimetre ruler down the bed's bottom "

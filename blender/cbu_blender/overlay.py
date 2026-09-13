@@ -24,6 +24,7 @@ _net_bounds = {}       # object name -> (x0, y0, x1, y1) of the net, in mm
 _net_cuts = {}         # object name -> per-island outlines, island space
 _live_rings = {}       # object name -> resolved rings, sampled off the draw
 _live_labels = {}      # object name -> resolved engraving, same treatment
+_live_marks = {}       # object name -> forced marks in net UV space
 _fingerprints = {}     # object name -> geometry fingerprint at unfold time
 _bed_cache = {}        # draw key -> batch, so the grid is not rebuilt per frame
 _TRI = None
@@ -67,6 +68,7 @@ def island_color(i: int, alpha: float = 0.55):
 # triangles are lifted off their own plane at build time instead. A fraction of
 # the object's local bounding box, so it works whatever the model is scaled to.
 LIFT = 0.0015
+MARK_LIFT = 3.0         # x LIFT: the marks sit above the tint, not under it
 
 
 def face_normal(co):
@@ -170,29 +172,77 @@ def rebuild(obj, pm, islands, alpha: float = 0.55) -> None:
                 # the colour is resolved in _tris - see set_alpha.
                 ids.append(i)
 
-    # forced marks, straight off the mesh attribute
-    attr = obj.data.attributes.get("cbu_constraint")
-    if attr is not None:
-        vals = np.zeros(len(obj.data.edges), dtype=np.int32)
-        attr.data.foreach_get("value", vals)
-        for i, v in enumerate(vals):
-            if v == 0:
-                continue
-            a, b = obj.data.edges[i].vertices
-            c = (0.85, 0.18, 0.10, 1.0) if v == 1 else (0.12, 0.45, 0.95, 1.0)
-            cut_pts += [obj.data.vertices[a].co[:], obj.data.vertices[b].co[:]]
-            cut_cols += [c, c]
+    cut_pts, cut_cols = mark_lines(obj, eps)
 
     _batches[obj.name] = {
         "pos": verts,
         "ids": ids,
         "alpha": alpha,
         "tris": _tris(verts, ids, alpha),
-        "lines": batch_for_shader(line_s, "LINES",
-                                  {"pos": cut_pts, "color": cut_cols})
-        if cut_pts else None,
+        "lines": _lines_batch(cut_pts, cut_cols),
     }
     _tag_redraw()
+
+
+def _lines_batch(pts, cols):
+    line_s = _shaders()[1]
+    if line_s is None or not pts:
+        return None
+    return batch_for_shader(line_s, "LINES", {"pos": pts, "color": cols})
+
+
+def mark_lines(obj, eps: float):
+    """Forced cut / fold marks in object space, lifted clear of the tint.
+
+    The tint is already lifted off the mesh by `eps` to stop it z-fighting the
+    faces - which put it in FRONT of marks drawn on the mesh itself, so the
+    colour swallowed them. They are the one thing on this overlay you are
+    looking at while you work, so they go above everything: MARK_LIFT times
+    further out, along the vertex normals, which is enough to win the depth
+    test without turning it off. Drawing them with depth testing disabled
+    would show marks on the far side of the model through it.
+    """
+    attr = obj.data.attributes.get("cbu_constraint")
+    if attr is None:
+        return [], []
+    me = obj.data
+    vals = np.zeros(len(me.edges), dtype=np.int32)
+    attr.data.foreach_get("value", vals)
+    hit = np.nonzero(vals)[0]
+    if not len(hit):
+        return [], []
+    lift_by = eps * MARK_LIFT
+    pts, cols = [], []
+    for i in hit:
+        a, b = me.edges[int(i)].vertices
+        c = CUT_MARK_RGBA if vals[i] == 1 else FOLD_MARK_RGBA
+        for v in (a, b):
+            co = np.asarray(me.vertices[v].co[:], dtype=float)
+            n = np.asarray(me.vertices[v].normal[:], dtype=float)
+            pts.append(tuple(co + n * lift_by))
+            cols.append(c)
+    return pts, cols
+
+
+def refresh_marks(*_args):
+    """Rebuild just the mark lines from the mesh attribute.
+
+    Marking writes an edge attribute and nothing else, so `geometry_changed`
+    correctly says the object was not modified and the cached annotation is
+    kept - which also meant the marks themselves never caught up until the
+    next unfold. This is the cheap half of a rebuild: no unfold, no island
+    data, one pass over the edges.
+    """
+    try:
+        for name, b in list(_batches.items()):
+            obj = bpy.data.objects.get(name)
+            if obj is None or obj.type != "MESH" or obj.mode == "EDIT":
+                continue
+            pts, cols = mark_lines(obj, lift_amount(obj))
+            b["lines"] = _lines_batch(pts, cols)
+        _tag_redraw()
+    except Exception:                                   # noqa: BLE001
+        pass                    # a cosmetic overlay must never break a session
 
 
 def island_colors(ids, alpha: float):
@@ -253,6 +303,7 @@ def set_net_cuts(name: str, groups) -> None:
         _net_cuts.pop(name, None)
     _live_rings.pop(name, None)
     _live_labels.pop(name, None)
+    _live_marks.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
 
@@ -306,6 +357,7 @@ def refresh_live_cuts(*_args):
             if obj is None or obj.type != "MESH":
                 _live_rings.pop(name, None)
                 _live_labels.pop(name, None)
+                _live_marks.pop(name, None)
                 continue
             rings = live_cut_rings(obj, sc)
             if rings is None:
@@ -313,6 +365,9 @@ def refresh_live_cuts(*_args):
             before = _live_rings.get(name)
             _live_rings[name] = rings
             _live_labels[name] = live_label_strokes(obj, sc) or []
+            marks = live_mark_segments(obj, sc)
+            if marks is not None:
+                _live_marks[name] = marks
             if before is None or len(before) != len(rings) or any(
                     not np.array_equal(a, b) for a, b in zip(before, rings)):
                 _tag_redraw()
@@ -360,6 +415,47 @@ def live_cut_rings(obj, scale: float):
     return _resolve(obj, scale, "rings")
 
 
+def live_mark_segments(obj, scale: float):
+    """Forced marks on the net, in UV units. Object Mode only, like _live_uv.
+
+    These ride on the mesh's own edges rather than on core geometry, so unlike
+    the cut outline they need no island-space round trip - the net UV layer
+    already says where each one is. Both halves of a cut seam are emitted,
+    because both are marked and the builder wants to see both.
+    """
+    if obj.mode == "EDIT":
+        return None
+    me = obj.data
+    uv = me.uv_layers.get(NET_UV)
+    attr = me.attributes.get("cbu_constraint")
+    if uv is None or not len(uv.data) or attr is None:
+        return None
+    vals = np.zeros(len(me.edges), dtype=np.int32)
+    attr.data.foreach_get("value", vals)
+    if not vals.any():
+        return []
+    marked = {}
+    for i in np.nonzero(vals)[0]:
+        a, b = me.edges[int(i)].vertices
+        marked[(min(a, b), max(a, b))] = int(vals[i])
+
+    raw = np.zeros(len(me.loops) * 2)
+    uv.data.foreach_get("uv", raw)
+    flat = raw.reshape(-1, 2) / scale
+    out = []
+    for poly in me.polygons:
+        n = poly.loop_total
+        for k in range(n):
+            l0 = poly.loop_start + k
+            l1 = poly.loop_start + (k + 1) % n
+            va = me.loops[l0].vertex_index
+            vb = me.loops[l1].vertex_index
+            v = marked.get((min(va, vb), max(va, vb)))
+            if v:
+                out.append((flat[l0], flat[l1], v))
+    return out
+
+
 def live_label_strokes(obj, scale: float):
     """Engraved strokes where the islands are now. Open polylines, not rings -
     closing them would draw a chord across every letter."""
@@ -383,6 +479,7 @@ def clear(name: str | None = None) -> None:
         _net_cuts.clear()
         _live_rings.clear()
         _live_labels.clear()
+        _live_marks.clear()
         _fingerprints.clear()
     else:
         _batches.pop(name, None)
@@ -390,6 +487,7 @@ def clear(name: str | None = None) -> None:
         _net_cuts.pop(name, None)
         _live_rings.pop(name, None)
         _live_labels.pop(name, None)
+        _live_marks.pop(name, None)
         _fingerprints.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
@@ -448,6 +546,8 @@ SHEET_RGBA = (0.95, 0.62, 0.15, 0.85)      # sheet outline
 CUT_RGBA = (0.20, 0.85, 0.45, 0.95)        # what the laser actually follows
 LABEL_RGBA = (0.55, 0.78, 1.00, 0.95)      # engraved seam / fold / part marks
 AXIS_RGBA = (0.95, 0.62, 0.15, 0.70)       # the mm ruler down the bed edges
+CUT_MARK_RGBA = (0.85, 0.18, 0.10, 1.0)    # forced cut
+FOLD_MARK_RGBA = (0.12, 0.45, 0.95, 1.0)   # forced fold
 MAX_TICKS = 400                            # a runaway must not stall drawing
 USABLE_RGBA = (0.95, 0.62, 0.15, 0.32)     # usable area inside the margins
 MAX_TILES = 400                            # a runaway net must not stall drawing
@@ -539,6 +639,33 @@ def stroke_segments(strokes, scale: float):
             cols.append(LABEL_RGBA)
             cols.append(LABEL_RGBA)
     return verts, cols
+
+
+def _marks_batch(obj, scale: float):
+    """Same contract as _cut_batch: read the cache, never sample live UVs."""
+    segs = _live_marks.get(obj.name)
+    line_s = _shaders()[1]
+    if not segs or line_s is None:
+        return None
+    key = ("marks", obj.name, scale, len(segs),
+           float(np.round(sum(float(a[0]) + float(b[1])
+                              for a, b, _v in segs), 4)))
+    hit = _bed_cache.get(key)
+    if hit is None:
+        verts, cols = [], []
+        for a, b, v in segs:
+            c = CUT_MARK_RGBA if v == 1 else FOLD_MARK_RGBA
+            verts.append((float(a[0] * scale), float(a[1] * scale), 0.0))
+            verts.append((float(b[0] * scale), float(b[1] * scale), 0.0))
+            cols.append(c)
+            cols.append(c)
+        hit = (batch_for_shader(line_s, "LINES", {"pos": verts, "color": cols})
+               if verts else None)
+        for k in [k for k in _bed_cache if isinstance(k, tuple)
+                  and k and k[0] == "marks"]:
+            del _bed_cache[k]
+        _bed_cache[key] = hit
+    return hit
 
 
 def _label_batch(obj, scale: float):
@@ -688,7 +815,8 @@ def _draw_bed():
     # Each layer on its own switch. Returning early on show_bed meant turning
     # the bed off also hid the cut outline and the engraving, which is not what
     # the checkbox says.
-    if s is None or not (s.show_bed or s.show_cut or s.show_net_labels):
+    if s is None or not (s.show_bed or s.show_cut or s.show_net_labels
+                         or s.show_net_marks):
         return
     space = getattr(ctx, "space_data", None)
     if space is None or space.type != "IMAGE_EDITOR" or space.mode != "UV":
@@ -747,6 +875,12 @@ def _draw_bed():
             labels = _label_batch(obj, sc)
             if labels is not None:
                 labels.draw(line_s)
+        # Last, so a forced mark is never hidden by anything else - it is what
+        # you are looking at while you edit seams.
+        if s.show_net_marks:
+            marks = _marks_batch(obj, sc)
+            if marks is not None:
+                marks.draw(line_s)
     finally:
         gpu.state.blend_set("NONE")
 
@@ -778,5 +912,6 @@ def unregister():
     _net_cuts.clear()
     _live_rings.clear()
     _live_labels.clear()
+    _live_marks.clear()
     _fingerprints.clear()
     _bed_cache.clear()
