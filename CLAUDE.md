@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 225 checks, real Blender API
+python blender/test_addon.py            # 230 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -285,6 +285,18 @@ the main panel. Regression: `and honours overlay_fill separately`, which reads
 `_draw.__code__.co_names` - a `getattr(s, "overlay_fill", True)` puts the name
 in `co_consts` instead and the check will not see it, so read the attribute
 directly.
+
+**The swatch on the Cut / Fold buttons is the colour key.** `COLOR_RED` and
+`COLOR_BLUE` are Blender's own swatch icons, so the button carries its own
+legend and nothing has to be remembered - and `ui.mark_key` repeats it in both
+panels, including outside Edit Mode where the buttons themselves are not drawn.
+If the mark colours ever change, change them here too; the test only asserts
+that the cut colour is redder than it is blue and the fold colour the reverse.
+
+**A typo'd icon name only fails inside `draw()`**, which needs a real UI
+region - so no headless suite ever reaches it and the panel is simply broken
+for the user. `every icon in ui.py exists` checks all 26 against
+`UILayout.bl_rna`, which needs no drawing at all.
 
 **Lifting the tint put it in front of the forced marks.** The island colour
 is raised off the mesh by `LIFT` to stop it z-fighting the faces - and the

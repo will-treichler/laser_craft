@@ -72,6 +72,18 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         sub.prop(s, "overlay_alpha", text="", slider=True)
 
 
+def mark_key(lay):
+    """The colour key for forced marks, drawn wherever they can be confused.
+
+    Shown in both modes on purpose - the buttons that carry the swatches only
+    appear in Edit Mode, and the marks themselves are visible from everywhere.
+    """
+    row = lay.row(align=True)
+    row.label(text="Cut", icon="COLOR_RED")
+    row.label(text="Fold", icon="COLOR_BLUE")
+    row.label(text="Auto", icon="RADIOBUT_OFF")
+
+
 class CBU_PT_seams(_Base, bpy.types.Panel):
     bl_label = "Seams"
     bl_parent_id = "CBU_PT_main"
@@ -82,11 +94,18 @@ class CBU_PT_seams(_Base, bpy.types.Panel):
             lay.label(text="Enter Edit Mode to mark seams", icon="INFO")
             lay.label(text="Alt-click selects an edge loop")
         else:
+            # The swatch IS the key: these are the colours the mark is drawn
+            # in, in the viewport and over the net. COLOR_RED / COLOR_BLUE are
+            # Blender's own swatch icons, so the button carries its own legend
+            # and there is nothing to remember.
             row = lay.row(align=True)
-            row.operator("cbu.mark", text="Cut", icon="UNLINKED").mode = "CUT"
-            row.operator("cbu.mark", text="Fold", icon="LINKED").mode = "FOLD"
-            row.operator("cbu.mark", text="Auto").mode = "AUTO"
+            row.operator("cbu.mark", text="Cut", icon="COLOR_RED").mode = "CUT"
+            row.operator("cbu.mark", text="Fold",
+                         icon="COLOR_BLUE").mode = "FOLD"
+            row.operator("cbu.mark", text="Auto",
+                         icon="RADIOBUT_OFF").mode = "AUTO"
             lay.operator("cbu.select_marked", icon="RESTRICT_SELECT_OFF")
+        mark_key(lay)
         lay.operator("cbu.clear_marks", icon="X")
 
 
@@ -282,6 +301,8 @@ class CBU_PT_uv(bpy.types.Panel):
         row.prop(s, "show_cut")
         row.prop(s, "show_net_labels", text="Annotation")
         row.prop(s, "show_net_marks")
+        if s.show_net_marks:
+            mark_key(lay)
         row = lay.row(align=True)
         sub = row.row(align=True)
         sub.enabled = s.show_bed

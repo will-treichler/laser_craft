@@ -457,6 +457,29 @@ check(all(abs(d[0] - 40.0) < 1e-3 and abs(d[1] - 25.0) < 1e-3 for d in _moved),
       f"and it moved by exactly the drag (got {_moved[0] if _moved else None})")
 check(bool(_still), "the islands that were not dragged stayed put")
 
+# ------------------------------------------------ every icon name is real
+# A typo'd icon raises inside draw(), which only happens with a real UI region
+# - so a headless suite never reaches it and the panel is simply broken for
+# the user. The names are checkable without drawing anything.
+import re as _re
+_valid = set(bpy.types.UILayout.bl_rna.functions["operator"]
+             .parameters["icon"].enum_items.keys())
+_ui_src = (ROOT / "cbu_blender" / "ui.py").read_bytes().decode()
+_used = sorted(set(_re.findall(r'icon="([A-Z0-9_]+)"', _ui_src)))
+_bad = [i for i in _used if i not in _valid]
+check(not _bad, f"every icon in ui.py exists ({len(_used)} used, bad: {_bad})")
+
+# The swatch is the colour key: red is a forced cut, blue a forced fold, and
+# they are the colours the mark is actually drawn in.
+check("COLOR_RED" in _used and "COLOR_BLUE" in _used,
+      "the mark buttons carry colour swatches")
+check(overlay.CUT_MARK_RGBA[0] > overlay.CUT_MARK_RGBA[2],
+      "and the cut colour really is the red one")
+check(overlay.FOLD_MARK_RGBA[2] > overlay.FOLD_MARK_RGBA[0],
+      "and the fold colour really is the blue one")
+check(_ui_src.count("mark_key(") >= 3,
+      "the key is defined once and drawn everywhere marks can be confused")
+
 # ------------------------------------------------ forced marks draw on top
 # The tint is lifted off the mesh to stop it z-fighting the faces, which put it
 # in FRONT of marks drawn on the mesh itself - so the colour swallowed the one
