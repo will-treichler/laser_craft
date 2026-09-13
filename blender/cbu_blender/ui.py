@@ -72,7 +72,7 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         sub.prop(s, "overlay_alpha", text="", slider=True)
 
 
-def mark_key(lay, s):
+def mark_key(lay, s, cells: int = 2):
     """The colour key for forced marks, beside the buttons that make them.
 
     Real swatches, not icons: an icon is tinted by the theme and reads as a
@@ -80,10 +80,18 @@ def mark_key(lay, s):
     values the overlay draws with (`overlay.mark_colors`), so the legend
     cannot drift from the thing it explains - and they can be changed if the
     defaults clash with a model's own colours.
+
+    A thin strip directly under each button, not a labelled colour field: the
+    button already says which is which, so the swatch only has to say what
+    colour that is. `cells` is how many buttons are above it, so the strips
+    line up with the two they belong to.
     """
-    col = lay.column(align=True)
-    col.prop(s, "mark_cut_color")
-    col.prop(s, "mark_fold_color")
+    row = lay.row(align=True)
+    row.scale_y = 0.4              # a strip under the button, not a form field
+    row.prop(s, "mark_cut_color", text="")
+    row.prop(s, "mark_fold_color", text="")
+    for _ in range(cells - 2):     # blanks so the strips stay under their own
+        row.label(text="")         # button when there are more than two
 
 
 class CBU_PT_seams(_Base, bpy.types.Panel):
@@ -108,7 +116,7 @@ class CBU_PT_seams(_Base, bpy.types.Panel):
             row.operator("cbu.mark", text="Auto",
                          icon="RADIOBUT_OFF").mode = "AUTO"
             lay.operator("cbu.select_marked", icon="RESTRICT_SELECT_OFF")
-        mark_key(lay, s)
+        mark_key(lay, s, cells=3)
         lay.operator("cbu.clear_marks", icon="X")
 
 
