@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import bpy
 
-from . import bridge, deps, log as cbulog
+from . import bridge, deps, props, log as cbulog
 
 CAT = "Cardboard"
 
@@ -141,6 +141,26 @@ class CBU_PT_folds(_Base, bpy.types.Panel):
         row = sub.column()
         row.enabled = s.corner_relief
         row.prop(s, "corner_overcut")
+
+
+class CBU_PT_labels(_Base, bpy.types.Panel):
+    bl_label = "Annotation"
+    bl_parent_id = "CBU_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        s = context.scene.cbu
+        lay = self.layout
+        lay.use_property_split = True
+        obj = context.active_object
+        lay.prop(s, "model_id")
+        if not (s.model_id or "").strip():
+            eff = props.model_id_for(s, obj)
+            lay.label(text=f"using: {eff}" if eff else "no id available",
+                      icon="INFO")
+        lay.prop(s, "label_height")
+        lay.prop(s, "label_min_height")
+        lay.prop(s, "label_folds")
 
 
 class CBU_PT_machine(_Base, bpy.types.Panel):
@@ -340,7 +360,8 @@ class CBU_PT_uv(bpy.types.Panel):
 
 
 classes = (CBU_PT_main, CBU_PT_seams, CBU_PT_material, CBU_PT_folds,
-           CBU_PT_machine, CBU_PT_solver, CBU_PT_debug, CBU_PT_uv)
+           CBU_PT_labels, CBU_PT_machine, CBU_PT_solver,
+           CBU_PT_debug, CBU_PT_uv)
 
 
 def register():

@@ -35,7 +35,7 @@ print("blender", bpy.app.version_string)
 
 # ---------------------------------------------------------------- register
 import cbu_blender
-from cbu_blender import bridge, dev, ops, overlay, props
+from cbu_blender import bridge, dev, ops, overlay, props, ui
 
 cbu_blender.register()
 check(hasattr(bpy.types.Scene, "cbu"), "settings registered on Scene")
@@ -449,6 +449,40 @@ check(bool(_moved), "some of the outline moved with the dragged island")
 check(all(abs(d[0] - 40.0) < 1e-3 and abs(d[1] - 25.0) < 1e-3 for d in _moved),
       f"and it moved by exactly the drag (got {_moved[0] if _moved else None})")
 check(bool(_still), "the islands that were not dragged stayed put")
+
+# ------------------------------------------------ the model identifier
+# Pieces from two models cut on the same afternoon are indistinguishable
+# without this: both are grey polygons whose seam numbers each start at 1.
+_s = bpy.context.scene.cbu
+_s.model_id = "ARMOUR"
+check(props.model_id_for(_s, obj) == "ARMOUR", "the panel field wins")
+_s.model_id = "  PAD  "
+check(props.model_id_for(_s, obj) == "PAD", "and is trimmed")
+_s.model_id = "   "
+check(props.model_id_for(_s, obj) == obj.name,
+      f"whitespace is not an id; falls back to the object ({obj.name})")
+_s.model_id = ""
+check(props.model_id_for(_s, obj) == obj.name,
+      "blank falls back to the object name")
+check(props.material_from(_s, obj).model_id == obj.name,
+      "and material_from carries it into the core")
+check(props.material_from(_s).model_id != obj.name or not obj.name,
+      "without an object it does not invent one from the active selection")
+
+# The height rule reaches the core as the user set it.
+_s.label_height, _s.label_min_height = 6.0, 3.0
+_m = props.material_from(_s, obj)
+check(_m.label_height == 6.0 and _m.label_min_height == 3.0,
+      "text height and floor reach the material")
+_s.label_folds = False
+check(props.material_from(_s, obj).label_folds is False,
+      "and the M/V toggle does too")
+_s.label_height, _s.label_min_height, _s.label_folds = 4.0, 2.0, True
+check(_s.label_height == 4.0 and _s.label_min_height == 2.0,
+      "defaults are 4 mm text with a 2 mm floor")
+
+check(any(c.__name__ == "CBU_PT_labels" for c in ui.classes),
+      "the Annotation panel is registered, not just defined")
 
 # ------------------------------------------------ the tint clears the mesh
 # The island tint lies on the same planes as the mesh faces, so drawn

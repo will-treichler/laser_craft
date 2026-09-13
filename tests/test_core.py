@@ -12,7 +12,7 @@ import networkx as nx
 import trimesh
 import pytest
 from shapely.geometry import (Polygon, MultiLineString, box,
-                              Point)
+                              Point, LineString)
 from shapely import set_precision
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,8 +27,11 @@ from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, offset_cut,
                                       fold_intervals, flute_warning,
                                       corner_relief)
-from cardboard_unfolder.tabs import place_tabs
+from cardboard_unfolder.tabs import (place_tabs, seam_labels,
+                                     part_labels, fold_labels,
+                                     fit_height)
 from cardboard_unfolder.layout import (build_parts, pack, narrow_necks,
+                                       _mls,
                                        Part, tighten, find_spot,
                                        find_pocket, free_region,
                                        seat_sheets)
@@ -317,6 +320,189 @@ def test_packing_leaves_no_overlap_and_nothing_off_the_sheet(name, tm):
             assert x0 >= m - 1e-6 and y0 >= m - 1e-6
             assert x1 <= mat.bed[0] - m + 1e-6
             assert y1 <= mat.bed[1] - m + 1e-6
+
+
+import string as _string
+
+
+def test_a_closed_glyph_survives_to_the_engrave_layer():
+    """Regression: every 0, O, D and Q was silently deleted.
+
+    _mls dropped any stroke whose first point equalled its last, meaning to
+    reject zero-length segments - but that is the definition of a CLOSED
+    stroke, which is what those glyphs are. A part stamped PIKA-0 engraved as
+    "PIKA-", and seam 10 engraved as "1". Not a missing annotation but a
+    wrong one, and nothing downstream can tell.
+    """
+    for ch in _string.digits + _string.ascii_uppercase + "-":
+        strokes = strokefont.text_strokes(ch, 5.0)
+        kept = list(_mls(strokes).geoms)
+        assert len(kept) == len(strokes), f"{ch!r} lost a stroke"
+
+    closed = [c for c in _string.digits + _string.ascii_uppercase
+              if any(np.allclose(s[0], s[-1])
+                     for s in strokefont.text_strokes(c, 5.0))]
+    assert closed, "the font has no closed glyph left to protect"
+
+    # ...and a stroke that really does go nowhere is still dropped
+    assert len(list(_mls([np.array([[1.0, 1.0], [1.0, 1.0]])]).geoms)) == 0
+    assert len(list(_mls([np.array([[1.0, 1.0]])]).geoms)) == 0
+
+
+def test_every_label_stroke_reaches_the_part():
+    """The count is the check: labels are built, then filtered on the way in,
+    and a filter that eats glyphs is invisible in any area or bounds test."""
+    mat = Material.from_flute("B")
+    mat.model_id = "D0Q"                        # three closed glyphs
+    pm = PolyMesh.from_trimesh(trimesh.creation.box()).scale_to_height(240.0)
+    islands, _ = unfold(pm, trials=40)
+    parts = build_parts(islands, mat)
+    by_id = {p.island_id: p for p in parts}
+    for isl in islands:
+        want = sum(len(l.strokes) for l in _all_labels([isl], mat))
+        got = len(list(getattr(by_id[isl.id].engrave, "geoms",
+                               [by_id[isl.id].engrave])))
+        if by_id[isl.id].engrave.is_empty:
+            got = 0
+        assert got == want, f"island {isl.id}: {want} strokes built, {got} engraved"
+
+
+def _all_labels(islands, mat):
+    sl, pl = seam_labels(islands, mat), part_labels(islands, mat)
+    out = []
+    for isl in islands:
+        out += sl[isl.id] + pl[isl.id]
+        out += fold_labels(isl, plan_folds(isl, mat), mat)
+    return out
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_every_label_is_between_the_floor_and_the_cap(name, tm):
+    """The whole point of the height rule: never bigger than asked for, never
+    smaller than legible, and left off rather than shrunk past the floor."""
+    mat = Material.from_flute("B")
+    mat.model_id = "TEST"
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=40)
+    labels = _all_labels(islands, mat)
+    assert labels, "a net this size should carry some annotation"
+    for lab in labels:
+        assert lab.height <= mat.label_height + 1e-9, lab.text
+        assert lab.height >= mat.label_min_height - 1e-9, lab.text
+
+
+def test_fit_height_divides_rather_than_searches():
+    mat = Material.from_flute("B")
+    mat.label_height, mat.label_min_height = 4.0, 2.0
+    # roomy: capped at the requested height, not grown to fill
+    assert fit_height("7", 500.0, mat) == pytest.approx(4.0)
+    # tight enough that the cap does not bind: the height whose width exactly
+    # fills the space
+    h = fit_height("12", 4.0, mat)
+    assert h is not None and mat.label_min_height < h < mat.label_height
+    assert strokefont.text_width("12", h) == pytest.approx(4.0, rel=1e-9)
+    # too tight for the floor: omitted, not shrunk
+    assert fit_height("12", 1.0, mat) is None
+    assert fit_height("", 100.0, mat) is None
+
+
+def test_a_label_never_leaves_its_island():
+    """An engraved line outside the part is cut off the sheet and lost, and a
+    seam number in a neighbour's territory is worse than none."""
+    mat = Material.from_flute("B")
+    mat.model_id = "X"
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(220.0)
+    islands, _ = unfold(pm, trials=40)
+    for isl in islands:
+        o = isl.outline().buffer(1e-6)
+        labs = (part_labels(islands, mat)[isl.id]
+                + fold_labels(isl, plan_folds(isl, mat), mat))
+        for lab in labs:
+            for st in lab.strokes:
+                assert o.contains(LineString(st) if len(st) > 1
+                                  else Point(st[0])), \
+                    f"{lab.kind} label {lab.text!r} escaped island {isl.id}"
+
+
+def test_every_fold_is_marked_mountain_or_valley():
+    """Which way a crease bends is not recoverable from a flat sheet."""
+    mat = Material.from_flute("B")
+    pm = PolyMesh.from_trimesh(trimesh.creation.box()).scale_to_height(200.0)
+    islands, _ = unfold(pm, trials=40)
+    for isl in islands:
+        plans = plan_folds(isl, mat)
+        labs = fold_labels(isl, plans, mat)
+        assert len(labs) == len(plans), "a box's folds all have room"
+        assert {l.text for l in labs} <= {"M", "V"}
+        for lab, plan in zip(labs, plans):
+            assert lab.text == ("M" if plan.is_mountain else "V")
+            assert lab.kind == "fold"
+
+    mat.label_folds = False
+    assert fold_labels(islands[0], plan_folds(islands[0], mat), mat) == []
+
+
+def test_the_model_id_is_stamped_on_every_island_that_can_hold_it():
+    mat = Material.from_flute("B")
+    pm = PolyMesh.from_trimesh(trimesh.creation.box()).scale_to_height(200.0)
+    islands, _ = unfold(pm, trials=40)
+
+    plain = part_labels(islands, mat)
+    assert all(l.text.startswith("P") for v in plain.values() for l in v)
+
+    mat.model_id = "ARM"
+    named = part_labels(islands, mat)
+    for isl in islands:
+        assert named[isl.id], "a 200 mm box panel has room for an id"
+        assert named[isl.id][0].text == f"ARM-{isl.id}"
+        assert named[isl.id][0].kind == "part"
+
+    # whitespace is not an id
+    mat.model_id = "   "
+    assert part_labels(islands, mat)[islands[0].id][0].text.startswith("P")
+
+
+def test_a_label_that_cannot_fit_is_omitted_not_shrunk():
+    """The floor is a floor: below it the label is dropped, never shrunk."""
+    mat = Material.from_flute("B")
+    pm = PolyMesh.from_trimesh(trimesh.creation.box()).scale_to_height(60.0)
+    islands, _ = unfold(pm, trials=40)
+
+    # Derive the premise rather than guess it. A first attempt assumed 60
+    # characters could not fit a 60 mm box - but the net of a box is a strip
+    # of four panels, 240 mm long, and it fitted easily. An id whose text at
+    # the floor is longer than any island's bounding-box DIAGONAL cannot fit
+    # at any angle, whatever the net turned out to look like.
+    diag = 0.0
+    for isl in islands:
+        x0, y0, x1, y1 = isl.outline().bounds
+        diag = max(diag, math.hypot(x1 - x0, y1 - y0))
+    per_char = (strokefont.text_width("AA", mat.label_min_height)
+                - strokefont.text_width("A", mat.label_min_height))
+    mat.model_id = "A" * (int(diag / per_char) + 5)
+    assert strokefont.text_width(mat.model_id, mat.label_min_height) > diag
+
+    assert all(v == [] for v in part_labels(islands, mat).values())
+
+
+def test_seam_numbers_match_across_the_pair():
+    """The two halves of a seam must carry the same number or the net cannot
+    be assembled - that is the entire job of this annotation."""
+    mat = Material.from_flute("B")
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(260.0)
+    islands, _ = unfold(pm, trials=40)
+    labelled = {}
+    for isl in islands:
+        for lab in seam_labels(islands, mat)[isl.id]:
+            labelled.setdefault(lab.text, 0)
+            labelled[lab.text] += 1
+    assert labelled, "some seams should be labelled"
+    # every seam id that got labelled at all should appear on both halves
+    both = sum(1 for n in labelled.values() if n == 2)
+    assert both >= len(labelled) * 0.8, \
+        f"only {both} of {len(labelled)} seam numbers appear on both halves"
 
 
 def test_the_cut_sits_on_the_part_edge_by_default():

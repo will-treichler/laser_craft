@@ -171,6 +171,29 @@ class CBUSettings(bpy.types.PropertyGroup):
         description="Cut extra seams, along fold edges, until every island "
                     "fits the laser bed")
 
+    # --- annotation ---
+    model_id: StringProperty(
+        name="Model ID", default="",
+        description=("Engraved on every island next to its number, so pieces "
+                     "from two models cut on the same day can be told apart. "
+                     "Blank falls back to the object's name, then the .blend's. "
+                     "Keep it SHORT - label length is what decides whether a "
+                     "small island can carry one at all"))
+    label_height: FloatProperty(
+        name="Text height", default=4.0, min=0.5, max=30.0,
+        description="Engraved text height in mm, where there is room for it")
+    label_min_height: FloatProperty(
+        name="Minimum height", default=2.0, min=0.5, max=30.0,
+        description=("Never engrave smaller than this. A label that still will "
+                     "not fit is left off - a burnt smudge where a seam number "
+                     "should be is worse than a bare edge, because the builder "
+                     "trusts it"))
+    label_folds: BoolProperty(
+        name="Mark folds M/V", default=True,
+        description=("Engrave M or V beside every fold. Which way a crease goes "
+                     "cannot be read off a flat sheet, and getting one wrong "
+                     "means peeling the shell apart again"))
+
     # --- output ---
     out_dir: StringProperty(name="Output", subtype="DIR_PATH", default="//cbu_out")
     write_dxf: BoolProperty(name="Also write DXF", default=True)
@@ -229,7 +252,24 @@ class CBUSettings(bpy.types.PropertyGroup):
     debug_port: IntProperty(name="Debug port", default=5678, min=1024, max=65535)
 
 
-def material_from(s: CBUSettings):
+def model_id_for(s: CBUSettings, obj=None) -> str:
+    """What to stamp on the pieces.
+
+    The panel field wins; otherwise the object's name, then the .blend's. An
+    unsaved file with a default-named object gives nothing, which is correct -
+    "Cube-3" tells a builder less than the bare part number already does.
+    """
+    tag = (s.model_id or "").strip()
+    if tag:
+        return tag
+    if obj is not None and obj.name and not obj.name.startswith("Mesh"):
+        return obj.name
+    import bpy
+    stem = bpy.path.basename(bpy.data.filepath)
+    return stem.rsplit(".", 1)[0] if stem else ""
+
+
+def material_from(s: CBUSettings, obj=None):
     from .vendor.cardboard_unfolder.material import Material
     m = Material.from_flute(s.flute)
     m.thickness = s.thickness
@@ -249,6 +289,10 @@ def material_from(s: CBUSettings):
     m.bed = (s.bed_x, s.bed_y)
     m.sheet_margin = s.margin
     m.part_gap = s.part_gap
+    m.label_height = s.label_height
+    m.label_min_height = s.label_min_height
+    m.label_folds = s.label_folds
+    m.model_id = model_id_for(s, obj)
     return m
 
 

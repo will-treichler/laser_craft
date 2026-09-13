@@ -22,7 +22,7 @@ from .material import Material
 from .unfold import Island, min_area_rect
 from .folds import (plan_folds, apply_relief, offset_cut,
                     corner_relief)
-from .tabs import place_tabs, seam_labels, part_labels
+from .tabs import place_tabs, seam_labels, part_labels, fold_labels
 
 
 @dataclass
@@ -101,8 +101,24 @@ def narrow_necks(geom, min_width: float) -> int:
 
 
 def _mls(segs) -> MultiLineString:
-    segs = [s for s in segs if np.linalg.norm(np.asarray(s[-1]) - np.asarray(s[0])) > 1e-9]
-    return MultiLineString([LineString(s) for s in segs]) if segs else MultiLineString([])
+    """Engraved polylines, minus the ones with no length.
+
+    Reject a stroke that goes nowhere - NOT one that comes back to where it
+    started. Testing `first != last` deleted every CLOSED glyph the stroke
+    font has: 0, O, D and Q vanished from every label. A part stamped PIKA-0
+    engraved as "PIKA-", and seam 10 engraved as "1" - which is not a missing
+    annotation but a wrong one, and the builder has no way to know. Island 0
+    of a pikachu net built 206 strokes and engraved 194.
+    """
+    out = []
+    for s in segs:
+        a = np.asarray(s, dtype=float)
+        if len(a) < 2:
+            continue
+        if float(np.abs(np.diff(a, axis=0)).max()) <= 1e-9:
+            continue                    # every point on top of the last
+        out.append(LineString(a))
+    return MultiLineString(out) if out else MultiLineString([])
 
 
 def build_parts(islands: list[Island], mat: Material) -> list[Part]:
@@ -133,7 +149,8 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
             perf_m.extend(perf_segments(t.base[0], t.base[1], mat))
 
         strokes = []
-        for lab in slabels.get(isl.id, []) + plabels.get(isl.id, []):
+        for lab in (slabels.get(isl.id, []) + plabels.get(isl.id, [])
+                    + fold_labels(isl, plans, mat)):
             strokes.extend(lab.strokes)
 
         cut = offset_cut(body, mat.edge_offset)

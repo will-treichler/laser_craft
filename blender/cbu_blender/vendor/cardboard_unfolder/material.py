@@ -101,7 +101,14 @@ class Material:
                                     # where +/- a few mm doesn't matter. Turn on if a
                                     # part visibly racks, then creases must cross flutes.
 
-    label_height: float = 5.0       # mm. Below ~3.5mm the character burns closed.
+    # Engraved annotation. 4mm reads easily on board; 2mm is the floor - the
+    # stroke width of a defocused beam is a real fraction of the cell below
+    # that and the character starts to burn closed. A label that cannot fit
+    # its space at the floor is left off rather than shrunk into a smudge.
+    label_height: float = 4.0
+    label_min_height: float = 2.0
+    label_folds: bool = True        # M / V beside every fold
+    model_id: str = ""              # stamped on each island with its number
 
     @property
     def perf_tie(self) -> float:

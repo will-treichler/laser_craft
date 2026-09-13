@@ -10,12 +10,12 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 161 core invariants (~41 s)
+python -m pytest tests -q               # 176 core invariants (~45 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 169 checks, real Blender API
+python blender/test_addon.py            # 179 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -706,6 +706,64 @@ concentrates stress and is where a fold starts to tear. Note shapely draws a
 round cap *beyond* the line end, so `_strip` pulls the ends in by the radius
 first - buffering the full segment turned a 50 mm fold into a 54 mm slot that
 ate into the panels either side.
+
+## Annotation
+
+Three engravings, and the net is not assemblable without the first:
+
+- **Seam numbers**, just inside each cut edge, on both halves. A 60-piece net
+  with unlabelled edges is a puzzle; the same net with matching numbers is a
+  job.
+- **M / V beside every fold.** Which way a crease bends is not recoverable
+  from a flat sheet, and getting one wrong on an assembled shell means peeling
+  it apart. The mark clears the relief slot using that fold's actual opening
+  from its `FoldPlan`, and goes on whichever side is inside the island - a
+  fold on the island's edge has material on one side only.
+- **`model_id` plus the island number**, inside each island. Cut two models in
+  one afternoon and the pieces are otherwise indistinguishable: both are grey
+  polygons whose seam numbers each start at 1. In the add-on the panel field
+  wins, then the object's name, then the .blend's (`props.model_id_for`); the
+  CLI takes `--id` and falls back to the mesh file's name.
+
+**The height rule is cap, floor, or omit.** `label_height` 4 mm,
+`label_min_height` 2 mm. Width is linear in height, so for an edge label the
+fitting height is one division - there is nothing to search (`fit_height`). A
+label that still will not fit is **left off**: a 1 mm character on corrugated
+board is a burnt smudge that reads as nothing, and a smudge where a seam
+number should be is worse than a bare edge, because the builder trusts it.
+Measured on a pikachu net at 150 mm: 78% of seam edges, 83% of folds and 75%
+of islands carry one, and every label lands between 2.00 and 4.00 mm.
+
+**`Label` carries its own height**, because the strokes cannot be measured
+afterwards - they are rotated, so their y extent is the glyph's *box* at that
+angle and reads up to 2.5x the real height. A probe that measured the strokes
+reported 9.94 mm glyphs from a 4 mm cap, which is a measurement bug that looks
+exactly like a real one.
+
+**Island labels need a point and an angle, not just a point.** The centroid of
+an L-shaped or horseshoe island is frequently outside it and
+`representative_point` only promises to be *somewhere* inside - which on a long
+thin island is somewhere with no room. `polylabel` gives the point furthest
+from any edge. Then sweep angles: these nets are full of slivers with plenty of
+room along them and none across, and horizontal-only left 10 of 24 pikachu
+islands unlabelled, three of which had obvious room (one was 22.4 x 17.7 mm
+with a 7.5 mm inscribed circle). Long axis, its perpendicular, then every 15
+degrees took it from 58% to 75%. The rest are genuinely 5-19 mm slivers.
+
+Label *length* is the real lever on coverage, which is why the tooltip says to
+keep `model_id` short - "PIKA-0" needs 9.6 x 2.0 mm of clear room at the floor.
+
+**Never reject an engraved stroke for closing on itself.** `_mls` dropped any
+stroke whose first point equalled its last, meaning to reject zero-length
+segments - but that is the definition of a **closed** stroke, which is what
+0, O, D and Q are in this font. Every one of them was silently deleted: a part
+stamped `PIKA-0` engraved as `PIKA-`, and seam 10 engraved as `1`. That is not
+a missing annotation but a **wrong** one, and nothing downstream can tell.
+Island 0 of a pikachu net built 206 strokes and engraved 194. Test the stroke
+*count* through to `Part.engrave`; a filter that eats glyphs is invisible to
+any area or bounds check. Regressions:
+`test_a_closed_glyph_survives_to_the_engrave_layer`,
+`test_every_label_stroke_reaches_the_part`.
 
 `use_tabs` is **off by default**. Most cardboard is taped or gets a glued
 backing strip, and the flaps cost about 22% of the sheet in area - measured on

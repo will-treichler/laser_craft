@@ -1,6 +1,7 @@
 """Command line entry point:  python -m cardboard_unfolder model.stl -o out/"""
 from __future__ import annotations
 import argparse
+from pathlib import Path
 import sys
 
 from .material import Material, FLUTES
@@ -26,6 +27,20 @@ def main(argv=None) -> int:
     g.add_argument("--crush", type=float,
                    help="crush factor 0.6-1.0; lower removes less at folds")
     g.add_argument("--tab-depth", type=float, help="glue tab depth, mm")
+
+    g = ap.add_argument_group("annotation")
+    g.add_argument("--id", dest="model_id", default=None,
+                   help="model identifier engraved on every island; "
+                        "defaults to the mesh file's name. Keep it SHORT - it "
+                        "is what decides whether a small island can carry a "
+                        "label at all")
+    g.add_argument("--text-height", type=float, default=None,
+                   help="engraved text height, mm (default 4)")
+    g.add_argument("--text-min", type=float, default=None,
+                   help="never engrave smaller than this, mm (default 2); "
+                        "a label that will not fit is left off instead")
+    g.add_argument("--no-fold-marks", action="store_true",
+                   help="skip the M / V mark beside every fold")
 
     g = ap.add_argument_group("machine")
     g.add_argument("--bed", default="600x400", help="bed size WxH in mm")
@@ -54,6 +69,17 @@ def main(argv=None) -> int:
         mat.bed = (w, h)
     except ValueError:
         ap.error(f"--bed wants WxH in mm, e.g. 600x400 (got {a.bed!r})")
+
+    # The mesh's own name is the obvious identifier and beats nothing at all,
+    # but it is often long - and label length is what decides whether a small
+    # island can carry one, so --id is worth using.
+    mat.model_id = a.model_id if a.model_id is not None else Path(a.mesh).stem
+    if a.text_height is not None:
+        mat.label_height = a.text_height
+    if a.text_min is not None:
+        mat.label_min_height = a.text_min
+    if a.no_fold_marks:
+        mat.label_folds = False
 
     if a.height is None and a.scale is None:
         print("note: no --height given, using the mesh's own units as mm",

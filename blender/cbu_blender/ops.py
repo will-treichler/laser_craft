@@ -320,7 +320,7 @@ class CBU_OT_unfold(bpy.types.Operator):
             bpy.ops.object.mode_set(mode="OBJECT")
 
         s = context.scene.cbu
-        mat = material_from(s)
+        mat = material_from(s, obj)
         U, L, _ = _core()
         log = cbulog.get()
         T = cbulog.Timings()
@@ -498,7 +498,7 @@ class CBU_OT_edit_seam(bpy.types.Operator):
             return {"CANCELLED"}
 
         s = context.scene.cbu
-        mat = material_from(s)
+        mat = material_from(s, obj)
         bpy.ops.object.mode_set(mode="OBJECT")
         try:
             parts = L.build_parts(islands, mat)
@@ -542,7 +542,7 @@ class CBU_OT_repack(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         s = context.scene.cbu
-        mat = material_from(s)
+        mat = material_from(s, obj)
         _, L, _ = _core()
         pm, islands, _old, _sheets, rep = _LAST[obj.name]
 
@@ -597,7 +597,7 @@ class CBU_OT_export(bpy.types.Operator):
         pm, islands, parts, sheets, rep = _LAST[obj.name]
         try:
             out = bpy.path.abspath(s.out_dir)
-            files = E.write_all(out, parts, material_from(s), sheets, rep,
+            files = E.write_all(out, parts, material_from(s, obj), sheets, rep,
                                 dxf=s.write_dxf, stem=obj.name.lower())
         except Exception as exc:                       # noqa: BLE001
             traceback.print_exc()
@@ -624,7 +624,7 @@ class CBU_OT_pack_uv(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         s = context.scene.cbu
-        mat = material_from(s)
+        mat = material_from(s, obj)
         _, L, _ = _core()
         pm, islands, old_parts, old_sheets, rep = _LAST[obj.name]
         sc = bridge.uv_scale(*mat.bed)
