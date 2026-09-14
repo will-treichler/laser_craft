@@ -10,12 +10,12 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 226 core invariants (~82 s)
+python -m pytest tests -q               # 236 core invariants (~85 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 236 checks, real Blender API
+python blender/test_addon.py            # 256 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -452,6 +452,65 @@ just cut would nudge the net and every hand edit would drift.
 A weld CAN produce a self-overlapping island - it re-creates whatever the
 solver avoided by cutting there. That is visible rather than prevented:
 `overlapping_pairs` reports it and Unfold is the way out.
+
+**A net IS its cut set, and that is what makes the optimiser usable.** Every
+dual arc is either a fold or a cut, so the complement of the fold forest is a
+*complete* description of a net. Hand it back as `forced_cuts` and
+`apply_constraints` deletes exactly those arcs, leaving a graph that is already
+a forest - the spanning-tree step then has nothing left to choose and the seed
+stops mattering. Measured on pikachu: 26 islands and 225 cut arcs replay at
+seeds 0, 3 and 41 to the same membership and **0.00e+00 mm** of vertex
+movement. `unfold.cut_arcs` is that set, `bridge.write_constraints` writes it
+into the mesh, and together they are why an optimiser's answer can be handed
+to the user as marks they can see and edit rather than as a number nobody can
+reproduce. Arcs that an *incoming* constraint deleted are included, because
+they are cuts too: the set has to describe the whole net, not the part of it
+this run happened to decide. Regressions:
+`test_a_nets_cut_set_replays_it_exactly_at_any_seed`,
+`test_the_cut_set_is_the_complement_of_the_folds`.
+
+**`weighted_dual` built its graph from EDGES, so a fully-isolated face
+vanished.** A face whose every dual arc is force-cut had no node at all - it
+fell out of the spanning tree, out of `_forest_positions`, and finally out of
+`build_islands` with a bare `KeyError: 269`. Invisible until a constraint set
+is complete enough to isolate a face, which is *exactly* what replaying a cut
+set does, so it surfaced the moment the above was first tried. `W.add_nodes_from(G)`
+is the fix. Regression:
+`test_a_face_cut_off_on_every_side_is_still_an_island`.
+
+It is not free, though, and the reason is worth remembering: **node insertion
+order is a tie-break**. Adding the nodes before the edges changes the order
+`nx.connected_components` walks them in, which changes the roots
+`split_to_fit` draws, which changes *which* arcs it cuts. Measured on the
+corpus: identical everywhere except torus, whose 52 bed splits came out 31 mm
+shorter in total seam - 0.1% of 32.9 m, same islands, same sheets, same repair
+cuts. Attributed by rebuilding `W` from its edges alone and re-running the
+bench row, not inferred.
+
+**A lock constrains the optimiser, nothing else.** `bridge.LOCK_ATTR`
+(`cbu_lock`) is a bool per edge; `write_constraints` skips those edges and
+overwrites every other one - including *clearing* marks the cut set did not
+ask for, because a stale FORCE_CUT left behind would silently constrain the
+next solve. Clear All Marks is a hand edit and still clears a locked edge:
+locking is aimed at the solver, and giving it a second meaning would make both
+unclear. Note a lock on an AUTO edge is meaningful in its own right - it says
+"never force anything here".
+
+Locked marks draw **dashed** (`overlay.dash`, three dashes and two gaps, a
+dash at each end so the mark still shows where it stops). Colour is already
+spoken for - it says cut or fold, and the user chooses it - and line width is
+a per-*draw* uniform rather than a per-segment vertex attribute, so neither is
+free to carry this. The dashing happens at sample time in `mark_lines` and
+`live_mark_segments`, so `_marks_batch` stays a plain segment list and knows
+nothing about locking.
+
+**`split_to_fit` reports the arcs it cut, not just how many.** The optimiser
+has to weigh a bed split differently from a repair cut: one lands on a real
+crease that already needs a glue flap, the other is the solver working around
+an overlap it could not resolve. A single count says nothing about which lever
+to pull. They reach the report as `bed_cut_arcs`, and must be a subset of
+`cut_arcs` or they name an edge that is actually folded
+(`test_the_bed_splits_are_named_and_are_part_of_the_cut_set`).
 
 **`.gitattributes` pins LF, and that is not cosmetic.** `core.autocrlf=true`
 hands back CRLF on any checkout - including the implicit one inside

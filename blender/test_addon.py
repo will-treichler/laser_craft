@@ -47,7 +47,8 @@ def pytest_approx(v, tol=1e-6):
 cbu_blender.register()
 check(hasattr(bpy.types.Scene, "cbu"), "settings registered on Scene")
 for idname in ("cbu.unfold", "cbu.mark", "cbu.export", "cbu.pack_uv",
-               "cbu.clear_marks", "cbu.select_marked"):
+               "cbu.clear_marks", "cbu.select_marked",
+               "cbu.lock", "cbu.clear_locks", "cbu.select_locked"):
     mod, fn = idname.split(".")
     check(hasattr(getattr(bpy.ops, mod), fn), f"operator {idname} registered")
 
@@ -1260,6 +1261,95 @@ check(obj.name not in ops._LAST,
       "the depsgraph handler drops the cached unfold after a real edit")
 check(obj.name not in overlay._fingerprints,
       "and the overlay annotation with it")
+
+# ----------------------------------------------- constraints and locks
+# The optimiser's answer IS its cut set, so write_constraints is how that
+# answer becomes something the user can see, edit and re-unfold against. Two
+# things have to hold or the promise is empty: the written set must replay the
+# same net, and a locked edge must survive being written over.
+obj = fresh("Locks", "ico_sphere", subdivisions=1)
+obj.scale = (0.12,) * 3
+bpy.ops.object.transform_apply(scale=True)
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+bpy.ops.cbu.clear_marks()
+bpy.ops.cbu.clear_locks()
+bpy.ops.cbu.unfold()
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+_pm, _isl, _pa, _sh, _rep = ops._LAST[obj.name]
+_want = set(_rep["cut_arcs"])
+check(bool(_want), "the net has cuts to write")
+_written, _locked = bridge.write_constraints(obj.data, _want)
+check(_locked == 0, f"nothing is locked yet (got {_locked})")
+_cuts, _folds = bridge.read_constraints(obj.data)
+check(_cuts == _want,
+      f"the cut set round-trips ({len(_cuts)} read vs {len(_want)} written)")
+check(not _folds, "and nothing was marked as a fold")
+
+# ...and replaying it gives the same net back, which is the whole point.
+_before = sorted(sorted(i.faces) for i in _isl)
+bpy.ops.cbu.unfold()
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+_after = sorted(sorted(i.faces) for i in ops._LAST[obj.name][1])
+check(_before == _after,
+      f"re-unfolding against the written cuts rebuilds the same net "
+      f"({len(_before)} islands vs {len(_after)})")
+
+# A lock is the user telling the optimiser to keep its hands off ONE decision.
+# Nothing else about it is special: it does not change what the mark means.
+bpy.ops.cbu.clear_marks()
+bpy.ops.object.mode_set(mode="EDIT")
+_bm = bmesh.from_edit_mesh(obj.data)
+_bm.edges.ensure_lookup_table()
+for _e in _bm.edges:
+    _e.select_set(False)
+_keep = _bm.edges[0]
+_keep.select_set(True)
+_kv = tuple(sorted(v.index for v in _keep.verts))
+bmesh.update_edit_mesh(obj.data)
+check(bpy.ops.cbu.mark(mode="FOLD") == {"FINISHED"}, "mark the edge as a fold")
+check(bpy.ops.cbu.lock(lock=True) == {"FINISHED"}, "lock it")
+bpy.ops.object.mode_set(mode="OBJECT")
+
+check(_kv in bridge.read_locks(obj.data), "the lock round-trips through the mesh")
+_written, _locked = bridge.write_constraints(obj.data, _want)
+check(_locked == 1, f"write_constraints sees the lock (got {_locked})")
+_cuts, _folds = bridge.read_constraints(obj.data)
+check(_kv in _folds and _kv not in _cuts,
+      "a locked fold survives a cut set that asks for it to be cut")
+check(_cuts == _want - {_kv},
+      "and every unlocked edge took the value it was given")
+
+bpy.ops.object.mode_set(mode="EDIT")
+_bm = bmesh.from_edit_mesh(obj.data)
+_bm.edges.ensure_lookup_table()
+for _e in _bm.edges:
+    _e.select_set(False)
+_bm.edges[0].select_set(True)
+bmesh.update_edit_mesh(obj.data)
+check(bpy.ops.cbu.lock(lock=False) == {"FINISHED"}, "unlock it again")
+bpy.ops.object.mode_set(mode="OBJECT")
+check(not bridge.read_locks(obj.data), "and the lock is gone")
+
+# Locked marks are drawn DASHED. Colour already says cut-or-fold and is the
+# user's to choose, and line width is a per-draw uniform rather than a vertex
+# attribute - so neither is free to carry this.
+_d = overlay.dash((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 3)
+check(len(_d) == 3, f"a dashed edge is 3 dashes (got {len(_d)})")
+check(abs(sum(float(b[0] - a[0]) for a, b in _d) - 3.0 / 5.0) < 1e-12,
+      "three equal dashes and two equal gaps cover 3/5 of the edge")
+check(abs(float(_d[0][0][0])) < 1e-12 and abs(float(_d[-1][-1][0]) - 1.0) < 1e-12,
+      "and a dash starts at each end, so the mark still shows where it stops")
+
+_lk = overlay.locked_edges(obj.data)
+check(len(_lk) == len(obj.data.edges) and not _lk.any(),
+      "locked_edges reads all-False on an unlocked mesh")
+
+bpy.ops.cbu.clear_marks()
+bpy.ops.cbu.clear_locks()
 
 # ------------------------------------------------------- reload operator
 # reload_all() unregisters CBU_OT_reload itself, so the operator must not

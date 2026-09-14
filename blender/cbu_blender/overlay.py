@@ -206,6 +206,33 @@ def mark_colors():
         return CUT_MARK_RGBA, FOLD_MARK_RGBA
 
 
+# A locked mark is drawn dashed. Colour is already spoken for - it says cut or
+# fold, and the user chooses it - and line width is a per-DRAW uniform, not a
+# per-segment attribute, so neither is available to say "the optimiser may not
+# touch this". Dashing costs no extra state and no second draw call, and reads
+# the same way in the 3D overlay and in the 2D net.
+LOCK_DASHES = 3
+
+
+def dash(a, b, n: int = LOCK_DASHES):
+    """One segment as n equal dashes with n-1 equal gaps between them."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    step = 1.0 / (2 * n - 1)
+    d = b - a
+    return [(a + d * (2 * k * step), a + d * ((2 * k + 1) * step))
+            for k in range(n)]
+
+
+def locked_edges(me) -> np.ndarray:
+    """Per-edge bool, all False when the object has never been locked."""
+    attr = me.attributes.get("cbu_lock")
+    out = np.zeros(len(me.edges), dtype=bool)
+    if attr is not None:
+        attr.data.foreach_get("value", out)
+    return out
+
+
 def mark_lines(obj, eps: float):
     """Forced cut / fold marks in object space, lifted clear of the tint.
 
@@ -227,15 +254,21 @@ def mark_lines(obj, eps: float):
     if not len(hit):
         return [], []
     lift_by = eps * MARK_LIFT
+    lock = locked_edges(me)
     cut_rgba, fold_rgba = mark_colors()
     pts, cols = [], []
     for i in hit:
         a, b = me.edges[int(i)].vertices
         c = cut_rgba if vals[i] == 1 else fold_rgba
+        ends = []
         for v in (a, b):
             co = np.asarray(me.vertices[v].co[:], dtype=float)
             n = np.asarray(me.vertices[v].normal[:], dtype=float)
-            pts.append(tuple(co + n * lift_by))
+            ends.append(co + n * lift_by)
+        for p, q in (dash(*ends) if lock[i] else [tuple(ends)]):
+            pts.append(tuple(p))
+            pts.append(tuple(q))
+            cols.append(c)
             cols.append(c)
     return pts, cols
 
@@ -450,10 +483,11 @@ def live_mark_segments(obj, scale: float):
     attr.data.foreach_get("value", vals)
     if not vals.any():
         return []
+    lock = locked_edges(me)
     marked = {}
     for i in np.nonzero(vals)[0]:
         a, b = me.edges[int(i)].vertices
-        marked[(min(a, b), max(a, b))] = int(vals[i])
+        marked[(min(a, b), max(a, b))] = (int(vals[i]), bool(lock[i]))
 
     raw = np.zeros(len(me.loops) * 2)
     uv.data.foreach_get("uv", raw)
@@ -466,8 +500,15 @@ def live_mark_segments(obj, scale: float):
             l1 = poly.loop_start + (k + 1) % n
             va = me.loops[l0].vertex_index
             vb = me.loops[l1].vertex_index
-            v = marked.get((min(va, vb), max(va, vb)))
-            if v:
+            got = marked.get((min(va, vb), max(va, vb)))
+            if not got:
+                continue
+            v, is_locked = got
+            # Dash at sample time, not at draw time: the batch then has nothing
+            # to know about locking and _marks_batch stays a plain segment list.
+            if is_locked:
+                out.extend((p, q, v) for p, q in dash(flat[l0], flat[l1]))
+            else:
                 out.append((flat[l0], flat[l1], v))
     return out
 

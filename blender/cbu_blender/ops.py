@@ -179,6 +179,42 @@ class CBU_OT_mark(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CBU_OT_lock(bpy.types.Operator):
+    bl_idname = "cbu.lock"
+    bl_label = "Lock Edges"
+    bl_description = ("Keep the optimiser away from the selected edges. "
+                      "Whatever they are marked as now - cut, fold or auto - "
+                      "is what it has to work around")
+    bl_options = {"REGISTER", "UNDO"}
+
+    lock: BoolProperty(name="Lock", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return (context.active_object is not None
+                and context.active_object.type == "MESH"
+                and context.mode == "EDIT_MESH")
+
+    def execute(self, context):
+        obj = context.active_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        lay = bridge.lock_layer(bm)
+        n = 0
+        for e in selected_edges(context, bm):
+            e[lay] = self.lock
+            n += 1
+        bmesh.update_edit_mesh(obj.data)
+        if n == 0:
+            self.report({"WARNING"}, "no edges selected")
+            return {"CANCELLED"}
+        # A lock changes how the mark is DRAWN (dashed) and, like marking, is
+        # not a geometry change - so nothing else would refresh it.
+        overlay.refresh_marks()
+        self.report({"INFO"},
+                    f"{n} edge(s) {'locked' if self.lock else 'unlocked'}")
+        return {"FINISHED"}
+
+
 class CBU_OT_select_all_faces(bpy.types.Operator):
     bl_idname = "cbu.select_all_faces"
     bl_label = "Select All Faces"
@@ -286,6 +322,55 @@ class CBU_OT_clear_marks(bpy.types.Operator):
             a = obj.data.attributes[bridge.EDGE_ATTR]
             a.data.foreach_set("value", np.zeros(len(obj.data.edges), dtype=np.int32))
             obj.data.update()
+        return {"FINISHED"}
+
+
+class CBU_OT_clear_locks(bpy.types.Operator):
+    bl_idname = "cbu.clear_locks"
+    bl_label = "Unlock All"
+    bl_description = "Give every edge back to the optimiser"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == "MESH"
+
+    def execute(self, context):
+        obj = context.active_object
+        if context.mode == "EDIT_MESH":
+            bm = bmesh.from_edit_mesh(obj.data)
+            lay = bridge.lock_layer(bm)
+            for e in bm.edges:
+                e[lay] = False
+            bmesh.update_edit_mesh(obj.data)
+        else:
+            bridge.ensure_mesh_attrs(obj.data)
+            a = obj.data.attributes[bridge.LOCK_ATTR]
+            a.data.foreach_set("value",
+                               np.zeros(len(obj.data.edges), dtype=bool))
+            obj.data.update()
+        overlay.refresh_marks()
+        return {"FINISHED"}
+
+
+class CBU_OT_select_locked(bpy.types.Operator):
+    bl_idname = "cbu.select_locked"
+    bl_label = "Select Locked"
+    bl_description = "Select every edge the optimiser has been told to leave alone"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        obj = context.active_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        lay = bridge.lock_layer(bm)
+        for e in bm.edges:
+            e.select_set(bool(e[lay]))
+        bm.select_flush(True)
+        bmesh.update_edit_mesh(obj.data)
         return {"FINISHED"}
 
 
@@ -929,6 +1014,7 @@ class CBU_OT_pack_uv(bpy.types.Operator):
 PLANAR_TOL = 1e-3      # same gate PolyMesh.check uses
 
 classes = (CBU_OT_mark, CBU_OT_clear_marks, CBU_OT_select_marked,
+           CBU_OT_lock, CBU_OT_clear_locks, CBU_OT_select_locked,
            CBU_OT_select_all_faces,
            CBU_OT_split_nonplanar, CBU_OT_unfold, CBU_OT_edit_seam,
            CBU_OT_repack, CBU_OT_export, CBU_OT_pack_uv)

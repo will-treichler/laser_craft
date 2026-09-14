@@ -119,6 +119,20 @@ class CBU_PT_seams(_Base, bpy.types.Panel):
         mark_key(lay, s, cells=3)
         lay.operator("cbu.clear_marks", icon="X")
 
+        # A lock says nothing about the mark - it says the OPTIMISER may not
+        # change it. Clear All Marks is a hand edit and still clears a locked
+        # edge; locking only ever constrains the solver.
+        box = lay.box()
+        box.label(text="Optimiser", icon="LOCKED")
+        if context.mode == "EDIT_MESH":
+            row = box.row(align=True)
+            row.operator("cbu.lock", text="Lock", icon="LOCKED").lock = True
+            row.operator("cbu.lock", text="Unlock",
+                         icon="UNLOCKED").lock = False
+            box.operator("cbu.select_locked", icon="RESTRICT_SELECT_OFF")
+        box.label(text="Locked marks draw dashed")
+        box.operator("cbu.clear_locks", icon="X")
+
 
 class CBU_PT_material(_Base, bpy.types.Panel):
     bl_label = "Material"

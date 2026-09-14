@@ -24,7 +24,7 @@ from cardboard_unfolder import mesh as mesh_mod
 from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs,
                                        search, min_rect_size, min_area_rect, fits,
                                        split_to_fit, split_island, unfold_tree,
-                                       join_islands,
+                                       join_islands, cut_arcs,
                                        mirrored_faces, _face_local)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, offset_cut,
@@ -548,6 +548,89 @@ def _labelled(islands, mat):
         body = apply_relief(isl.outline(), plans)
         out[isl.id] = (island_labels(isl, plans, mat, body), body)
     return out
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_a_nets_cut_set_replays_it_exactly_at_any_seed(name, tm):
+    """The invariant the whole optimiser rests on.
+
+    Every dual arc is either a fold or a cut, so the cut set is a COMPLETE
+    description of a net: replay it as forced_cuts and apply_constraints
+    deletes exactly those arcs, leaving a graph that is already a forest. The
+    spanning-tree step then has nothing to choose and the seed cannot matter.
+
+    Without this, "the optimiser writes constraints you can then hand-edit" is
+    a promise the code does not keep - re-running Unfold would quietly give a
+    different net and every hand edit would be against a layout that no longer
+    exists.
+    """
+    pm = PolyMesh.from_trimesh(tm)
+    islands, rep = unfold(pm, trials=40, seed=0)
+    cuts = set(rep["cut_arcs"])
+    assert cuts, "a closed mesh always needs cuts"
+
+    want_members = sorted(tuple(sorted(i.faces)) for i in islands)
+    want_pos = {f: r for i in islands for f, r in i.faces.items()}
+
+    for seed in (0, 5, 91):
+        again, _ = unfold(pm, trials=40, seed=seed, forced_cuts=cuts)
+        assert sorted(tuple(sorted(i.faces)) for i in again) == want_members
+        got = {f: r for i in again for f, r in i.faces.items()}
+        worst = max(float(np.abs(got[f] - want_pos[f]).max()) for f in want_pos)
+        assert worst == 0.0, f"seed {seed} moved the net by {worst:.2e} mm"
+
+
+def test_a_face_cut_off_on_every_side_is_still_an_island():
+    """Regression: it used to vanish, with a KeyError deep in build_islands.
+
+    weighted_dual built its graph from EDGES, so a face whose every dual arc is
+    forced cut had no node at all - it fell out of the spanning tree, out of
+    _forest_positions, and finally out of build_islands. Invisible until a
+    constraint set is complete enough to isolate a face, which is exactly what
+    replaying an optimiser's cut set does.
+    """
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosahedron())
+    G = pm.dual_graph()
+    victim = 0
+    ring = [tuple(sorted(G[victim][n]["verts"])) for n in G.neighbors(victim)]
+    assert len(ring) == 3, "a triangle has three neighbours to cut away"
+
+    islands, rep = unfold(pm, trials=20, forced_cuts=set(ring))
+    alone = [i for i in islands if set(i.faces) == {victim}]
+    assert len(alone) == 1, "the isolated face is its own island"
+    assert sum(len(i.faces) for i in islands) == len(pm.faces), \
+        "and no face went missing"
+
+
+def test_the_bed_splits_are_named_and_are_part_of_the_cut_set():
+    """The optimiser has to weigh a bed split differently from a repair cut.
+
+    One lands on a real crease that already needs a glue flap; the other is the
+    solver working around an overlap. Counting them together says nothing about
+    which lever to pull, so split_to_fit reports the arcs it cut and unfold
+    passes them on - and they must be genuine members of the net's cut set, or
+    they name something that is not there.
+    """
+    pm = PolyMesh.from_trimesh(trimesh.creation.cylinder(radius=40, height=180,
+                                                         sections=24))
+    islands, rep = unfold(pm, trials=20, max_size=(60.0, 60.0))
+    bed = rep["bed_cut_arcs"]
+    assert bed, "a 40 mm cylinder cannot fit a 60 mm bed in one piece"
+    assert set(bed) <= set(rep["cut_arcs"]),         "a bed split that is not in the cut set names an edge that is folded"
+    assert len(bed) == len(set(bed)), "no arc is cut twice"
+
+
+def test_the_cut_set_is_the_complement_of_the_folds():
+    pm = PolyMesh.from_trimesh(trimesh.creation.cylinder(radius=1, height=2,
+                                                         sections=16))
+    islands, rep = unfold(pm, trials=40)
+    G = pm.dual_graph()
+    folds = sum(len(i.folds) for i in islands)
+    assert len(rep["cut_arcs"]) + folds == G.number_of_edges(), (
+        f"{len(rep['cut_arcs'])} cuts + {folds} folds != "
+        f"{G.number_of_edges()} arcs")
+    # ...and the fold count is what a spanning forest must have
+    assert folds == len(pm.faces) - len(islands)
 
 
 @pytest.mark.parametrize("name,tm", ALL, ids=IDS)
@@ -1162,7 +1245,7 @@ def test_bed_split_is_maximal(name, tm):
     pm = PolyMesh.from_trimesh(tm).scale_to_height(280)
     limit = (400.0, 260.0)
     forest, pos, _, _ = search(pm, pm.dual_graph(), trials=60)
-    cut, _, ncuts, _ = split_to_fit(pm, forest, pos, *limit)
+    cut, _, ncuts, _, _ = split_to_fit(pm, forest, pos, *limit)
 
     removed = set(map(frozenset, forest.edges())) - set(map(frozenset, cut.edges()))
     assert len(removed) == ncuts, "reported split count must match the arcs removed"
@@ -1196,8 +1279,8 @@ def test_scored_tree_search_never_does_worse_than_the_first_clean_tree():
         if bad_a or bad_b:
             continue                       # no clean tree to compare against
 
-        _, _, cuts_first, _ = split_to_fit(pm, first, pos_a, *limit)
-        _, _, cuts_scored, _ = split_to_fit(pm, scored, pos_b, *limit)
+        _, _, cuts_first, _, _ = split_to_fit(pm, first, pos_a, *limit)
+        _, _, cuts_scored, _, _ = split_to_fit(pm, scored, pos_b, *limit)
         assert cuts_scored <= cuts_first, (
             f"scored search returned a worse tree: {1+cuts_scored} pieces "
             f"vs {1+cuts_first} for the first clean tree")
@@ -1209,7 +1292,7 @@ def test_bed_split_only_removes_existing_arcs():
     pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
     pm = pm.scale_to_height(280)
     forest, pos, _, _ = search(pm, pm.dual_graph(), trials=60)
-    cut, _, _, _ = split_to_fit(pm, forest, pos, 400.0, 260.0)
+    cut, _, _, _, _ = split_to_fit(pm, forest, pos, 400.0, 260.0)
     before = set(map(frozenset, forest.edges()))
     after = set(map(frozenset, cut.edges()))
     assert after <= before

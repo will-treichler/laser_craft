@@ -207,7 +207,11 @@ def main(argv=None):
             f"unresolved={r['unresolved']} oversize={r['oversize']}")
 
     if a.json:
-        Path(a.json).write_text(json.dumps(rows, indent=1))
+        # newline="" or Windows text mode writes CRLF, which .gitattributes
+        # then normalises on commit - so the file is dirty the moment it is
+        # written and every later diff carries it.
+        Path(a.json).write_text(json.dumps(rows, indent=1) + "\n",
+                                newline="\n")
         print(f"wrote {a.json}")
     if a.baseline:
         old = json.loads(Path(a.baseline).read_text())

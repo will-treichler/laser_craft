@@ -312,6 +312,13 @@ def weighted_dual(pm: PolyMesh, G: nx.Graph, c: np.ndarray,
     structurally diverse slice of tree space that jittering weights does not.
     """
     W = nx.Graph()
+    # Every face, not just the ones with a surviving arc. A face whose edges
+    # are ALL force-cut is isolated, and building W from edges alone dropped
+    # it - out of the spanning tree, out of _forest_positions, and finally out
+    # of build_islands with a KeyError. It is a perfectly good one-face island.
+    # Invisible until a constraint set is complete enough to isolate a face,
+    # which is precisely what replaying an optimiser's cuts does.
+    W.add_nodes_from(G)
     lmax = max((d["length"] for *_, d in G.edges(data=True)), default=1.0)
     for a, b, d in G.edges(data=True):
         v0, v1 = d["verts"]
@@ -373,7 +380,8 @@ def search(pm: PolyMesh, G: nx.Graph | None = None, trials: int = 250,
                     print(f"  clean unfold on trial {i + 1}")
                 return T, pos, set(), i + 1
             seen_clean += 1
-            _, _, ncuts, over = split_to_fit(pm, T, pos, *max_size, trials=3)
+            _, _, ncuts, over, _ = split_to_fit(pm, T, pos, *max_size,
+                                                trials=3)
             # an unsplittable oversized face is worse than any piece count
             score = (over, 1 + ncuts)
             if best_clean is None or score < best_clean[0]:
@@ -722,6 +730,12 @@ def split_to_fit(pm: PolyMesh, forest: nx.Graph, pos: dict[int, np.ndarray],
     Cutting k arcs of a forest always yields exactly k more components, so
     "fewest pieces" is just "fewest cuts" - the trials below vary the root and
     the order children are absorbed in, and keep the cheapest result.
+
+    Returns (forest, pos, n_cuts, n_oversize, arcs). The arcs are reported and
+    not merely counted because the optimiser has to tell a bed split apart from
+    a repair cut: this is the good kind, landing on a real crease that already
+    needs a glue flap, while a repair cut is the solver working around an
+    overlap it could not otherwise resolve. Two very different things to weigh.
     """
     forest = forest.copy()
     rng = np.random.default_rng(seed)
@@ -754,7 +768,7 @@ def split_to_fit(pm: PolyMesh, forest: nx.Graph, pos: dict[int, np.ndarray],
     pos, _ = _forest_positions(pm, forest)
     still = [c for c in nx.connected_components(forest)
              if not fits(np.vstack([pos[f] for f in c]), max_w, max_h)]
-    return forest, pos, len(best_cuts), len(still)
+    return forest, pos, len(best_cuts), len(still), best_cuts
 
 
 # ------------------------------------------------------------ island build
@@ -805,6 +819,32 @@ def build_islands(pm: PolyMesh, G: nx.Graph, forest: nx.Graph,
     return islands
 
 
+def cut_arcs(G_full: nx.Graph, forest: nx.Graph) -> list:
+    """The cut set of a finished net, as sorted (v0, v1) mesh-vertex pairs.
+
+    Every dual arc is either a fold or a cut, so the cuts are the complement of
+    the fold forest - and that complement is a COMPLETE description of the net.
+    Feed it back as `forced_cuts` and apply_constraints deletes exactly those
+    arcs, leaving a graph that is already a forest; the spanning-tree step then
+    has nothing left to choose and the seed stops mattering. That is what lets
+    the optimiser hand its answer to the user as editable marks instead of as a
+    number nobody can reproduce.
+
+    Arcs deleted by an incoming constraint are included, because they are cuts
+    too - the set has to describe the whole net, not the part of it this run
+    happened to decide.
+    """
+    out = []
+    for a, b in G_full.edges:
+        if forest.has_edge(a, b):
+            continue
+        verts = G_full[a][b].get("verts")
+        if verts is None:
+            continue
+        out.append((min(verts), max(verts)))
+    return sorted(set(out))
+
+
 def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
            max_size: tuple[float, float] | None = None,
            forced_cuts: set = (), forced_folds: set = (),
@@ -826,13 +866,18 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
         forest, pos, bad, extra = repair(pm, forest, bad)
 
     splits = oversize = 0
+    bed_arcs = []
     if max_size is not None:
-        forest, pos, splits, oversize = split_to_fit(pm, forest, pos, *max_size)
+        forest, pos, splits, oversize, bed = split_to_fit(pm, forest, pos,
+                                                          *max_size)
+        bed_arcs = sorted({tuple(sorted(G_full[a][b]["verts"]))
+                           for a, b in bed if "verts" in G_full[a][b]})
         bad = overlapping_pairs(forest, pos)
 
     # seams are reported against the full dual so forced cuts still get tabs
     islands = build_islands(pm, G_full, forest, pos)
-    report = dict(trials_used=used, extra_cuts=extra, size_splits=splits,
+    report = dict(cut_arcs=cut_arcs(G_full, forest), bed_cut_arcs=bed_arcs,
+                  trials_used=used, extra_cuts=extra, size_splits=splits,
                   islands=len(islands), unresolved=len(bad),
                   oversize_islands=oversize, notes=notes,
                   isometry_error=isometry_error(pm, pos))

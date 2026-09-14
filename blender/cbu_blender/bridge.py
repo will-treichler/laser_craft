@@ -28,6 +28,8 @@ from mathutils import Matrix
 # `from __future__ import annotations`.
 
 EDGE_ATTR = "cbu_constraint"
+# Bool per edge: the optimiser must leave this edge's mark alone.
+LOCK_ATTR = "cbu_lock"
 FACE_ATTR = "cbu_island"
 UV_LAYER = "CBU_Net"
 # mm. Corners closer than this are treated as the same corner.
@@ -63,11 +65,27 @@ def face_layer(bm, create: bool = True):
     return lay
 
 
+def lock_layer(bm, create: bool = True):
+    lay = bm.edges.layers.bool.get(LOCK_ATTR)
+    if lay is None and create:
+        lay = bm.edges.layers.bool.new(LOCK_ATTR)
+    return lay
+
+
 def ensure_mesh_attrs(mesh) -> None:
     if EDGE_ATTR not in mesh.attributes:
         mesh.attributes.new(EDGE_ATTR, "INT", "EDGE")
     if FACE_ATTR not in mesh.attributes:
         mesh.attributes.new(FACE_ATTR, "INT", "FACE")
+    if LOCK_ATTR not in mesh.attributes:
+        mesh.attributes.new(LOCK_ATTR, "BOOLEAN", "EDGE")
+
+
+def edge_keys(mesh) -> np.ndarray:
+    """(n, 2) sorted vertex pairs, one row per edge, in edge-index order."""
+    v = np.zeros(len(mesh.edges) * 2, dtype=np.int32)
+    mesh.edges.foreach_get("vertices", v)
+    return np.sort(v.reshape(-1, 2), axis=1)
 
 
 def uv_selected_edges(bm, uv_name: str = UV_LAYER) -> set:
@@ -88,6 +106,54 @@ def uv_selected_edges(bm, uv_name: str = UV_LAYER) -> set:
             if getattr(l[lay], "select_edge", False):
                 out.add(l.edge.index)
     return out
+
+
+def read_locks(mesh) -> set:
+    """Edges the optimiser must not touch, as sorted (v0, v1) pairs."""
+    attr = mesh.attributes.get(LOCK_ATTR)
+    if attr is None:
+        return set()
+    vals = np.zeros(len(mesh.edges), dtype=bool)
+    attr.data.foreach_get("value", vals)
+    keys = edge_keys(mesh)
+    return {(int(a), int(b)) for a, b in keys[vals]}
+
+
+def write_constraints(mesh, cuts, folds=()) -> tuple[int, int]:
+    """Replace the unlocked marks with this cut set. Returns (written, locked).
+
+    A net IS its cut set, so this is how an optimiser's answer survives into
+    something the user can see, edit and re-unfold against. It overwrites
+    unlocked marks by design - including clearing marks the optimiser did not
+    ask for, because a stale FORCE_CUT left behind would silently constrain
+    the next solve. Locking an edge is how you tell it to keep its hands off a
+    decision you made by hand.
+
+    Object Mode only, like everything else that touches mesh data: in Edit
+    Mode the live values are in the BMesh and this writes into a datablock
+    nothing is reading.
+    """
+    ensure_mesh_attrs(mesh)
+    attr = mesh.attributes[EDGE_ATTR]
+    locked = read_locks(mesh)
+    cuts = {(min(a, b), max(a, b)) for a, b in cuts}
+    folds = {(min(a, b), max(a, b)) for a, b in folds}
+
+    vals = np.zeros(len(mesh.edges), dtype=np.int32)
+    attr.data.foreach_get("value", vals)
+    written = 0
+    for i, (a, b) in enumerate(edge_keys(mesh)):
+        key = (int(a), int(b))
+        if key in locked:
+            continue
+        want = FORCE_CUT if key in cuts else (FORCE_FOLD if key in folds
+                                              else AUTO)
+        if vals[i] != want:
+            vals[i] = want
+            written += 1
+    attr.data.foreach_set("value", vals)
+    mesh.update()
+    return written, len(locked)
 
 
 def read_constraints(mesh) -> tuple[set, set]:
