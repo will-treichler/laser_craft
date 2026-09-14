@@ -10,12 +10,12 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 217 core invariants (~71 s)
+python -m pytest tests -q               # 226 core invariants (~82 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 232 checks, real Blender API
+python blender/test_addon.py            # 236 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -423,15 +423,44 @@ islands" passes on a cube and fails on a sphere - the real invariant is that
 the two faces disagree about where the edge sits in the net
 (`cutting an edge slits the net along it`).
 
-That is also why `cbu.edit_seam` has two cut modes. Marking the edge and
-re-unfolding lets the solver rebuild the whole tree, so the freed faces
-usually reattach to a *different* island and the region count does not move,
-while the rest of the layout jumps around. `separate=True` (the default)
-instead calls `unfold.split_island`, which removes that one fold in place and
-detaches exactly the piece on its far side. An island's folds form a spanning
-tree, so every fold is a bridge and removing one always yields exactly two
-pieces; the spent fold becomes a matched pair of cuts sharing a new seam id,
-which is what pairs a glue tab with its partner.
+**Both seam edits are local, and neither re-runs the unfold.** Re-unfolding
+lets the solver rebuild every tree, so the faces freed by a cut usually
+reattach somewhere else entirely and the whole layout jumps - correct, but not
+what someone editing one seam expects, and it throws away where every other
+hand edit put things. So `cbu.edit_seam` writes the mark and edits in place;
+**Unfold is the one explicit global re-solve**, and it honours the marks left
+behind. That is the workflow: Unfold to see it, edit seams by hand, Unfold
+again when you want the solver to reconsider.
+
+`unfold.split_island` removes one fold in place and detaches exactly the piece
+on its far side. An island's folds form a spanning tree, so every fold is a
+bridge: removing one always yields exactly two pieces. The spent fold becomes a
+matched pair of cuts sharing a new seam id, which is what pairs a glue tab with
+its partner.
+
+`unfold.join_islands` is its exact inverse. Where the welded island goes is not
+a choice - f1 has exactly one placement sharing the edge with f0 and lying on
+its far side, and `unfold_tree` already knows how to find it; the rest of the
+island follows by the rigid motion that implies, recovered from the two shared
+corners. No reflection is possible, because both placements are
+orientation-preserving images of the same face. **Split then join is
+byte-exact**: measured at 1.4e-13 mm on a real net and asserted across the
+corpus at 1e-9 (`test_split_then_join_puts_the_island_back_exactly`), plus the
+island being welded ONTO must not move at all. Without that, welding a seam you
+just cut would nudge the net and every hand edit would drift.
+
+A weld CAN produce a self-overlapping island - it re-creates whatever the
+solver avoided by cutting there. That is visible rather than prevented:
+`overlapping_pairs` reports it and Unfold is the way out.
+
+**`.gitattributes` pins LF, and that is not cosmetic.** `core.autocrlf=true`
+hands back CRLF on any checkout - including the implicit one inside
+`git stash pop`. Every edit script in this repo opens with
+`assert "\r\n" not in src`, so a stashed-and-restored file then fails its own
+patch with no explanation, and `sync_vendor` copies the CRLF straight into the
+vendored tree. It bit twice in one session before the file was added. Nothing
+CRLF has ever been committed; check with
+`git show HEAD:path | grep -c $'\r'` if in doubt.
 
 **In the UV editor, `edge.select` is the wrong selection.** UV selection lives
 per loop and, with UV Sync Selection off, is entirely separate from the mesh

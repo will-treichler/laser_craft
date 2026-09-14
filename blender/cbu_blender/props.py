@@ -206,13 +206,6 @@ class CBUSettings(bpy.types.PropertyGroup):
     write_dxf: BoolProperty(name="Also write DXF", default=True)
 
     # --- overlay ---
-    separate_on_cut: BoolProperty(
-        name="Cut separates", default=True,
-        description=("Cut detaches the piece on the far side as its own "
-                     "island and leaves the rest of the net where it is. "
-                     "Off re-runs the solver, which may reattach that piece "
-                     "to a different island instead"))
-
     show_cut: BoolProperty(
         name="Show cut outline", default=True,
         description=("Draw what the laser actually follows - the islands plus "

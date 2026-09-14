@@ -468,6 +468,108 @@ def split_island(isl: Island, f0: int, f1: int, new_id: int, new_seam: int):
             build(new_id, side_b, target.f1))
 
 
+def join_islands(a: Island, b: Island, pm: PolyMesh, G: nx.Graph,
+                 f0: int, f1: int):
+    """Weld island `b` onto `a` along the edge between faces f0 and f1.
+
+    The exact inverse of split_island, and the local counterpart to
+    re-unfolding with a forced fold. Re-unfolding would let the solver rebuild
+    every tree, which moves the whole net - correct, but not what someone
+    welding one seam in the 2D view expects. This moves `b` rigidly onto `a`
+    and leaves everything else exactly where it was, so the global re-solve
+    stays an explicit act.
+
+    Where `b` goes is not a choice: f1 has exactly one placement that shares
+    the edge with f0 and lies on the far side of it, and unfold_tree already
+    knows how to find it. Compute that placement, then carry the rest of `b`
+    with the rigid motion it implies. Two corresponding points fix a rotation
+    and a translation; no reflection is possible, because both placements are
+    orientation-preserving images of the same face.
+
+    Returns None when the two are not adjacent across an uncut edge here - they
+    may share an edge in 3D and already be in the same island, or be joined
+    through a different path.
+
+    The joined island CAN self-overlap: welding re-creates whatever the solver
+    avoided by cutting there. That is visible rather than prevented -
+    overlapping_pairs reports it and re-running the unfold is the way out.
+    """
+    if a is b or a.id == b.id:
+        return None
+    if f0 not in a.faces or f1 not in b.faces:
+        return None
+    if not G.has_edge(f0, f1):
+        return None
+    ev = G[f0][f1].get("verts")
+    if ev is None:
+        return None
+
+    ring0 = pm.faces[f0]
+    if ev[0] not in ring0 or ev[1] not in ring0:
+        return None
+    P2 = a.faces[f0][ring0.index(ev[0])]
+    Q2 = a.faces[f0][ring0.index(ev[1])]
+
+    # Where f1 belongs, by exactly the rule unfold_tree uses for a child.
+    d = Q2 - P2
+    n = float(np.linalg.norm(d))
+    if n < 1e-12:
+        return None
+    d = d / n
+    e = np.array([-d[1], d[0]])
+    t, h, _L = _face_local(pm, f1, ev[0], ev[1])
+    k = -1.0 if _edge_dir(ring0, *ev) == _edge_dir(pm.faces[f1], *ev) else 1.0
+    target = P2 + np.outer(t, d) + k * np.outer(h, e)
+
+    # The rigid motion carrying b's current f1 onto that target, from the two
+    # shared corners - the same two-point recovery the 2D overlay uses.
+    ring1 = pm.faces[f1]
+    i0, i1 = ring1.index(ev[0]), ring1.index(ev[1])
+    q0, q1 = b.faces[f1][i0], b.faces[f1][i1]
+    p0, p1 = target[i0], target[i1]
+    u, v = q1 - q0, p1 - p0
+    lu, lv = float(np.hypot(*u)), float(np.hypot(*v))
+    if lu < 1e-12 or lv < 1e-12:
+        return None
+    c = float(u @ v) / (lu * lv)
+    s = float(u[0] * v[1] - u[1] * v[0]) / (lu * lv)
+    R = np.array([[c, -s], [s, c]])
+
+    def move(pts):
+        return (np.asarray(pts, dtype=float) - q0) @ R.T + p0
+
+    out = Island(id=min(a.id, b.id))
+    out.faces = dict(a.faces)
+    for fi, ring in b.faces.items():
+        out.faces[fi] = move(ring)
+
+    # The two cuts that were this seam become the fold again. Drop them by the
+    # face they sit on rather than by seam id: a hand-welded edge may never
+    # have been a numbered pair.
+    def is_seam(cut, face):
+        if cut.face != face:
+            return False
+        ends = (np.allclose(cut.a, P2) and np.allclose(cut.b, Q2)) or \
+               (np.allclose(cut.a, Q2) and np.allclose(cut.b, P2))
+        return ends
+
+    out.cuts = [c for c in a.cuts if not is_seam(c, f0)]
+    for c in b.cuts:
+        m = Cut(move([c.a, c.b])[0], move([c.a, c.b])[1], c.face, c.seam)
+        if np.allclose(m.a, P2) and np.allclose(m.b, Q2) and c.face == f1:
+            continue
+        if np.allclose(m.a, Q2) and np.allclose(m.b, P2) and c.face == f1:
+            continue
+        out.cuts.append(m)
+
+    out.folds = list(a.folds)
+    for fo in b.folds:
+        mv = move([fo.a, fo.b])
+        out.folds.append(Fold(mv[0], mv[1], fo.bend, fo.f0, fo.f1))
+    out.folds.append(Fold(P2, Q2, float(G[f0][f1].get("bend", 0.0)), f0, f1))
+    return out
+
+
 # -------------------------------------------------------------- bed limit
 
 def _convex_hull(pts: np.ndarray) -> np.ndarray:

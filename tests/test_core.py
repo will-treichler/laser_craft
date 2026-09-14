@@ -24,6 +24,7 @@ from cardboard_unfolder import mesh as mesh_mod
 from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs,
                                        search, min_rect_size, min_area_rect, fits,
                                        split_to_fit, split_island, unfold_tree,
+                                       join_islands,
                                        mirrored_faces, _face_local)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, offset_cut,
@@ -547,6 +548,79 @@ def _labelled(islands, mat):
         body = apply_relief(isl.outline(), plans)
         out[isl.id] = (island_labels(isl, plans, mat, body), body)
     return out
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_split_then_join_puts_the_island_back_exactly(name, tm):
+    """The invariant that makes Weld a local edit rather than a re-solve.
+
+    join_islands is the inverse of split_island, so doing both has to leave the
+    net byte-for-byte where it started - otherwise welding a seam you just cut
+    would nudge the whole island and every hand edit would drift.
+    """
+    pm = PolyMesh.from_trimesh(tm)
+    G = pm.dual_graph()
+    islands, _ = unfold(pm, trials=40)
+    isl = max(islands, key=lambda i: len(i.faces))
+    if not isl.folds:
+        pytest.skip("single-face island has no fold to cut")
+
+    fo = isl.folds[len(isl.folds) // 2]
+    parts = split_island(isl, fo.f0, fo.f1, 9999, 4242)
+    assert parts is not None
+    a, b = parts
+    assert len(a.faces) + len(b.faces) == len(isl.faces)
+
+    j = join_islands(a, b, pm, G, fo.f0, fo.f1)
+    assert j is not None, "the two halves of a fresh cut must weld back"
+    assert set(j.faces) == set(isl.faces)
+    assert len(j.folds) == len(isl.folds)
+    assert len(j.cuts) == len(isl.cuts)
+    worst = max(float(np.abs(j.faces[k] - isl.faces[k]).max()) for k in isl.faces)
+    assert worst < 1e-9, f"welding moved the island by {worst:.2e} mm"
+
+
+def test_a_weld_is_a_rigid_motion_not_a_re_solve():
+    """Every edge length in the welded island survives, and the half that did
+    not move did not move at all."""
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(200.0)
+    G = pm.dual_graph()
+    islands, _ = unfold(pm, trials=40)
+    isl = max(islands, key=lambda i: len(i.faces))
+    fo = isl.folds[3]
+    a, b = split_island(isl, fo.f0, fo.f1, 9999, 4242)
+    before_a = {k: v.copy() for k, v in a.faces.items()}
+
+    j = join_islands(a, b, pm, G, fo.f0, fo.f1)
+    assert j is not None
+    for k, ring in before_a.items():
+        assert np.allclose(j.faces[k], ring, atol=1e-12), \
+            "the island being welded ONTO must not move"
+    assert isometry_error(pm, j.faces) < 1e-12
+
+
+def test_join_refuses_what_it_cannot_weld():
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    G = pm.dual_graph()
+    islands, _ = unfold(pm, trials=40)
+    isl = max(islands, key=lambda i: len(i.faces))
+    # A split whose kept side has a face that does NOT touch the other side.
+    # Cutting at folds[0] can leave a five-face stub where every face happens
+    # to border f1, and then there is no stranger left to test with.
+    found = None
+    for fo in isl.folds:
+        a, b = split_island(isl, fo.f0, fo.f1, 9999, 4242)
+        strangers = [f for f in a.faces if f != fo.f0 and not G.has_edge(f, fo.f1)]
+        if strangers:
+            found = (fo, a, b, strangers[0])
+            break
+    assert found, "no fixture on this mesh"
+    fo, a, b, stranger = found
+
+    assert join_islands(a, a, pm, G, fo.f0, fo.f1) is None, "an island with itself"
+    assert join_islands(a, b, pm, G, fo.f1, fo.f0) is None, "faces the wrong way round"
+    assert join_islands(a, b, pm, G, stranger, fo.f1) is None,         "faces that do not share an edge in 3D"
 
 
 def test_the_coplanar_merge_does_not_rescan_per_group():

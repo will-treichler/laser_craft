@@ -944,21 +944,24 @@ _base = bpy.context.scene.cbu.last_islands
 _fe = _fold_edge()
 check(_fe is not None, "found a fold edge to cut")
 _select_only(_fe)
-check(bpy.ops.cbu.edit_seam(mode="CUT", separate=False) == {"FINISHED"},
-      "re-unfolding cut runs")
-_resolved = bpy.context.scene.cbu.last_islands
-
-bpy.ops.cbu.clear_marks()
-bpy.ops.cbu.unfold()
-_fe = _fold_edge()
-_select_only(_fe)
-check(bpy.ops.cbu.edit_seam(mode="CUT", separate=True) == {"FINISHED"},
-      "separating cut runs")
+# Snapshot every island's geometry: a local edit must leave the rest of the net
+# exactly where it was. That is the whole reason Cut no longer re-unfolds.
+_before = {i.id: {k: v.copy() for k, v in i.faces.items()}
+           for i in ops._LAST[obj.name][1]}
+check(bpy.ops.cbu.edit_seam(mode="CUT") == {"FINISHED"}, "cut runs")
 _detached = bpy.context.scene.cbu.last_islands
 check(_detached == _base + 1,
-      f"a separating cut adds exactly one island ({_base} -> {_detached})")
-check(_detached > _resolved,
-      f"and gives more regions than re-unfolding ({_detached} vs {_resolved})")
+      f"a cut adds exactly one island ({_base} -> {_detached})")
+
+_moved = 0
+for _i in ops._LAST[obj.name][1]:
+    _old = _before.get(_i.id)
+    if _old is None:
+        continue
+    for _f, _ring in _i.faces.items():
+        if _f in _old and not np.allclose(_ring, _old[_f], atol=1e-9):
+            _moved += 1
+check(_moved == 0, f"cutting moved {_moved} face(s) that it should not have")
 
 _pm, _isl, _parts, _sheets, _rep = ops._LAST[obj.name]
 check(len({i.id for i in _isl}) == len(_isl), "island ids stay unique after a split")
@@ -978,7 +981,7 @@ check(sum(len(i.faces) for i in _isl) == len(_pm.faces),
 bpy.ops.cbu.clear_marks()
 bpy.ops.cbu.unfold()
 _select_only(_target)
-check(bpy.ops.cbu.edit_seam(mode="CUT", separate=False) == {"FINISHED"},
+check(bpy.ops.cbu.edit_seam(mode="CUT") == {"FINISHED"},
       "cut a seam from the 2D view")
 check(_edge_is_slit(_target), "cutting an edge slits the net along it")
 if bpy.context.mode == "EDIT_MESH":
@@ -996,6 +999,34 @@ if bpy.context.mode == "EDIT_MESH":
     bpy.ops.object.mode_set(mode="OBJECT")
 _cuts, _folds = bridge.read_constraints(obj.data)
 check(not _cuts and len(_folds) == 1, "the weld replaced the cut, not stacked on it")
+
+# Weld is the inverse and is equally local: cut an edge, weld it back, and the
+# net must be exactly where it started. Re-unfolding would also give a valid
+# answer - a different one - which is why this is measured rather than assumed.
+bpy.ops.cbu.clear_marks()
+bpy.ops.cbu.unfold()
+_fe2 = _fold_edge()
+_pre = {i.id: {k: v.copy() for k, v in i.faces.items()}
+        for i in ops._LAST[obj.name][1]}
+_pre_n = bpy.context.scene.cbu.last_islands
+_select_only(_fe2)
+check(bpy.ops.cbu.edit_seam(mode="CUT") == {"FINISHED"}, "cut, to weld back")
+check(bpy.context.scene.cbu.last_islands == _pre_n + 1, "the cut took")
+_select_only(_fe2)
+check(bpy.ops.cbu.edit_seam(mode="FOLD") == {"FINISHED"}, "weld it back")
+check(bpy.context.scene.cbu.last_islands == _pre_n,
+      f"welding removes the island the cut added "
+      f"({bpy.context.scene.cbu.last_islands} vs {_pre_n})")
+_worst = 0.0
+_unused = {i.id: i.faces for i in ops._LAST[obj.name][1]}
+for _id, _pre_faces in _pre.items():
+    for _f, _ring in _pre_faces.items():
+        for _i2 in ops._LAST[obj.name][1]:
+            if _f in _i2.faces:
+                _worst = max(_worst, float(np.abs(_i2.faces[_f] - _ring).max()))
+                break
+check(_worst < 1e-9,
+      f"cut then weld puts the net back exactly (worst {_worst:.2e} mm)")
 
 # re-nesting on demand must not disturb the islands, only where they sit
 _before_islands = bpy.context.scene.cbu.last_islands
@@ -1188,7 +1219,7 @@ finally:
     overlay._batches.pop(obj.name, None)
 
 # Both rebuild call sites must pass the setting; one of them silently did not.
-for _fn in (ops.CBU_OT_unfold.execute, ops.CBU_OT_edit_seam._separate):
+for _fn in (ops.CBU_OT_unfold.execute, ops.CBU_OT_edit_seam._local):
     check("overlay_alpha" in _fn.__code__.co_names,
           f"{_fn.__qualname__} passes the opacity setting through")
 

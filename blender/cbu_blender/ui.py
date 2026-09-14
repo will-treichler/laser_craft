@@ -375,21 +375,17 @@ class CBU_PT_uv(bpy.types.Panel):
             row = box.row(align=True)
             op = row.operator("cbu.edit_seam", text="Cut", icon="COLOR_RED")
             op.mode = "CUT"
-            op.separate = s.separate_on_cut
             op = row.operator("cbu.edit_seam", text="Weld", icon="COLOR_BLUE")
             op.mode = "FOLD"
             mark_key(box, s)
-            box.prop(s, "separate_on_cut")
             if not context.scene.tool_settings.use_uv_select_sync:
                 box.label(text="reading the UV selection", icon="UV")
             else:
                 box.label(text="UV sync on: reading the 3D selection",
                           icon="INFO")
-        if s.separate_on_cut:
-            box.label(text="Cut detaches that piece; the rest stays put.")
-        else:
-            box.label(text="Cut re-unfolds; the freed piece may")
-            box.label(text="reattach elsewhere and the layout moves.")
+        box.label(text="Both edit in place. The rest of the net",
+                  icon="INFO")
+        box.label(text="stays put; press Unfold to re-solve.")
 
         lay.separator()
         col = lay.column(align=True)

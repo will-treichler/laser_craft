@@ -1,0 +1,10 @@
+# This repo is LF everywhere, and core.autocrlf=true on Windows will happily
+# hand back CRLF on any checkout - including the implicit one a `git stash pop`
+# does. Every source file here starts with `assert "\r\n" not in src`, so a
+# stashed-and-restored file then fails its own edit script with no explanation.
+# Pinning the working-tree ending removes the hazard rather than documenting it.
+* text=auto eol=lf
+*.png binary
+*.stl binary
+*.blend binary
+*.blend1 binary

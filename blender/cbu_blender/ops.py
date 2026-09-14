@@ -431,20 +431,15 @@ class CBU_OT_unfold(bpy.types.Operator):
 class CBU_OT_edit_seam(bpy.types.Operator):
     bl_idname = "cbu.edit_seam"
     bl_label = "Edit Seam"
-    bl_description = ("Force the selected edge(s) and re-unfold, so the change "
-                      "shows in the net immediately")
+    bl_description = ("Cut or weld the selected edge(s) in place. The rest of "
+                      "the net does not move and the unfold is NOT re-run - "
+                      "press Unfold when you want the solver to reconsider")
     bl_options = {"REGISTER", "UNDO"}
 
     mode: EnumProperty(items=[
-        ("CUT", "Cut", "Cut along this edge"),
-        ("FOLD", "Weld", "Never cut here - joins the two islands into one"),
+        ("CUT", "Cut", "Cut here, detaching the piece on the far side"),
+        ("FOLD", "Weld", "Never cut here - welds the two islands into one"),
     ], default="CUT")
-    separate: BoolProperty(
-        name="Separate into a new island", default=True,
-        description=("Detach the piece on the far side of the cut as its own "
-                     "island, leaving the rest of the net alone. Off re-runs "
-                     "the solver, which is free to reattach that piece "
-                     "elsewhere - fewer islands, but the whole layout moves"))
 
     @classmethod
     def poll(cls, context):
@@ -453,22 +448,19 @@ class CBU_OT_edit_seam(bpy.types.Operator):
                 and context.mode == "EDIT_MESH")
 
     def execute(self, context):
-        if self.mode == "CUT" and self.separate:
-            return self._separate(context)
-        r = bpy.ops.cbu.mark(mode=self.mode)
-        if "FINISHED" not in r:
-            self.report({"WARNING"}, "nothing selected in this view")
-            return {"CANCELLED"}
-        return bpy.ops.cbu.unfold()
+        """Both directions are local, and neither re-runs the unfold.
 
-    def _separate(self, context):
-        """Cut the fold locally instead of re-unfolding.
-
-        Marking the edge and re-unfolding lets the solver rebuild the whole
-        tree, so the faces freed by the cut usually reattach to a different
-        island and the region count does not go up at all. Cutting the fold in
-        place detaches exactly the piece the user pointed at.
+        Re-unfolding would let the solver rebuild every tree, so the faces
+        freed by a cut usually reattach somewhere else entirely and the whole
+        layout jumps - correct, but not what someone editing one seam expects,
+        and it throws away every other hand edit's placement. Cut detaches
+        exactly the piece pointed at; Weld moves one island rigidly onto the
+        other. Unfold stays the one explicit global re-solve, and it honours
+        the marks these leave behind.
         """
+        return self._local(context)
+
+    def _local(self, context):
         obj = context.active_object
         if obj.name not in _LAST:
             self.report({"WARNING"}, "unfold first")
@@ -481,11 +473,14 @@ class CBU_OT_edit_seam(bpy.types.Operator):
             self.report({"WARNING"}, "select an edge between two faces")
             return {"CANCELLED"}
 
-        # record it so a later re-unfold keeps the cut
-        bpy.ops.cbu.mark(mode="CUT")
+        # Record it first, so a later Unfold keeps the decision. This is the
+        # whole point of editing in place: the mark persists, the layout does
+        # not move, and the solver only reconsiders when asked.
+        bpy.ops.cbu.mark(mode=self.mode)
 
         U, L, _ = _core()
         pm, islands, _parts, _sheets, rep = _LAST[obj.name]
+        G = pm.dual_graph() if self.mode == "FOLD" else None
         core_of = {}
         for ci, grp in enumerate(pm.source_faces):
             for poly in grp:
@@ -495,21 +490,36 @@ class CBU_OT_edit_seam(bpy.types.Operator):
         for _eidx, (p0, p1) in picks:
             a, b = core_of.get(p0), core_of.get(p1)
             if a is None or b is None or a == b:
-                continue            # inside one merged n-gon: nothing to cut
-            host = next((i for i in islands if a in i.faces and b in i.faces), None)
-            if host is None:
-                continue            # already in different islands
-            nid = max(i.id for i in islands) + 1
-            seam = max([c.seam for i in islands for c in i.cuts] + [-1]) + 1
-            out = U.split_island(host, a, b, nid, seam)
-            if out is None:
-                continue
-            islands[islands.index(host)] = out[0]
-            islands.append(out[1])
+                continue            # inside one merged n-gon: nothing to do
+            if self.mode == "CUT":
+                host = next((i for i in islands
+                             if a in i.faces and b in i.faces), None)
+                if host is None:
+                    continue        # already in different islands
+                nid = max(i.id for i in islands) + 1
+                seam = max([c.seam for i in islands for c in i.cuts] + [-1]) + 1
+                out = U.split_island(host, a, b, nid, seam)
+                if out is None:
+                    continue
+                islands[islands.index(host)] = out[0]
+                islands.append(out[1])
+            else:
+                ia = next((i for i in islands if a in i.faces), None)
+                ib = next((i for i in islands if b in i.faces), None)
+                if ia is None or ib is None or ia is ib:
+                    continue        # already one island
+                out = U.join_islands(ia, ib, pm, G, a, b)
+                if out is None:
+                    continue
+                islands.remove(ia)
+                islands.remove(ib)
+                islands.append(out)
             done += 1
 
         if not done:
-            self.report({"WARNING"}, "that edge is already cut in this net")
+            self.report({"WARNING"},
+                        "that edge is already cut in this net" if self.mode == "CUT"
+                        else "those faces are already in one island")
             return {"CANCELLED"}
 
         s = context.scene.cbu
