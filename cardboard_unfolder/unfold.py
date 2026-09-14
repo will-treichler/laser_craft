@@ -11,6 +11,7 @@ layout doesn't self-overlap. No algorithm can guarantee a single-piece result
 are known), so the objective is to minimise island count, never to succeed.
 """
 from __future__ import annotations
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -400,14 +401,84 @@ def search(pm: PolyMesh, G: nx.Graph | None = None, trials: int = 250,
     return best
 
 
-def repair(pm: PolyMesh, forest: nx.Graph, overlaps: set, max_cuts: int = 500):
-    """Greedy minimum set cover: repeatedly cut the tree arc that breaks the
-    most conflicting face-pair paths. Provably terminates - in the worst case
-    every face becomes its own island."""
+def _face_area(pm: PolyMesh, f: int) -> float:
+    """Flat area of one face, by shoelace on its 3D ring projected to its own
+    plane - which is exact, because the face is planar. Unfolding is a rigid
+    motion, so this is also its area anywhere in the net."""
+    r = np.asarray([pm.vertices[v] for v in pm.faces[f]], dtype=float)
+    # Newell: |sum of cross products| / 2 is the area of any planar polygon in
+    # 3D, with no need to pick a projection plane and no risk of picking one
+    # the polygon is edge-on to.
+    n = np.cross(r - r.mean(0), np.roll(r, -1, axis=0) - r.mean(0)).sum(0)
+    return 0.5 * float(np.linalg.norm(n))
+
+
+def _side_areas(forest: nx.Graph, face_area: dict) -> dict:
+    """For every arc of the forest, the face area on each side of it.
+
+    One rooted DFS per component gives all of them at once. Removing an arc of
+    a tree always yields exactly two pieces, and the piece below the child is
+    just its subtree - so the areas both cuts would produce are a post-order
+    sum, O(n) for the whole forest rather than O(n) per candidate arc.
+    """
+    out = {}
+    for comp in nx.connected_components(forest):
+        sub = forest.subgraph(comp)
+        root = next(iter(comp))
+        total = sum(face_area[f] for f in comp)
+        below = {f: face_area[f] for f in comp}
+        # A DFS preorder lists a parent's arc before any of its children's, so
+        # walking it backwards finalises every child before its parent is used.
+        for parent, child in reversed(list(nx.dfs_edges(sub, root))):
+            below[parent] += below[child]
+        for parent, child in nx.dfs_edges(sub, root):
+            out[(min(parent, child), max(parent, child))] = (
+                below[child], total - below[child])
+    return out
+
+
+def repair(pm: PolyMesh, forest: nx.Graph, overlaps: set, max_cuts: int = 500,
+           splinter_width: float = 0.0, weights=None):
+    """Cut tree arcs until nothing overlaps, preferring cuts that leave
+    islands somebody can actually hold.
+
+    Greedy set cover over the conflicting face-pair paths: every overlap is
+    resolved by cutting SOME arc on the path between the two faces, so the
+    paths are the sets and the arcs are the elements. Provably terminates - in
+    the worst case every face becomes its own island.
+
+    With `splinter_width` set this becomes the WEIGHTED greedy, choosing by
+    coverage per unit cost rather than coverage alone. That matters more than
+    it sounds: repair is where pikachu's splinters come from - 25 extra cuts
+    against 0-1 from bed splitting - precisely because the unweighted rule has
+    no idea what the islands it leaves behind look like, and will happily slice
+    a two-face tab off the edge of a panel if that tab happens to lie on three
+    conflicting paths.
+
+    The cost of an arc is what cutting it does to the net: one more island, a
+    new seam twice the arc's length, and - dominant - whatever splinter
+    penalty the two halves incur that the whole did not. Judged on the
+    equal-area circle, which is an upper bound on inscribed width, so this
+    sees a splinter it is about to make but can miss one it already has. A
+    guide for choosing between arcs, never a verdict on the result.
+
+    Coverage per unit cost is the standard weighted set-cover greedy and keeps
+    its logarithmic guarantee; taking cheapest-first instead would resolve
+    nothing, and coverage-first is what we already have.
+    """
+    from .cost import Weights, area_width, splinter_penalty
+
     forest = forest.copy()
+    w = weights or Weights()
     cuts = 0
     pos, _ = _forest_positions(pm, forest)
     bad = overlaps
+
+    face_area, ref = {}, 1.0
+    if splinter_width > 0:
+        face_area = {f: _face_area(pm, f) for f in forest}
+        ref = math.sqrt(max(sum(face_area.values()), 1e-9))
+
     while bad and cuts < max_cuts:
         cover: dict[tuple[int, int], int] = {}
         for a, b in bad:
@@ -420,11 +491,153 @@ def repair(pm: PolyMesh, forest: nx.Graph, overlaps: set, max_cuts: int = 500):
                 cover[key] = cover.get(key, 0) + 1
         if not cover:
             break
-        forest.remove_edge(*max(cover, key=cover.get))
+
+        if splinter_width <= 0:
+            pick = max(cover, key=cover.get)
+        else:
+            sides = _side_areas(forest, face_area)
+            best, pick = None, None
+            for key, n in cover.items():
+                a_below, a_above = sides.get(key, (0.0, 0.0))
+                whole = splinter_penalty(area_width(a_below + a_above),
+                                         splinter_width, w.splinter_power)
+                made = (splinter_penalty(area_width(a_below), splinter_width,
+                                         w.splinter_power)
+                        + splinter_penalty(area_width(a_above), splinter_width,
+                                           w.splinter_power))
+                length = forest[key[0]][key[1]].get("length", 0.0)
+                price = (w.island
+                         + w.splinter * max(0.0, made - whole)
+                         + w.seam * 2.0 * length / ref)
+                value = n / price
+                # Ties go to the arc that covers more, which is the rule this
+                # degenerates to when every cut costs the same.
+                if best is None or (value, n) > best:
+                    best, pick = (value, n), key
+
+        forest.remove_edge(*pick)
         cuts += 1
         pos, _ = _forest_positions(pm, forest)
         bad = overlapping_pairs(forest, pos)
     return forest, pos, bad, cuts
+
+
+def _neck_count(pm: PolyMesh, nodes, sub_pos, width: float) -> int:
+    """Near-pinches in one placed component. Deferred import: layout owns the
+    measurement and imports this module, so it cannot be imported at the top."""
+    from .layout import narrow_necks
+    import shapely
+    from shapely.ops import unary_union
+    polys = []
+    for f in nodes:
+        q = Polygon(sub_pos[f])
+        if not q.is_valid:
+            q = q.buffer(0)
+        polys.append(shapely.set_precision(q, 1e-9))
+    return narrow_necks(unary_union(polys), width)
+
+
+def reattach(pm: PolyMesh, G: nx.Graph, forest: nx.Graph,
+             pos: dict[int, np.ndarray], max_rounds: int = 4,
+             neck_width: float = 0.0):
+    """Put back every cut that has stopped being necessary.
+
+    Greedy set cover cuts an arc because some pair of faces overlapped through
+    it AT THAT MOMENT. Later cuts in the same run routinely resolve the same
+    conflict from the other end, and nothing ever goes back to check - so the
+    net keeps a seam, and often a whole island, that no longer pays for
+    anything. That is where pikachu's confetti comes from: repair makes 25
+    cuts and is not allowed to regret any of them.
+
+    So: for every dual arc that currently separates two components, try
+    welding along it and keep the weld if the merged island does not overlap
+    itself and still fits the bed. Smallest island first, because welding a
+    splinter away is worth more than shortening a seam.
+
+    Every accepted weld strictly improves the net - one fewer island, one
+    fewer seam, and a splinter penalty that can only fall, because the merged
+    island contains both halves. So this cannot make things worse and needs no
+    cost function to tell it when to stop.
+
+    `neck_width` guards the one way a weld could make things worse: an island
+    that wraps around and rejoins itself through a near-single-point pinch is
+    one piece topologically and two physically, and rejoining two halves is
+    how such a pinch gets made. It refuses any weld whose merged island has
+    more necks than its two halves had between them.
+
+    It is OFF by default, because it was measured and does not pay. On the
+    whole corpus it changes only pikachu, and there it buys **3 necks** (102
+    down to 99) for **3 splinters** (2 up to 5) and four extra islands. Welding
+    turns out to create very few new pinches - most of the rise from the 90 of
+    the unwelded net is the same necks living in fewer, larger islands - so the
+    guard mostly just refuses good welds. Kept, exposed and documented rather
+    than deleted, because it is the right instrument if a model ever does tear
+    there; the default is a statement about this corpus, not about the idea.
+
+    It does NOT check the bed, and must not: before split_to_fit an island is
+    routinely larger than a sheet - that is what split_to_fit is for - so a
+    bed test here would reject nearly every weld on a big model. Rejoining
+    more of the tree hands the splitter more freedom, not less, and the
+    splitter is provably maximal for whatever tree it is given. So this runs
+    before it. Returns (forest, pos, welds).
+    """
+    forest = forest.copy()
+    welds = 0
+    for _round in range(max_rounds):
+        comps = [set(c) for c in nx.connected_components(forest)]
+        comp_of = {f: i for i, c in enumerate(comps) for f in c}
+        area = {i: sum(_face_area(pm, f) for f in c) for i, c in enumerate(comps)}
+
+        # candidate arcs: those the net currently cuts. Smallest island first.
+        cands = []
+        for a, b in G.edges:
+            if forest.has_edge(a, b):
+                continue
+            ca, cb = comp_of.get(a), comp_of.get(b)
+            if ca is None or cb is None or ca == cb:
+                continue
+            cands.append((min(area[ca], area[cb]), a, b))
+        cands.sort(key=lambda t: t[0])
+
+        made = 0
+        for _size, a, b in cands:
+            if not forest.has_node(a) or not forest.has_node(b):
+                continue
+            if nx.has_path(forest, a, b):
+                continue            # an earlier weld this round already joined them
+            side_a = set(nx.node_connected_component(forest, a))
+            forest.add_edge(a, b, **G[a][b])
+            nodes = nx.node_connected_component(forest, a)
+            sub = forest.subgraph(nodes)
+            root = min(nodes)
+            try:
+                sub_pos = unfold_tree(pm, sub, root)
+            except ValueError:
+                forest.remove_edge(a, b)
+                continue
+            ok = not overlapping_pairs(sub, sub_pos)
+            if ok and neck_width > 0:
+                # Measure both halves in the MERGED placement. Each half keeps
+                # its own tree, so the merge moves it by a rigid motion, and a
+                # rigid motion cannot change a neck count - which means the
+                # before and after measurements need no second placement and
+                # cannot drift apart. The stale per-round component map would
+                # have been wrong here: earlier welds in the same round have
+                # already changed what a is joined to.
+                side_b = nodes - side_a
+                before = (_neck_count(pm, side_a, sub_pos, neck_width)
+                          + _neck_count(pm, side_b, sub_pos, neck_width))
+                ok = _neck_count(pm, nodes, sub_pos, neck_width) <= before
+            if ok:
+                welds += 1
+                made += 1
+            else:
+                forest.remove_edge(a, b)
+        if not made:
+            break
+
+    pos, _ = _forest_positions(pm, forest)
+    return forest, pos, welds
 
 
 def split_island(isl: Island, f0: int, f1: int, new_id: int, new_seam: int):
@@ -848,22 +1061,36 @@ def cut_arcs(G_full: nx.Graph, forest: nx.Graph) -> list:
 def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
            max_size: tuple[float, float] | None = None,
            forced_cuts: set = (), forced_folds: set = (),
-           verbose: bool = False):
+           verbose: bool = False, splinter_width: float = 0.0,
+           neck_width: float = 0.0, weights=None):
     """Full unfold: search, repair overlaps, then split anything too big.
 
     max_size is the island limit in mm, which should already have room
     subtracted for glue tabs and kerf - Blender's addon tests the bare island
     against the full page and then adds flaps afterwards, which is why its
     output sometimes still overflows.
+
+    `splinter_width` (`Material.splinter_width`) turns on the cost-aware
+    repair. It is a parameter rather than a Material because the core solver
+    has no business knowing about flutes and kerfs, and because passing 0
+    gives back the old unweighted behaviour exactly - which is what makes the
+    two comparable on the bench.
     """
     G_full = pm.dual_graph()
     G, notes = apply_constraints(G_full, forced_cuts, forced_folds)
 
     forest, pos, bad, used = search(pm, G, trials=trials, seed=seed,
                                     verbose=verbose, max_size=max_size)
-    extra = 0
+    extra = welds = 0
     if bad:
-        forest, pos, bad, extra = repair(pm, forest, bad)
+        forest, pos, bad, extra = repair(pm, forest, bad,
+                                         splinter_width=splinter_width,
+                                         weights=weights)
+        # Greedy cover cannot regret a cut, and later cuts routinely make an
+        # earlier one pointless. Only worth running where repair actually ran.
+        forest, pos, welds = reattach(pm, G, forest, pos,
+                                      neck_width=neck_width)
+        bad = overlapping_pairs(forest, pos)
 
     splits = oversize = 0
     bed_arcs = []
@@ -877,7 +1104,8 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
     # seams are reported against the full dual so forced cuts still get tabs
     islands = build_islands(pm, G_full, forest, pos)
     report = dict(cut_arcs=cut_arcs(G_full, forest), bed_cut_arcs=bed_arcs,
-                  trials_used=used, extra_cuts=extra, size_splits=splits,
+                  trials_used=used, extra_cuts=extra, rewelds=welds,
+                  size_splits=splits,
                   islands=len(islands), unresolved=len(bad),
                   oversize_islands=oversize, notes=notes,
                   isometry_error=isometry_error(pm, pos))

@@ -79,7 +79,8 @@ def measure(name, tm, mat, height_mm, trials, seed):
     limit = (mat.usable_bed[0] - pad, mat.usable_bed[1] - pad)
 
     t0 = time.perf_counter()
-    islands, rep = unfold(pm, trials=trials, seed=seed, max_size=limit)
+    islands, rep = unfold(pm, trials=trials, seed=seed, max_size=limit,
+                          splinter_width=mat.splinter_width)
     t_unfold = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -103,6 +104,12 @@ def measure(name, tm, mat, height_mm, trials, seed):
     return dict(
         model=name, faces=len(pm.faces), islands=len(islands),
         splinters=sum(1 for w in widths if w < mat.splinter_width),
+        # Count alone is misleading and it took eight pikachu nets to see it:
+        # the one with the FEWEST pieces under 15 mm had ten of them under 5,
+        # while the one with the most had five, the rest a buildable 8-14 mm.
+        # Ranking by `splinters` puts the unbuildable net first, so the table
+        # has to show the shape of the distribution, not just its size.
+        tiny=sum(1 for w in widths if w < mat.splinter_width / 3.0),
         min_width=round(min(widths), 1) if widths else 0.0,
         med_width=round(float(np.median(widths)), 1) if widths else 0.0,
         necks=necks, sheets=sheets, oversize=len(over),
@@ -116,13 +123,15 @@ def measure(name, tm, mat, height_mm, trials, seed):
 
 
 COLS = [("model", "%-11s"), ("faces", "%5d"), ("islands", "%7d"),
-        ("splinters", "%9d"), ("min_width", "%9.1f"), ("necks", "%5d"),
+        ("splinters", "%9d"), ("tiny", "%4d"), ("min_width", "%9.1f"),
+        ("necks", "%5d"),
         ("sheets", "%6d"), ("util", "%5.1f"), ("seam_mm", "%7d"),
         ("extra_cuts", "%10d"), ("mirrored", "%8d"),
         ("t_unfold", "%8.2f"), ("t_pack", "%6.2f")]
 # Lower is better for all of these; util is the one that wants to go up.
 BETTER_UP = {"util"}
-WATCH = ["islands", "splinters", "sheets", "util", "seam_mm", "extra_cuts",
+WATCH = ["islands", "splinters", "tiny", "sheets", "util", "seam_mm",
+         "extra_cuts",
          "mirrored"]
 
 
@@ -151,6 +160,11 @@ def deltas(new, old):
             continue
         bits = []
         for k in WATCH:
+            if k not in b:
+                # A baseline saved before this column existed is a normal
+                # thing to diff against - it must report what it can, not
+                # refuse the whole comparison over one missing key.
+                continue
             d = r[k] - b[k]
             if abs(d) < (0.05 if isinstance(d, float) else 1):
                 continue

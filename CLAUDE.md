@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 236 core invariants (~85 s)
+python -m pytest tests -q               # 252 core invariants (~90 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -60,19 +60,22 @@ moves several of these in opposite directions at once - fewer sheets can cost
 splinters, fewer islands can cost a sheet - so a claim about it is a claim
 about this table, not about one number.
 
-The baseline that starts the work (200 mm, 300x300 bed, gap 1, tabs off):
+Where it started (200 mm, 300x300 bed, gap 1, tabs off) and where Phase 2
+left it:
 
-| model | islands | splinters | min width | necks | sheets | repair cuts |
-|---|---|---|---|---|---|---|
-| pikachu | 26 | **12** | **3.1 mm** | 90 | 2 | 25 |
-| torus | 57 | 0 | 63.4 | 78 | 21 | 4 |
-| annulus | 35 | 0 | 32.9 | 0 | 13 | 1 |
-| icosphere2 | 9 | 0 | 26.8 | 0 | 4 | 0 |
+| model | islands | splinters | tiny | sheets | seam mm |
+|---|---|---|---|---|---|
+| pikachu | 26 -> **7** | 12 -> **2** | 4 -> 1 | 2 -> *3* | 6998 -> 6058 |
+| torus | 57 -> 53 | 0 | 0 | 21 -> *22* | 32858 -> 31906 |
+| annulus | 35 -> 34 | 0 | 0 | 13 | 16949 -> 16712 |
+| icosphere2 | 9 | 0 | 0 | 4 | 9976 |
 
-Half of pikachu's islands cannot be held, and **repair is where they come
-from**: 25 extra cuts against 0-1 from bed splitting. `repair` is greedy set
-cover over conflicting paths with no idea what the islands it leaves behind
-look like.
+Half of pikachu's islands could not be held, and **repair was where they came
+from**: 25 extra cuts against 0-1 from bed splitting. The sheet each model
+gave up is the trade the priority ordering asks for - splinters first, then
+sheets - and it is a packing problem, not an unfolding one: 7 large islands
+pack to 26% of a sheet where 26 small ones reached 39%. Fracturing islands to
+pack better is a separate lever and belongs after a better packer.
 
 **A splinter is measured by `layout.inscribed_width`, not by area.** The
 largest circle that fits is the honest answer to "can I hold this while the
@@ -83,6 +86,48 @@ one. An L with 8 mm legs measures 9.4 mm, because the inner corner holds a
 bigger circle than either leg, and that is the right answer: the piece has
 somewhere to grip. `Material.splinter_width` is 15 mm and is a statement about
 fingers, so it is tunable.
+
+**Regret is the biggest single lever in the whole solver.** Greedy set cover
+cuts an arc because two faces overlapped *through it at that moment*, and
+later cuts in the same run routinely resolve the same conflict from the other
+end. Nothing ever went back to check, so the net kept a seam - and usually a
+whole island - that had stopped paying for anything. `unfold.reattach` is that
+check: for every dual arc still separating two components, try welding along
+it and keep the weld when the merged island does not overlap itself. On
+pikachu that is **26 islands to 7 and 12 splinters to 2**, more than every
+other optimiser change put together.
+
+It needs no cost function to know when to stop, because every weld it keeps is
+strictly an improvement - one fewer island, one fewer seam, and a splinter
+penalty that can only fall, since the merged island contains both halves. It
+runs to a fixed point (`test_reattach_has_nothing_left_to_do_the_second_time`)
+and only where `repair` actually ran.
+
+Two things it must not do. It must **not check the bed**: before
+`split_to_fit` an island is routinely bigger than a sheet - that is what the
+splitter is for - so a bed test here refuses nearly every weld on a large
+model, and rejoining more of the tree hands the (provably maximal) splitter
+more freedom rather than less. And its neck guard is **off by default**: an
+island that wraps round and rejoins itself through a near-pinch is one piece
+topologically and two physically, so refusing a weld that creates one sounds
+obviously right - measured, it changes only pikachu, and there it buys 3 necks
+(102 -> 99) for 3 splinters (2 -> 5) and four extra islands. Welding creates
+very few new pinches; most of the rise is the same necks living in fewer,
+larger islands. The parameter stays, documented, for the model that does tear.
+
+**Cost-aware repair is the small half of that story, and worth knowing how
+small.** `repair` now takes `splinter_width` and becomes the WEIGHTED greedy -
+coverage per unit cost rather than coverage alone, where an arc's cost is one
+more island, a seam twice its length, and the splinter penalty the two halves
+incur that the whole did not. It disagrees with the unweighted rule on **19 of
+pikachu's 25 cuts** and still ends at the same cut count, because by the last
+few steps *every* arc on a conflicting path makes a sliver - at steps 22-24 all
+ten remaining candidates priced identically at ~46. The choice repair is given
+is constrained by the tree, so the tree is the lever (Phase 3), and regret is
+what recovers what the tree cost. It is on wherever a Material is in hand, and
+`splinter_width=0` reproduces the old rule exactly, which is what makes the
+two comparable on the bench. The side areas it prices with come from one
+rooted DFS per component (`_side_areas`), not one traversal per candidate arc.
 
 **"Low poly" in a filename is not a fact.** The spartan helmet is **499,992
 triangles** and the coplanar merge removes only 18% of them - it is a smooth
@@ -109,6 +154,25 @@ because there is no other way to see a complexity change, with a 10x margin so
 it does not flap on a slow machine.
 
 ## Things that will bite you
+
+**Splinter COUNT ranks the unbuildable net first.** Measured over eight
+pikachu nets: the one with the FEWEST pieces under 15 mm - 15 of them - had
+ten of those under 5 mm, while the one with the most, 22, had only five, the
+rest sitting between 8 and 14 mm, fiddly but buildable. So `cost.score_islands`
+SUMS a steep per-island penalty rather than counting, and `bench.py` carries a
+`tiny` column (under a third of `splinter_width`) beside `splinters`. A table
+that shows only the count is not enough to rank two nets by.
+
+`cardboard_unfolder/cost.py` is the one number the optimiser minimises, and
+every weight in it is a judgement about building these things by hand, so each
+is named, tunable and reported alongside the total - a score with no breakdown
+is unfalsifiable. Two tiers: `quick=True` never touches shapely and judges a
+splinter by the equal-area circle `2*sqrt(A/pi)`, which is a genuine UPPER
+bound on the inscribed width, so it can miss a splinter but never invent one
+(`test_the_equal_area_circle_is_an_upper_bound_on_what_fits`). Safe as a
+filter, useless as a verdict. **Sheets are counted, never estimated**: total
+island area is conserved wherever the net is cut, so any area-based sheet
+estimate is the same constant for every candidate and ranks nothing at all.
 
 **Unfolding is exact, not approximate.** Planar faces unfold by rigid motion;
 edge lengths survive to ~1e-15. There is no solver. Parameterisation tools

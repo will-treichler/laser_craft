@@ -45,11 +45,13 @@ def run(mesh_path, outdir, material: Material | None = None,
     pad = 2 * mat.tab_depth + 2 * mat.kerf
     limit = (mat.usable_bed[0] - pad, mat.usable_bed[1] - pad)
 
-    islands, rep = unfold(pm, trials=trials, seed=seed,
-                          max_size=limit, verbose=verbose)
+    islands, rep = unfold(pm, trials=trials, seed=seed, max_size=limit,
+                          verbose=verbose,
+                          splinter_width=mat.splinter_width)
     log(f"unfolded: {rep['islands']} island(s), isometry error "
         f"{rep['isometry_error']:.1e}, {rep['trials_used']} trial(s), "
-        f"{rep['extra_cuts']} repair cut(s), {rep['size_splits']} bed split(s)")
+        f"{rep['extra_cuts']} repair cut(s), {rep['rewelds']} re-weld(s), "
+        f"{rep['size_splits']} bed split(s)")
     if rep["unresolved"]:
         log(f"  ! {rep['unresolved']} overlap(s) could not be resolved")
 

@@ -25,6 +25,8 @@ from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs
                                        search, min_rect_size, min_area_rect, fits,
                                        split_to_fit, split_island, unfold_tree,
                                        join_islands, cut_arcs,
+                                       reattach, repair, _side_areas,
+                                       _face_area,
                                        mirrored_faces, _face_local)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
                                       apply_relief, offset_cut,
@@ -600,6 +602,100 @@ def test_a_face_cut_off_on_every_side_is_still_an_island():
     assert len(alone) == 1, "the isolated face is its own island"
     assert sum(len(i.faces) for i in islands) == len(pm.faces), \
         "and no face went missing"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_the_equal_area_circle_is_an_upper_bound_on_what_fits(name, tm):
+    """The cheap tier's whole licence to exist.
+
+    `area_width` judges a splinter from area alone, which is only safe because
+    no shape of area A holds a circle wider than the one of area A - so it can
+    miss a splinter but never invent one. Inside a search that means it is
+    usable as a filter and useless as a verdict, and if the inequality ever
+    went the other way the optimiser would start cutting away islands that are
+    perfectly holdable.
+    """
+    from cardboard_unfolder.cost import area_width, island_area
+    from cardboard_unfolder.layout import inscribed_width
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, trials=30)
+    for isl in islands:
+        bound = area_width(island_area(isl))
+        real = inscribed_width(isl.outline(), tol=0.01)
+        assert real <= bound + 1e-6, (
+            f"island {isl.id} holds {real:.3f} mm but the area bound says "
+            f"{bound:.3f} mm")
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_reattach_never_makes_a_net_worse(name, tm):
+    """Every weld it keeps is strictly an improvement, so this is a ratchet.
+
+    Greedy cover cuts an arc because two faces overlapped through it at that
+    moment, and later cuts routinely resolve the same conflict from the other
+    end - nothing ever went back to check. The guarantee that makes it safe to
+    run unconditionally is that a weld is only kept when the merged island does
+    not overlap itself, so it can only remove islands and seams.
+    """
+    pm = PolyMesh.from_trimesh(tm)
+    G = pm.dual_graph()
+    forest, pos, bad, _ = search(pm, G, trials=30, seed=0)
+    if bad:
+        forest, pos, bad, _ = repair(pm, forest, bad)
+    before = nx.number_connected_components(forest)
+    seam_before = sum(d.get("length", 0.0) for *_e, d in G.edges(data=True)
+                      if not forest.has_edge(*_e[:2]))
+
+    out, pos2, welds = reattach(pm, G, forest, pos)
+    after = nx.number_connected_components(out)
+    assert after == before - welds, \
+        f"{welds} weld(s) should remove exactly that many islands"
+    assert after <= before
+    assert not overlapping_pairs(out, pos2), \
+        "reattach kept a weld that overlaps"
+    assert isometry_error(pm, pos2) < 1e-6
+    assert not mirrored_faces(pm, pos2)
+    seam_after = sum(d.get("length", 0.0) for *_e, d in G.edges(data=True)
+                     if not out.has_edge(*_e[:2]))
+    assert seam_after <= seam_before + 1e-9, "welding cannot lengthen the seam"
+
+
+def test_reattach_has_nothing_left_to_do_the_second_time():
+    """It runs to a fixed point, so a caller cannot improve on it by looping.
+
+    If a second pass found more welds, the first one stopped early and the net
+    handed to bed splitting is not the one the cost function was promised.
+    """
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=2))
+    G = pm.dual_graph()
+    forest, pos, bad, _ = search(pm, G, trials=20, seed=1)
+    if bad:
+        forest, pos, bad, _ = repair(pm, forest, bad)
+    once, pos1, _ = reattach(pm, G, forest, pos)
+    twice, _, again = reattach(pm, G, once, pos1)
+    assert again == 0, f"a second pass found {again} more weld(s)"
+    assert set(map(frozenset, twice.edges)) == set(map(frozenset, once.edges))
+
+
+def test_side_areas_accounts_for_every_face_on_both_sides_of_every_arc():
+    """The number the cost-aware repair prices a cut with.
+
+    Removing an arc of a tree yields exactly two pieces, so the two side areas
+    must add up to the component - if they do not, the repair is pricing a cut
+    that does not exist, and it would do it silently.
+    """
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    G = pm.dual_graph()
+    forest, pos, _bad, _ = search(pm, G, trials=20, seed=0)
+    face_area = {f: _face_area(pm, f) for f in forest}
+    sides = _side_areas(forest, face_area)
+    assert len(sides) == forest.number_of_edges()
+    for comp in nx.connected_components(forest):
+        total = sum(face_area[f] for f in comp)
+        for a, b in forest.subgraph(comp).edges:
+            lo, hi = sides[(min(a, b), max(a, b))]
+            assert abs(lo + hi - total) < 1e-9
+            assert lo > 0 and hi > 0, "a tree arc always has faces on both sides"
 
 
 def test_the_bed_splits_are_named_and_are_part_of_the_cut_set():

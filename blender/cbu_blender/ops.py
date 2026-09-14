@@ -456,7 +456,8 @@ class CBU_OT_unfold(bpy.types.Operator):
             with cbulog.stage(T, "unfold"):
                 islands, rep = U.unfold(pm, trials=s.trials, seed=s.seed,
                                         max_size=limit, forced_cuts=cuts,
-                                        forced_folds=folds)
+                                        forced_folds=folds,
+                                        splinter_width=mat.splinter_width)
             for isl in islands:
                 log.debug("island %d: %d face(s), %.0f x %.0f mm, %.0f mm2",
                           isl.id, len(isl.faces), *isl.size(), isl.area())
