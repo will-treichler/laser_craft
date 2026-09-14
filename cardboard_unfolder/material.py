@@ -113,6 +113,13 @@ class Material:
     # edges get numbered at all - on a pikachu net the median cut edge is
     # 10.5 mm and a two-digit number at the 2 mm floor is 2.88 mm wide, so a
     # quarter needs an 11.5 mm edge and only 41% of edges have one.
+    # The smallest piece worth handing to a human. Measured as the largest
+    # circle that fits inside the part (layout.inscribed_width), not area: a
+    # 2 x 40 mm splinter and a 9 x 9 mm square have the same area and only one
+    # of them can be held while the glue sets. Empirical - it is a statement
+    # about fingers, not geometry.
+    splinter_width: float = 15.0
+
     label_edge_frac: float = 0.25
     label_folds: bool = True        # M / V beside every fold
     model_id: str = ""              # stamped on each island with its number

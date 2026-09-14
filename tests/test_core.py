@@ -5,6 +5,7 @@ Run:  python -m pytest tests -q      (or just: python tests/test_core.py)
 """
 import math
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,7 @@ from cardboard_unfolder.tabs import (place_tabs, seam_labels,
                                      fit_height, island_labels,
                                      short_id, ACROSS_FRAC)
 from cardboard_unfolder.layout import (build_parts, pack, narrow_necks,
-                                       _mls,
+                                       _mls, inscribed_width,
                                        Part, tighten, find_spot,
                                        find_pocket, free_region,
                                        seat_sheets)
@@ -546,6 +547,69 @@ def _labelled(islands, mat):
         body = apply_relief(isl.outline(), plans)
         out[isl.id] = (island_labels(isl, plans, mat, body), body)
     return out
+
+
+def test_the_coplanar_merge_does_not_rescan_per_group():
+    """A complexity regression, guarded by the clock because there is no other
+    way to see it.
+
+    Interior edges used to be recomputed inside the group loop by scanning the
+    WHOLE edge map, with an `in members` list test inside that - so the cost
+    was groups x edges x group size. It is invisible on the 300-face models
+    everything else here uses, and fatal on anything real: a UV sphere, which
+    is thousands of two-triangle coplanar groups, took **72.8 s** to merge and
+    now takes 2.9 s for byte-identical output. A 500k-triangle scan extrapolated
+    to about 40 minutes.
+
+    The bound is loose on purpose. This machine does it in ~1 s; the old code
+    needed well over ten at this size, so a 10x margin still catches a
+    reintroduction without failing on a slow CI box.
+    """
+    tm = trimesh.creation.uv_sphere(count=[40, 40])
+    t0 = time.perf_counter()
+    pm = PolyMesh.from_trimesh(tm)
+    elapsed = time.perf_counter() - t0
+
+    assert len(pm.faces) < len(tm.faces), "the merge did nothing"
+    groups = sum(1 for g in pm.source_faces if len(g) > 1)
+    assert groups > 500, f"fixture no longer has many groups ({groups})"
+    assert elapsed < 10.0, f"coplanar merge took {elapsed:.1f} s"
+
+
+def test_inscribed_width_measures_what_a_hand_can_hold():
+    """Area is the wrong measure of a fiddly part, and so is the bounding box.
+
+    The splinter penalty is built on this, so it has to mean what it says: the
+    largest circle that fits, which is the FATTEST point of the part.
+    """
+    assert inscribed_width(box(0, 0, 20, 20)) == pytest.approx(20.0, abs=0.3)
+
+    # same area, wildly different to handle
+    thin = box(0, 0, 40.0, 2.0)
+    fat = box(0, 0, math.sqrt(80.0), math.sqrt(80.0))
+    assert thin.area == pytest.approx(fat.area, rel=1e-9)
+    assert inscribed_width(thin) < 3.0 < inscribed_width(fat)
+
+    # An L with 8 mm legs measures ~9.4, not 8: the inner corner holds a bigger
+    # circle than either leg. That is the intended answer - the piece has
+    # somewhere to grip - and it is exactly the sort of thing a "min dimension"
+    # reading of this function would get wrong.
+    L = Polygon([(0, 0), (40, 0), (40, 8), (8, 8), (8, 40), (0, 40)])
+    exact = 2 * 8 * math.sqrt(2) / (1 + math.sqrt(2))
+    assert inscribed_width(L) == pytest.approx(exact, abs=0.3)
+
+    assert inscribed_width(Polygon()) == 0.0
+
+
+def test_the_splinter_floor_is_a_material_setting():
+    """It is a statement about fingers, not geometry, so it is tunable."""
+    mat = Material.from_flute("B")
+    assert mat.splinter_width > 0
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(240.0)
+    islands, _ = unfold(pm, trials=40)
+    widths = [inscribed_width(p.cut) for p in build_parts(islands, mat)]
+    assert widths and max(widths) > mat.splinter_width,         "a 240 mm sphere should give at least one properly handleable part"
 
 
 def test_short_id_keeps_short_names_and_hashes_long_ones():

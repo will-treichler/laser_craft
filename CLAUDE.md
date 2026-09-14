@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 214 core invariants (~77 s)
+python -m pytest tests -q               # 217 core invariants (~71 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -22,6 +22,9 @@ blender --background --factory-startup --python blender/test_addon.py
 python blender/test_dev.py              # 29 checks on the debug tooling
 
 python blender/dev_install.py           # symlink add-on into Blender
+
+python tools/bench.py --json base.json  # the corpus, saved
+python tools/bench.py --baseline base.json   # ...and what moved since
 ```
 
 ## Architecture
@@ -46,6 +49,64 @@ numbers → kerf → split to bed → pack → layered SVG/DXF.
 | `layout.py` | Parts, narrow-neck detection, shelf packing |
 | `export.py` | Layered SVG + DXF + manifest |
 | `strokefont.py` | Single-stroke font for engraved labels |
+
+## The optimiser, and how it is judged
+
+`tools/bench.py` is the scoreboard: a fixed corpus at a fixed seed, printing
+islands, **splinters**, min island width, necks, sheets, utilisation, seam
+length, repair cuts, mirrored faces and time. `--json` saves a run and
+`--baseline` diffs against it, marking each move better or WORSE. The optimiser
+moves several of these in opposite directions at once - fewer sheets can cost
+splinters, fewer islands can cost a sheet - so a claim about it is a claim
+about this table, not about one number.
+
+The baseline that starts the work (200 mm, 300x300 bed, gap 1, tabs off):
+
+| model | islands | splinters | min width | necks | sheets | repair cuts |
+|---|---|---|---|---|---|---|
+| pikachu | 26 | **12** | **3.1 mm** | 90 | 2 | 25 |
+| torus | 57 | 0 | 63.4 | 78 | 21 | 4 |
+| annulus | 35 | 0 | 32.9 | 0 | 13 | 1 |
+| icosphere2 | 9 | 0 | 26.8 | 0 | 4 | 0 |
+
+Half of pikachu's islands cannot be held, and **repair is where they come
+from**: 25 extra cuts against 0-1 from bed splitting. `repair` is greedy set
+cover over conflicting paths with no idea what the islands it leaves behind
+look like.
+
+**A splinter is measured by `layout.inscribed_width`, not by area.** The
+largest circle that fits is the honest answer to "can I hold this while the
+glue sets": a 2 x 40 mm splinter and a 9 x 9 mm square have the same area and
+only one of them is workable. It is the FATTEST point, deliberately - "is any
+part of it fragile" is a different question and `narrow_necks` answers that
+one. An L with 8 mm legs measures 9.4 mm, because the inner corner holds a
+bigger circle than either leg, and that is the right answer: the piece has
+somewhere to grip. `Material.splinter_width` is 15 mm and is a statement about
+fingers, so it is tunable.
+
+**"Low poly" in a filename is not a fact.** The spartan helmet is **499,992
+triangles** and the coplanar merge removes only 18% of them - it is a smooth
+scan, and there is nothing to unfold until it has been decimated. `bench.py`
+carries a triangle budget for this reason, and the add-on needs the same guard:
+right now that model would simply appear to hang.
+
+**The coplanar merge was quadratic in the wrong variable.** Interior edges were
+recomputed inside the group loop by scanning the whole edge map, with an
+`in members` LIST test inside that - groups x edges x group size. Invisible on
+the 300-face models the suite uses, fatal on anything real:
+
+| case | before | after |
+|---|---|---|
+| uv_sphere, 24,960 tri (thousands of 2-face groups) | **72.8 s** | **2.9 s** |
+| helmet, 16,000 tri | 7.2 s | 1.8 s |
+| scaling | 133 -> 450 us/tri (n^1.7) | flat ~110 us/tri |
+
+Byte-identical output. The pathology needs *many multi-face groups*, so a
+subdivided box (6 groups) barely shows it and a UV sphere shows it completely -
+worth knowing when choosing a fixture. Regression:
+`test_the_coplanar_merge_does_not_rescan_per_group`, guarded by the clock
+because there is no other way to see a complexity change, with a 10x margin so
+it does not flap on a slow machine.
 
 ## Things that will bite you
 

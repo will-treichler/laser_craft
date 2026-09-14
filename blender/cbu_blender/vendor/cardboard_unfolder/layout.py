@@ -100,6 +100,37 @@ def narrow_necks(geom, min_width: float) -> int:
     return max(0, n - 1)
 
 
+def inscribed_width(geom, tol: float = 0.25) -> float:
+    """Diameter of the largest circle that fits inside the part, in mm.
+
+    The honest measure of "can I pick this up and glue a tab to it". Area is
+    not: a 2 x 40 mm splinter and a 9 x 9 mm square have the same area and are
+    not equally handleable, and it is the splinter that gets dropped, bent and
+    sworn at. Nor is the bounding box, which says nothing about a C-shape.
+
+    This is the FATTEST point, not the thinnest - the right question for "can
+    I hold it", and deliberately not the same question as "is any part of it
+    fragile", which is what narrow_necks answers. An L with 8 mm legs measures
+    9.4 mm, because the inscribed circle at the inner corner is larger than
+    either leg: the piece has somewhere to grip even though most of it is thin.
+
+    Bisection on erosion - if buffering inward by r empties the shape then no
+    circle of radius r fits in it. About a dozen buffers, which is cheap
+    enough to score every island with.
+    """
+    if geom.is_empty:
+        return 0.0
+    x0, y0, x1, y1 = geom.bounds
+    lo, hi = 0.0, max(x1 - x0, y1 - y0) / 2.0 + tol
+    while hi - lo > tol:
+        mid = 0.5 * (lo + hi)
+        if geom.buffer(-mid).is_empty:
+            hi = mid
+        else:
+            lo = mid
+    return 2.0 * lo
+
+
 def _mls(segs) -> MultiLineString:
     """Engraved polylines, minus the ones with no length.
 
