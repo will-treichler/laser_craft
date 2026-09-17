@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 275 core invariants (~2 min)
+python -m pytest tests -q               # 284 core invariants (~100 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -67,10 +67,10 @@ it, and what `--optimise` adds on top:
 | model | islands | splinters | tiny | min width | sheets | seam mm |
 |---|---|---|---|---|---|---|
 | pikachu | 26 -> 8 -> **9** | 12 -> 2 -> **2** | 4 -> 1 -> **0** | 3.1 -> 3.3 -> **10.3** | 2 -> 3 -> **2** | 6998 -> 6176 -> 6169 |
-| annulus | 35 -> 34 -> **26** | 0 | 0 | 32.9 -> 32.9 -> **70.8** | 13 | 16949 -> 16712 -> **14786** |
+| annulus | 35 -> 34 -> **26** | 0 | 0 | 32.9 -> 32.9 -> **70.8** | 13 -> 12 -> *13* | 16949 -> 16712 -> **14786** |
 | icosphere2 | 9 -> 9 -> **8** | 0 | 0 | 26.8 | 4 | 9976 -> 9976 -> 9880 |
 | capsule | 6 -> 6 -> *7* | 0 | 0 | 38.6 -> *18.0* | 2 | 5183 -> 5183 -> **4937** |
-| torus | 57 -> 53 -> 53 | 0 | 0 | 63.4 | 21 -> 22 -> *23* | 32858 -> 31906 -> *32383* |
+| torus | 57 -> 53 -> 53 | 0 | 0 | 63.4 | 21 -> 21 -> *22* | 32858 -> 31906 -> *32383* |
 
 Half of pikachu's islands could not be held, and **repair was where they came
 from**: 25 extra cuts against 0-1 from bed splitting. Phase 2's regret pass
@@ -81,7 +81,10 @@ named below: the search cannot see sheets.
 
 `--optimise` is opt-in and the committed baseline is the plain path, because
 it costs roughly 3x the time - it has to mend each candidate before it can
-score one.
+score one. It still gives up a sheet on annulus and torus, which is the same
+one cause each time and is named below: **the search has no sheet term**. The
+raster packer took the plain path to 12 and 21 sheets there, so what the
+optimiser now trades away is a better number than it used to be beaten by.
 
 **A splinter is measured by `layout.inscribed_width`, not by area.** The
 largest circle that fits is the honest answer to "can I hold this while the
@@ -362,6 +365,46 @@ Anything measuring one piece against another must use the *pre-split* `pos`.
 then live in different frames - stack them and they appear to overlap at the
 origin, and any merge looks like it fits. This produced a convincing but
 entirely false "NOT MAXIMAL" result while developing.
+
+**Ask where a part fits, not whether it fits here.** `nest` offers each part
+a few hundred CORNER positions and `find_pocket` a few more; `raster_pack`
+cross-correlates the sheet's occupancy with the part's raster and gets the
+overlap count at **every** offset from one transform pair. The number of
+candidate positions stops being a thing to budget for, which is what every
+other packer here is really limited by. On the corpus: annulus 13 sheets to
+12, torus 22 to 21, everything else tied, and on pikachu it is also ten times
+faster than the packer it beats (0.5 s against 6.2 s).
+
+Two knobs, and neither wants turning up. **8 or 12 rotations instead of 4, and
+1 mm cells instead of 2, give identical sheet counts for 2-5x the time.** So
+the win is the question being asked, not the resolution it is asked at - and
+"a finer sweep" is exactly what plateaued before. Restarting with a jittered
+order buys one more sheet on torus (21 -> 20) for six times the work, which is
+why the single pass is what ships.
+
+**The mask must be a provable superset of the part, and dilation is not.**
+Sampling cell centres under-covers by up to a cell, and a cell is 2 mm of real
+collision. The obvious fix is to dilate the sampled grid - and a 4-connected
+dilation cannot reach the cell at a convex corner, whose only filled
+neighbour is diagonal, which is what
+`test_the_raster_mask_covers_the_whole_part` caught. Buffering by **half a
+cell diagonal** before sampling is exact instead of nearly right: the nearest
+cell centre to any point is the centre of that point's own cell, at most
+(res/2, res/2) away, so it lies inside the buffer and the cell is marked. It
+is also less conservative than a dilation, 0.71 of a cell against a whole one.
+
+`raster_mask` returns the grid's origin along with the grid, because the two
+have to agree - placing a part by one geometry's bounds while its mask came
+from another's is a silent offset, and the first version had exactly that bug.
+And `free_offsets` thresholds at 0.5, not 0: a float transform lands on
+~1e-12. `test_the_fft_collision_test_agrees_with_counting_the_overlap` checks
+the correlation against the definition at every offset, because an off-by-one
+there is a packer that quietly stacks parts on top of each other.
+
+`pack()` runs all three strategies and keeps the winner
+(`test_pack_never_loses_to_any_strategy`). The raster packer is the newest and
+least exercised, so it earns its place by that rule rather than by replacing
+anything.
 
 **Packing is not the bottleneck you would expect - part *shape* is.** On a
 pauldron split to fit the bed, every island's bounding box is 65-80% of the
@@ -1262,21 +1305,27 @@ Done: M1 (core), M4 (Blender add-on), debug tooling.
 
 Not done, roughly in value order:
 
-1. **True polygon nesting.** Packing is bbox shelving at ~36% sheet use. NFP
-   nesting is worth ~+20 points on nets this concave. Blender's own
-   `uv.pack_islands(shape_method='CONCAVE', scale=False)` already does this and
-   may be enough — see `ops.CBU_OT_pack_uv`.
+1. **A sheet term in the cost function.** The search is blind to the one
+   number after splinters that the user cares about, and it costs a sheet on
+   annulus and torus. Both cheap estimates were measured and ranked backwards
+   (see above), so this needs the real packer in the finalist stage - now
+   affordable in a way it was not, since `raster_pack` is ten times faster
+   than `pack` on pikachu.
 2. **2D seam editing.** Partly done: `cbu.edit_seam` cuts or welds the
    selected edge from the UV editor and re-unfolds, and `cbu.repack` re-nests
    on demand. Still click-to-pick only - no modal drag-along-a-path tool.
    PolyZamboni's `operators.py:890` is a working reference for Image-Editor
    modal plumbing.
-3. **Live re-unfold** on seam change.
-4. **Splitting a single oversized face.** Bed splitting only cuts along fold
+3. **Better sequences for the raster packer.** It is still greedy
+   bottom-left in decreasing-area order; jittered restarts already find one
+   more sheet on torus, and annealing over sequence and rotation is the
+   documented way past that. The collision test is no longer what limits it.
+4. **Live re-unfold** on seam change.
+5. **Splitting a single oversized face.** Bed splitting only cuts along fold
    edges, so one face bigger than the bed still fails. Needs an in-plane cut
    plus a splice — for cardboard, a glued backing strip, not an interlock.
-5. **Tab side assignment as 2-SAT** (currently greedy; skipped seams get taped).
-6. **Flute-direction constraint.** Deliberately off (`Material.lock_grain`);
+6. **Tab side assignment as 2-SAT** (currently greedy; skipped seams get taped).
+7. **Flute-direction constraint.** Deliberately off (`Material.lock_grain`);
    costume tolerance doesn't need it. Turn on if a part visibly racks.
 
 ## Conventions

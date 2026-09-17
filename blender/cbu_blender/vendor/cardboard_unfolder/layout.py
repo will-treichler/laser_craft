@@ -551,14 +551,161 @@ def shelf_pack(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
     return (sheet + 1 if fit else 0), oversized
 
 
+# The raster packer's two knobs, and neither wants turning up. Measured across
+# the corpus: 8 or 12 angles instead of 4, and 1 mm cells instead of 2, give
+# byte-identical sheet counts for 2-5x the time. The win is asking about EVERY
+# position at once rather than about a handful of corners - it is not about
+# resolution, and a finer sweep is exactly what plateaued before.
+RASTER_RES = 2.0                        # mm per cell
+RASTER_ANGLES = (0.0, 45.0, 90.0, 135.0)
+
+
+def raster_mask(geom, res: float, gap: float):
+    """A part as a binary grid, plus the grid's origin in mm.
+
+    Grown by half the gap first, so that touching in the raster means `gap`
+    apart in millimetres - half on each of two parts is a whole gap between
+    them, the same trick `find_spot` plays with its buffers, and it means the
+    collision test needs no clearance logic of its own.
+
+    Then grown again by **half a cell diagonal**, which is what makes the mask
+    a provable SUPERSET of the shape rather than a sample of it. The argument
+    is exact: the nearest cell centre to any point is the centre of that
+    point's own cell, at most (res/2, res/2) away, so it lies within
+    res*0.7071 - hence inside the second buffer - and the cell is marked. A
+    mask that under-covers would let two parts overlap by up to a cell, and a
+    cell is 2 mm of real collision on a real laser.
+
+    Dilating the sampled grid instead is the obvious move and is NOT
+    sufficient: a 4-connected dilation cannot reach the cell at a convex
+    corner, whose only filled neighbour is diagonal
+    (`test_the_raster_mask_covers_the_whole_part` catches exactly that). This
+    is also slightly less conservative than a dilation - 0.71 of a cell rather
+    than a whole one - and being conservative here is measured not to matter:
+    halving the cell size halves the padding and changes no sheet count.
+
+    The origin comes back with the mask because the two must agree. Placing a
+    part by one geometry's bounds while its mask was built from another's is
+    an offset nothing downstream would catch.
+    """
+    g = geom.buffer(gap / 2.0 + res * 0.7072)
+    x0, y0, x1, y1 = g.bounds
+    nx = max(1, int(math.ceil((x1 - x0) / res)) + 1)
+    ny = max(1, int(math.ceil((y1 - y0) / res)) + 1)
+    xs = x0 + (np.arange(nx) + 0.5) * res
+    ys = y0 + (np.arange(ny) + 0.5) * res
+    X, Y = np.meshgrid(xs, ys)
+    m = shapely.contains_xy(g, X.ravel(), Y.ravel()).reshape(ny, nx)
+    return m, x0, y0
+
+
+def free_offsets(F, shape, mask: np.ndarray) -> np.ndarray:
+    """Every grid offset at which `mask` lands on nothing, in one shot.
+
+    Cross-correlating the sheet's occupancy with the part gives the overlap
+    count at ALL offsets from a single transform pair, so the number of
+    candidate positions stops being the thing you have to budget for. That is
+    the whole idea: `_corner_candidates` offers a few hundred positions chosen
+    by a heuristic that cannot see a pocket, and this offers every one.
+
+    `F` is the occupancy already transformed - it is shared across a part's
+    rotations, which is most of the saving once there is more than one angle.
+    The 0.5 threshold is because a float transform lands on ~1e-12, not 0.
+    """
+    gh, gw = shape
+    h, w = mask.shape
+    if h > gh or w > gw:
+        return None
+    Mk = np.fft.rfft2(mask[::-1, ::-1].astype(np.float64), s=(gh, gw))
+    corr = np.fft.irfft2(F * Mk, s=(gh, gw))
+    # corr[y + h - 1, x + w - 1] is the overlap of the mask placed at (x, y)
+    return corr[h - 1:gh, w - 1:gw] < 0.5
+
+
+def raster_pack(parts: list[Part], mat: Material, res: float = RASTER_RES,
+                angles=RASTER_ANGLES) -> tuple[int, list[Part]]:
+    """True-shape bottom-left over a raster, with FFT collision.
+
+    `nest` asks "does this part fit at one of these corners"; this asks "where
+    on this sheet does this part fit at all", which is a different question and
+    a strictly larger set of answers. On the corpus it takes pikachu from 3
+    sheets to 2 and torus from 22 to 21, ties everything else, and on pikachu
+    it is also ten times faster than the packer it beats.
+
+    Rotations are rasterised once per part rather than per placement, and the
+    occupancy is transformed once per part rather than once per angle.
+    """
+    W, H = mat.usable_bed
+    gap = mat.part_gap
+    gw, gh = int(math.ceil(W / res)), int(math.ceil(H / res))
+
+    for p in parts:
+        orient_min_bbox(p)
+    oversized, fit = [], []
+    for p in parts:
+        w, h = p.size
+        if (w > W or h > H) and (h > W or w > H):
+            oversized.append(p)
+        else:
+            fit.append(p)
+    fit.sort(key=lambda p: -p.cut.area)
+
+    shapes = {id(p): [(a,) + raster_mask(affinity.rotate(p.cut, a,
+                                                         origin="centroid"),
+                                        res, gap) for a in angles]
+              for p in fit}
+
+    sheet = 0
+    occ = np.zeros((gh, gw), dtype=np.float64)
+    remaining = list(fit)
+    while remaining:
+        leftovers = []
+        for p in remaining:
+            F = np.fft.rfft2(occ, s=(gh, gw))
+            best = None
+            for ang, m, mx0, my0 in shapes[id(p)]:
+                ok = free_offsets(F, (gh, gw), m)
+                if ok is None or not ok.any():
+                    continue
+                ys, xs = np.nonzero(ok)
+                k = int(np.argmin(ys * gw + xs))        # bottom, then left
+                cand = (int(ys[k]), int(xs[k]), ang, m, mx0, my0)
+                if best is None or cand[:2] < best[:2]:
+                    best = cand
+            if best is None:
+                leftovers.append(p)
+                continue
+            gy, gx, ang, m, mx0, my0 = best
+            p.rotate(ang, origin=p.cut.centroid.coords[0])
+            # mx0/my0 are the grid's own origin, not the part's bounds - see
+            # raster_mask on why those are not the same thing.
+            p.translate(gx * res - mx0 + mat.sheet_margin,
+                        gy * res - my0 + mat.sheet_margin)
+            p.sheet = sheet
+            occ[gy:gy + m.shape[0], gx:gx + m.shape[1]] += m
+        if len(leftovers) == len(remaining):
+            break                       # nothing fits an empty sheet
+        remaining = leftovers
+        if remaining:
+            sheet += 1
+            occ = np.zeros((gh, gw), dtype=np.float64)
+
+    for p in oversized:
+        p.sheet = -1
+    return (sheet + 1 if fit else 0), oversized
+
+
 def pack(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
     """Pack onto sheets, taking whichever strategy wins on this net.
 
-    Neither strategy dominates. True-shape nesting is far better when parts
-    are small enough to share a sheet (a pauldron split to 70% of the bed:
-    9 sheets shelved, 5 nested) and worse when a greedy bottom-left placement
-    paints itself into a corner (drum12 split to 50%: 5 shelved, 10 nested).
-    Running both costs milliseconds and removes the risk entirely.
+No strategy dominates. True-shape nesting is far better when parts are small
+    enough to share a sheet (a pauldron split to 70% of the bed: 9 sheets
+    shelved, 5 nested) and worse when a greedy bottom-left placement paints
+    itself into a corner (drum12 split to 50%: 5 shelved, 10 nested).
+    `raster_pack` beats both where it wins and ties where it does not, but it
+    is the newest and the least exercised, so it earns its place by the same
+    rule as the others rather than by replacing them. Running all three
+    removes the risk entirely.
 
     Packing mutates the parts, so each strategy starts from a snapshot. The
     snapshot is references, not copies: shapely geometries are immutable and
@@ -575,7 +722,7 @@ def pack(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
 
     start_state = snap()
     trials = []
-    for fn in (shelf_pack, nest):
+    for fn in (shelf_pack, nest, raster_pack):
         restore(start_state)
         for p in parts:
             p.xform = np.eye(3)

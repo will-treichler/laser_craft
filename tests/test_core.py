@@ -1817,14 +1817,100 @@ def test_pipeline_produces_parts_that_fit_the_bed(name, tm):
         assert x1 <= m.bed[0] + 1e-6 and y1 <= m.bed[1] + 1e-6
 
 
-def test_pack_never_loses_to_either_strategy():
-    """Neither packer dominates, so pack() runs both and keeps the winner.
+def test_the_fft_collision_test_agrees_with_counting_the_overlap():
+    """The one numerical claim the raster packer rests on.
+
+    `free_offsets` says a part fits at an offset because a cross-correlation
+    came back below 0.5 - which is only the right answer if that correlation
+    really is the overlap count at that offset. It is a float transform, so it
+    lands on ~1e-12 rather than 0, and getting the index arithmetic off by one
+    would produce a packer that quietly places parts on top of each other.
+    Checked against the definition, by hand, over every offset.
+    """
+    from cardboard_unfolder.layout import free_offsets
+    rng = np.random.default_rng(3)
+    occ = (rng.random((23, 29)) < 0.25).astype(float)
+    mask = (rng.random((5, 7)) < 0.5)
+    mask[0, 0] = mask[-1, -1] = True        # pin the extent
+
+    gh, gw = occ.shape
+    h, w = mask.shape
+    got = free_offsets(np.fft.rfft2(occ, s=(gh, gw)), (gh, gw), mask)
+    assert got.shape == (gh - h + 1, gw - w + 1)
+    for y in range(gh - h + 1):
+        for x in range(gw - w + 1):
+            direct = float((occ[y:y + h, x:x + w] * mask).sum())
+            assert bool(got[y, x]) == (direct == 0.0), (
+                f"offset ({x}, {y}): correlation says "
+                f"{'free' if got[y, x] else 'blocked'}, direct count {direct}")
+
+
+def test_the_raster_mask_covers_the_whole_part():
+    """It must be a SUPERSET of the shape, never a sample of it.
+
+    Sampling cell centres alone under-covers by up to a cell, and a cell is
+    2 mm of real collision on a real laser. Dilating the sampled grid is the
+    obvious fix and is not sufficient: a 4-connected dilation cannot reach the
+    cell at a convex corner, whose only filled neighbour is diagonal - which
+    is exactly what this caught. Buffering by half a cell diagonal before
+    sampling is provable instead of nearly right.
+    """
+    import shapely
+    from cardboard_unfolder.layout import raster_mask
+    from shapely.geometry import Polygon as P
+    res, gap = 2.0, 1.0
+    # an L, so the test says something about a concave outline as well
+    geom = P([(0, 0), (40, 0), (40, 9), (9, 9), (9, 40), (0, 40)])
+    m, x0, y0 = raster_mask(geom, res, gap)
+
+    g = geom.buffer(gap / 2.0)
+    dense = shapely.get_coordinates(g.exterior.segmentize(res / 3.0))
+    for x, y in dense:
+        ix, iy = int((x - x0) / res), int((y - y0) / res)
+        assert 0 <= ix < m.shape[1] and 0 <= iy < m.shape[0], \
+            f"({x:.1f}, {y:.1f}) falls outside the grid entirely"
+        assert m[iy, ix], \
+            f"point ({x:.1f}, {y:.1f}) is outside the mask that represents it"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_the_raster_packer_leaves_no_overlap_and_nothing_off_the_sheet(name, tm):
+    from cardboard_unfolder.layout import raster_pack
+    m = Material.from_flute("B")
+    m.part_gap = 1.0
+    pad = 2 * m.tab_depth + 2 * m.kerf
+    limit = (m.usable_bed[0] - pad, m.usable_bed[1] - pad)
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(280)
+    islands, _ = unfold(pm, trials=30, max_size=limit)
+    parts = build_parts(islands, m)
+    sheets, over = raster_pack(parts, m)
+
+    placed = [p for p in parts if p.sheet >= 0]
+    for i, a in enumerate(placed):
+        for b in placed[i + 1:]:
+            if a.sheet != b.sheet:
+                continue
+            hit = a.cut.buffer(-1e-9).intersection(b.cut.buffer(-1e-9))
+            assert hit.area <= 1e-9, (
+                f"parts {a.island_id} and {b.island_id} overlap by "
+                f"{hit.area:.3f} mm2 on sheet {a.sheet}")
+    for p in placed:
+        x0, y0, x1, y1 = p.bounds
+        assert x0 >= m.sheet_margin - 1e-6 and y0 >= m.sheet_margin - 1e-6
+        assert x1 <= m.sheet_margin + m.usable_bed[0] + 1e-6
+        assert y1 <= m.sheet_margin + m.usable_bed[1] + 1e-6
+
+
+def test_pack_never_loses_to_any_strategy():
+    """No packer dominates, so pack() runs all three and keeps the winner.
 
     Nesting is far better when parts can share a sheet and worse when its
     greedy placement paints itself into a corner - measured both ways on real
-    nets. This is the property that makes adding it safe.
+    nets. The raster packer beats both where it wins and ties where it does
+    not. This is the property that makes adding any of them safe.
     """
-    from cardboard_unfolder.layout import shelf_pack, nest as nest_fn
+    from cardboard_unfolder.layout import (shelf_pack, nest as nest_fn,
+                                           raster_pack)
     m = Material.from_flute("B")
     pad = 2 * m.tab_depth + 2 * m.kerf
     for tm, frac in ((trimesh.creation.icosphere(subdivisions=1), 1.0),
@@ -1837,11 +1923,14 @@ def test_pack_never_loses_to_either_strategy():
         a = build_parts(islands, m)
         b = build_parts(islands, m)
         c = build_parts(islands, m)
+        d = build_parts(islands, m)
         s_shelf, _ = shelf_pack(a, m)
         s_nest, _ = nest_fn(b, m)
-        s_pack, _ = pack(c, m)
-        assert s_pack <= min(s_shelf, s_nest), (
-            f"pack used {s_pack} sheets, shelf {s_shelf}, nest {s_nest}")
+        s_rast, _ = raster_pack(c, m)
+        s_pack, _ = pack(d, m)
+        assert s_pack <= min(s_shelf, s_nest, s_rast), (
+            f"pack used {s_pack} sheets, shelf {s_shelf}, nest {s_nest}, "
+            f"raster {s_rast}")
 
 
 def test_nested_parts_do_not_overlap():
