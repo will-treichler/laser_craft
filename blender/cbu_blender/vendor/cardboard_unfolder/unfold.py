@@ -132,48 +132,92 @@ def _edge_dir(ring, a: int, b: int) -> int:
     return 1 if ring[(ring.index(a) + 1) % n] == b else -1
 
 
+class _Lookup:
+    """Two dicts read as one, newest first. Cheaper than merging them when the
+    first is a handful of entries and the second is the whole net."""
+
+    __slots__ = ("a", "b")
+
+    def __init__(self, a, b):
+        self.a, self.b = a, b
+
+    def __getitem__(self, k):
+        try:
+            return self.a[k]
+        except KeyError:
+            return self.b[k]
+
+
+def place_across(pm: PolyMesh, tree: nx.Graph, pos: dict, parent: int,
+                 child: int) -> np.ndarray:
+    """Where `child` lands, given `parent` is already placed at pos[parent].
+
+    The one piece of real geometry in the unfolder, so it lives in exactly one
+    place: `unfold_tree` walks a whole component with it and `place_branch`
+    moves a single branch with it, and neither can drift from the other.
+    """
+    ev = tree[parent][child]["verts"]
+    pr, cr = pm.faces[parent], pm.faces[child]
+    if ev[0] not in pr or ev[1] not in pr or ev[0] not in cr or ev[1] not in cr:
+        raise ValueError(f"dual arc {parent}-{child} names verts not on both faces")
+
+    P2 = pos[parent][pr.index(ev[0])]
+    Q2 = pos[parent][pr.index(ev[1])]
+    d = Q2 - P2
+    d = d / np.linalg.norm(d)
+    e = np.array([-d[1], d[0]])
+
+    # Which side of the seam the child goes is a combinatorial fact, not
+    # something to infer from the geometry. Two faces of a consistently wound
+    # mesh traverse their shared edge in OPPOSITE directions, so _face_local
+    # hands each of them a signed h that already points away from the other;
+    # placing both with k = +1 puts them on opposite sides. Reading the two
+    # directions against each other rather than trusting the mesh globally
+    # also absorbs a locally flipped face.
+    #
+    # The sums of signed offsets this replaced were a centroid test, not a
+    # side test. A concave ring can have its vertex sum on the far side of its
+    # own seam, and the child was then placed on top of its parent - which is
+    # not merely an overlap but a REFLECTION, the mirror image of the true
+    # face, and it will not fold up. isometry_error cannot see it because a
+    # reflection keeps every edge length. Measured on pikachu at 150 mm: 5 of
+    # 277 faces mirrored, 7 folds back-folded, and the spurious overlaps drove
+    # repair to 32 extra cuts and 15 confetti islands of one or two faces.
+    t, h, L = _face_local(pm, child, ev[0], ev[1])
+    k = -1.0 if _edge_dir(pr, *ev) == _edge_dir(cr, *ev) else 1.0
+    return P2 + np.outer(t, d) + k * np.outer(h, e)
+
+
+def place_branch(pm: PolyMesh, tree: nx.Graph, pos: dict, parent: int,
+                 child: int, members) -> dict:
+    """Place `child` and everything beyond it, leaving the rest of pos alone.
+
+    `members` confines the walk, which is what stops it turning round and
+    re-placing the side it came from. Welding a 5-face splinter onto a
+    250-face island then costs 5 placements instead of 255 - the difference
+    between a search that can afford to score its candidates and one that
+    cannot.
+    """
+    sub = tree.subgraph(set(members) | {parent})
+    out = {child: place_across(pm, tree, pos, parent, child)}
+    # Look in the branch first, fall back to the caller's placement for the
+    # one node outside it. Copying the whole net's positions per call would
+    # cost more than the placement it is helping with.
+    view = _Lookup(out, pos)
+    for a, b in nx.bfs_edges(sub, child):
+        if b == parent:
+            continue
+        out[b] = place_across(pm, tree, view, a, b)
+    return out
+
+
 def unfold_tree(pm: PolyMesh, tree: nx.Graph, root: int) -> dict[int, np.ndarray]:
     """Place every face of one connected dual-tree component into the plane."""
-    pos: dict[int, np.ndarray] = {}
-
     ring = pm.faces[root]
-    v0, v1 = ring[0], ring[1]
-    t, h, _ = _face_local(pm, root, v0, v1)
-    pos[root] = np.column_stack([t, h])
-
+    t, h, _ = _face_local(pm, root, ring[0], ring[1])
+    pos: dict[int, np.ndarray] = {root: np.column_stack([t, h])}
     for parent, child in nx.bfs_edges(tree, root):
-        ev = tree[parent][child]["verts"]
-        pr, cr = pm.faces[parent], pm.faces[child]
-        if ev[0] not in pr or ev[1] not in pr or ev[0] not in cr or ev[1] not in cr:
-            raise ValueError(f"dual arc {parent}-{child} names verts not on both faces")
-
-        P2 = pos[parent][pr.index(ev[0])]
-        Q2 = pos[parent][pr.index(ev[1])]
-        d = Q2 - P2
-        d = d / np.linalg.norm(d)
-        e = np.array([-d[1], d[0]])
-
-        # Which side of the seam the child goes is a combinatorial fact, not
-        # something to infer from the geometry. Two faces of a consistently
-        # wound mesh traverse their shared edge in OPPOSITE directions, so
-        # _face_local hands each of them a signed h that already points away
-        # from the other; placing both with k = +1 puts them on opposite
-        # sides. Reading the two directions against each other rather than
-        # trusting the mesh globally also absorbs a locally flipped face.
-        #
-        # The sums of signed offsets this replaced were a centroid test, not a
-        # side test. A concave ring can have its vertex sum on the far side of
-        # its own seam, and the child was then placed on top of its parent -
-        # which is not merely an overlap but a REFLECTION, the mirror image of
-        # the true face, and it will not fold up. isometry_error cannot see it
-        # because a reflection keeps every edge length. Measured on pikachu at
-        # 150 mm: 5 of 277 faces mirrored, 7 folds back-folded, and the
-        # spurious overlaps drove repair to 32 extra cuts and 15 confetti
-        # islands of one or two faces.
-        t, h, L = _face_local(pm, child, ev[0], ev[1])
-        k = -1.0 if _edge_dir(pr, *ev) == _edge_dir(cr, *ev) else 1.0
-
-        pos[child] = P2 + np.outer(t, d) + k * np.outer(h, e)
+        pos[child] = place_across(pm, tree, pos, parent, child)
     return pos
 
 
@@ -344,6 +388,139 @@ def _forest_positions(pm: PolyMesh, forest: nx.Graph):
     return pos, comps
 
 
+def _trial(pm: PolyMesh, G: nx.Graph, rng) -> tuple:
+    """One randomised restart: a direction, a maximum spanning tree, its
+    placement and its overlaps. The unit both search and optimise work in."""
+    c = rng.normal(size=3)
+    c /= np.linalg.norm(c)
+    W = weighted_dual(pm, G, c, rng=rng)
+    T = nx.maximum_spanning_tree(W)
+    pos, _ = _forest_positions(pm, T)
+    return T, pos, overlapping_pairs(T, pos)
+
+
+def mend(pm: PolyMesh, G: nx.Graph, forest: nx.Graph, pos: dict,
+         bad: set, splinter_width: float = 0.0, neck_width: float = 0.0,
+         weights=None) -> tuple:
+    """Everything between a raw tree and a net that could be cut: resolve the
+    overlaps, then put back the cuts that stopped being necessary.
+
+    Returns (forest, pos, bad, extra_cuts, rewelds). Bed splitting is
+    deliberately NOT here - it depends on the bed and this does not, so a
+    caller comparing candidate trees can mend them all and split once.
+    """
+    extra = welds = 0
+    if bad:
+        forest, pos, bad, extra = repair(pm, forest, bad,
+                                         splinter_width=splinter_width,
+                                         weights=weights)
+        forest, pos, welds = reattach(pm, G, forest, pos,
+                                      neck_width=neck_width)
+        bad = overlapping_pairs(forest, pos)
+    return forest, pos, bad, extra, welds
+
+
+def optimise(pm: PolyMesh, G: nx.Graph, mat, trials: int = 60, seed: int = 0,
+             max_size: tuple | None = None, budget: int = 10,
+             finalists: int = 3, weights=None, splinter_width: float = 0.0,
+             neck_width: float = 0.0, progress=None, verbose: bool = False):
+    """Choose a tree by what the finished net costs, not by how it starts.
+
+    `search` ranks candidates by how many faces overlap, and only among the
+    trees that overlap not at all. On the models where that matters it does
+    neither job: pikachu has no clean tree in 60 restarts, so the scoring
+    branch never ran, and the tie-break it fell back on is **anti-correlated**
+    with the answer - spearman -0.3 to -0.46 against the finished cost. The
+    fewest-overlaps tree costs **+74% to +114%** more than the best of the same
+    24 candidates. Many overlaps usually means the net wraps densely, and a
+    dense wrap consolidates into a few large islands once it has been mended;
+    a tree that starts tidy is often one that ends up in fragments.
+
+    So the ranking has to happen after `mend`, and it does: the quick cost of
+    the mended net ranks candidates at spearman **+0.97** on pikachu and +0.73
+    on icosphere2, and picks the best of 16 outright. There is no cheaper
+    signal - that was looked for and `len(bad)` is the one that was there.
+
+    Which makes `budget` the whole design. Mending is what costs (1.7 s a
+    candidate on pikachu, after the incremental rewrite took it down from 17),
+    so only candidates that actually need mending are counted against it;
+    clean trees are nearly free and every restart up to `trials` gets one.
+Candidates are ranked BEFORE the bed split, which looks wrong and was
+    measured both ways. A torus unfolds to a handful of islands and leaves the
+    splitter to make 53 of them, so ranking a pre-split net there is ranking
+    almost nothing - the obvious fix is to rank after a cheap split, and it
+    costs 30% more time across the corpus and changes nothing it was meant to
+    (torus stayed at 23 sheets, its repair cuts went 6 to 15). Kept cheap.
+
+    The finalists ARE split properly and scored with the full cost, which the
+    quick tier cannot match: it bounds splinters rather than measuring them
+    and never looks at necks.
+
+    `progress(done, total, note) -> bool` is called once per candidate and
+    returning False stops the search, which then answers with the best it has.
+    A minute of silence is indistinguishable from a hang.
+    """
+    from .cost import score_islands, Weights
+
+    weights = weights or Weights()
+    if splinter_width <= 0 and mat is not None:
+        splinter_width = mat.splinter_width
+    rng = np.random.default_rng(seed)
+
+    cands, spent, used = [], 0, 0
+    for i in range(trials):
+        used = i + 1
+        T, pos, bad = _trial(pm, G, rng)
+        if bad:
+            if spent >= budget:
+                continue        # out of mending budget; a clean tree still counts
+            spent += 1
+        T, pos, bad, extra, welds = mend(pm, G, T, pos, bad,
+                                         splinter_width=splinter_width,
+                                         neck_width=neck_width,
+                                         weights=weights)
+        isl = build_islands(pm, G, T, pos)
+        q = score_islands(isl, mat, w=weights, quick=True)
+        cands.append((q.total, i, T, pos, bad, extra, welds))
+        if verbose:
+            print(f"  trial {i + 1}: {len(isl)} island(s), quick {q.total:.1f}")
+        if progress is not None and not progress(
+                i + 1, trials, f"tree {i + 1}/{trials}"):
+            break
+
+    if not cands:
+        return None
+
+    cands.sort(key=lambda c: c[0])
+    best = None
+    for rank, (_q, i, T, pos, bad, extra, welds) in enumerate(
+            cands[:max(1, finalists)]):
+        splits = oversize = 0
+        bed = []
+        if max_size is not None:
+            T, pos, splits, oversize, bed = split_to_fit(pm, T, pos, *max_size)
+            bad = overlapping_pairs(T, pos)
+        isl = build_islands(pm, G, T, pos)
+        full = score_islands(isl, mat, w=weights)
+        if verbose:
+            print(f"  finalist {rank + 1} (trial {i + 1}): {full.report()}")
+        stats = dict(extra_cuts=extra, rewelds=welds, size_splits=splits,
+                     oversize=oversize, bed=bed, cost=full.total,
+                     terms=full.terms, trial=i + 1)
+        if best is None or full.total < best[3]["cost"]:
+            best = (T, pos, bad, stats)
+        if progress is not None and not progress(
+                rank + 1, min(finalists, len(cands)),
+                f"scoring {rank + 1}"):
+            break
+
+    T, pos, bad, stats = best
+    stats["trials_used"] = used
+    stats["candidates"] = len(cands)
+    stats["mended"] = spent
+    return T, pos, bad, stats
+
+
 def search(pm: PolyMesh, G: nx.Graph | None = None, trials: int = 250,
            seed: int = 0, verbose: bool = False,
            max_size: tuple | None = None, size_candidates: int = 6):
@@ -369,12 +546,7 @@ def search(pm: PolyMesh, G: nx.Graph | None = None, trials: int = 250,
     best_clean = None               # (score, T, pos, trials_used)
     seen_clean = 0
     for i in range(trials):
-        c = rng.normal(size=3)
-        c /= np.linalg.norm(c)
-        W = weighted_dual(pm, G, c, rng=rng)
-        T = nx.maximum_spanning_tree(W)
-        pos, _ = _forest_positions(pm, T)
-        bad = overlapping_pairs(T, pos)
+        T, pos, bad = _trial(pm, G, rng)
         if not bad:
             if max_size is None:
                 if verbose:
@@ -479,7 +651,15 @@ def repair(pm: PolyMesh, forest: nx.Graph, overlaps: set, max_cuts: int = 500,
         face_area = {f: _face_area(pm, f) for f in forest}
         ref = math.sqrt(max(sum(face_area.values()), 1e-9))
 
-    while bad and cuts < max_cuts:
+    while cuts < max_cuts:
+        if not bad:
+            # The fast path below can only ever be optimistic, so "nothing
+            # overlaps any more" is not a conclusion it is allowed to reach on
+            # its own - the loop exits through a real measurement or not at all.
+            pos, _ = _forest_positions(pm, forest)
+            bad = overlapping_pairs(forest, pos)
+            if not bad:
+                break
         cover: dict[tuple[int, int], int] = {}
         for a, b in bad:
             try:
@@ -517,8 +697,27 @@ def repair(pm: PolyMesh, forest: nx.Graph, overlaps: set, max_cuts: int = 500,
 
         forest.remove_edge(*pick)
         cuts += 1
-        pos, _ = _forest_positions(pm, forest)
-        bad = overlapping_pairs(forest, pos)
+        # Cutting a tree arc moves NOTHING relative to anything in its own
+        # half - the fact split_to_fit is already built on - so the overlap
+        # set can only shrink, and only by the pairs that just landed in
+        # different components, which overlapping_pairs excludes anyway.
+        # Filtering is therefore the same answer as recomputing for a fraction
+        # of the cost: 25 placements and 25 STRtrees on a pikachu net become
+        # one or two.
+        #
+        # "Therefore" does a lot of work there, so it was measured: identical
+        # on four of five corpus models, and on pikachu 8 of 124 cuts differed
+        # by up to 6 pairs. _forest_positions RE-ROOTS every component, so the
+        # coordinates afterwards are numerically different and GEOS decides a
+        # borderline touch the other way. Hence the honest recompute at the top
+        # of the loop - the filter may end the loop early, the measurement
+        # decides whether it was right to.
+        comp_of = {}
+        for ci, comp in enumerate(nx.connected_components(forest)):
+            for f in comp:
+                comp_of[f] = ci
+        bad = {(a, b) for a, b in bad if comp_of[a] == comp_of[b]}
+    pos, _ = _forest_positions(pm, forest)
     return forest, pos, bad, cuts
 
 
@@ -537,13 +736,59 @@ def _neck_count(pm: PolyMesh, nodes, sub_pos, width: float) -> int:
     return narrow_necks(unary_union(polys), width)
 
 
+def _shrunk(pos, faces, shrink: float = 1e-6):
+    """Face polygons, pulled in slightly so that sharing an edge is not an
+    overlap. The shrink and the 1e-9 area threshold below are copied from
+    `overlapping_pairs` deliberately: two answers to the same question that
+    round differently would be worse than one slow answer."""
+    out, live = [], []
+    for f in faces:
+        q = Polygon(pos[f])
+        if not q.is_valid:
+            q = q.buffer(0)
+        q = q.buffer(-shrink * max(1.0, np.sqrt(abs(q.area))))
+        if not q.is_empty:
+            out.append(q)
+            live.append(f)
+    return out, live
+
+
+def _cross_overlaps(pos_a: dict, a_faces, host, joined: tuple) -> bool:
+    """Does any face of A land on any face of B?
+
+    Only the CROSS pairs, because A was a clean island and B was a clean
+    island and welding moves A rigidly - neither side can have started
+    overlapping itself. `joined` is the pair the weld joins, which shares an
+    edge by construction, and is excluded exactly as `overlapping_pairs`
+    excludes a forest arc; it is the only cross pair that can be one, since a
+    forest has exactly one arc across the cut it is putting back.
+
+    `host` is a prepared (polys, faces, STRtree) triple, because the island
+    being welded ONTO does not move between candidates - rebuilding its
+    polygons for each of them was 3.1 s of a 4.9 s pikachu mend.
+    """
+    pb, fb, idx = host
+    pa, fa = _shrunk(pos_a, a_faces)
+    if not pa or not pb:
+        return False
+    for i, q in enumerate(pa):
+        for j in idx.query(q):
+            j = int(j)
+            pair = (fa[i], fb[j])
+            if pair == joined or pair[::-1] == joined:
+                continue
+            if q.intersection(pb[j]).area > 1e-9:
+                return True
+    return False
+
+
 def reattach(pm: PolyMesh, G: nx.Graph, forest: nx.Graph,
              pos: dict[int, np.ndarray], max_rounds: int = 4,
              neck_width: float = 0.0):
     """Put back every cut that has stopped being necessary.
 
-    Greedy set cover cuts an arc because some pair of faces overlapped through
-    it AT THAT MOMENT. Later cuts in the same run routinely resolve the same
+    Greedy set cover cuts an arc because some pair of faces overlapped THROUGH
+    IT AT THAT MOMENT. Later cuts in the same run routinely resolve the same
     conflict from the other end, and nothing ever goes back to check - so the
     net keeps a seam, and often a whole island, that no longer pays for
     anything. That is where pikachu's confetti comes from: repair makes 25
@@ -551,8 +796,8 @@ def reattach(pm: PolyMesh, G: nx.Graph, forest: nx.Graph,
 
     So: for every dual arc that currently separates two components, try
     welding along it and keep the weld if the merged island does not overlap
-    itself and still fits the bed. Smallest island first, because welding a
-    splinter away is worth more than shortening a seam.
+    itself. Smallest island first, because welding a splinter away is worth
+    more than shortening a seam.
 
     Every accepted weld strictly improves the net - one fewer island, one
     fewer seam, and a splinter penalty that can only fall, because the merged
@@ -566,10 +811,10 @@ def reattach(pm: PolyMesh, G: nx.Graph, forest: nx.Graph,
     more necks than its two halves had between them.
 
     It is OFF by default, because it was measured and does not pay. On the
-    whole corpus it changes only pikachu, and there it buys **3 necks** (102
-    down to 99) for **3 splinters** (2 up to 5) and four extra islands. Welding
-    turns out to create very few new pinches - most of the rise from the 90 of
-    the unwelded net is the same necks living in fewer, larger islands - so the
+    whole corpus it changes only pikachu, and there it buys 3 necks (102 down
+    to 99) for 3 splinters (2 up to 5) and four extra islands. Welding turns
+    out to create very few new pinches - most of the rise from the 90 of the
+    unwelded net is the same necks living in fewer, larger islands - so the
     guard mostly just refuses good welds. Kept, exposed and documented rather
     than deleted, because it is the right instrument if a model ever does tear
     there; the default is a statement about this corpus, not about the idea.
@@ -580,15 +825,31 @@ def reattach(pm: PolyMesh, G: nx.Graph, forest: nx.Graph,
     more of the tree hands the splitter more freedom, not less, and the
     splitter is provably maximal for whatever tree it is given. So this runs
     before it. Returns (forest, pos, welds).
+
+    Everything here is incremental, and it has to be. The straightforward
+    version re-placed the entire merged component and re-intersected all of it
+    for EVERY candidate arc: 17 s a call on a pikachu net, and the single
+    reason the tree search could not afford to score its candidates with the
+    cost function that ranks them correctly.
     """
     forest = forest.copy()
+    pos = dict(pos)
     welds = 0
-    for _round in range(max_rounds):
-        comps = [set(c) for c in nx.connected_components(forest)]
-        comp_of = {f: i for i, c in enumerate(comps) for f in c}
-        area = {i: sum(_face_area(pm, f) for f in c) for i, c in enumerate(comps)}
 
-        # candidate arcs: those the net currently cuts. Smallest island first.
+    # Component bookkeeping by hand rather than through networkx. `has_path`
+    # and `node_connected_component` are both O(component) and were called
+    # once per candidate arc, which was most of the rest of the old cost.
+    comp_of, members = {}, {}
+    for ci, comp in enumerate(nx.connected_components(forest)):
+        members[ci] = set(comp)
+        for f in comp:
+            comp_of[f] = ci
+
+    face_area = {f: _face_area(pm, f) for f in forest}
+    area = {ci: sum(face_area[f] for f in c) for ci, c in members.items()}
+    geo = {}            # comp -> (polys, faces, STRtree), dropped when it moves
+
+    for _round in range(max_rounds):
         cands = []
         for a, b in G.edges:
             if forest.has_edge(a, b):
@@ -601,38 +862,49 @@ def reattach(pm: PolyMesh, G: nx.Graph, forest: nx.Graph,
 
         made = 0
         for _size, a, b in cands:
-            if not forest.has_node(a) or not forest.has_node(b):
-                continue
-            if nx.has_path(forest, a, b):
-                continue            # an earlier weld this round already joined them
-            side_a = set(nx.node_connected_component(forest, a))
+            ca, cb = comp_of.get(a), comp_of.get(b)
+            if ca is None or cb is None or ca == cb:
+                continue        # an earlier weld this round already joined them
+            # Move the SMALLER side onto the larger. The big island keeps the
+            # coordinates it already had, so nothing else in the net shifts,
+            # and the placement work is proportional to the splinter being
+            # welded on rather than to the panel it is welded to.
+            if len(members[ca]) > len(members[cb]):
+                a, b, ca, cb = b, a, cb, ca
+            moving, host = members[ca], members[cb]
+
             forest.add_edge(a, b, **G[a][b])
-            nodes = nx.node_connected_component(forest, a)
-            sub = forest.subgraph(nodes)
-            root = min(nodes)
             try:
-                sub_pos = unfold_tree(pm, sub, root)
+                new = place_branch(pm, forest, pos, b, a, moving)
             except ValueError:
                 forest.remove_edge(a, b)
                 continue
-            ok = not overlapping_pairs(sub, sub_pos)
+
+            hg = geo.get(cb)
+            if hg is None:
+                hp, hf = _shrunk(pos, host)
+                hg = geo[cb] = (hp, hf, STRtree(hp) if hp else None)
+            ok = not _cross_overlaps(new, moving, hg, (a, b))
             if ok and neck_width > 0:
-                # Measure both halves in the MERGED placement. Each half keeps
-                # its own tree, so the merge moves it by a rigid motion, and a
-                # rigid motion cannot change a neck count - which means the
-                # before and after measurements need no second placement and
-                # cannot drift apart. The stale per-round component map would
-                # have been wrong here: earlier welds in the same round have
-                # already changed what a is joined to.
-                side_b = nodes - side_a
-                before = (_neck_count(pm, side_a, sub_pos, neck_width)
-                          + _neck_count(pm, side_b, sub_pos, neck_width))
-                ok = _neck_count(pm, nodes, sub_pos, neck_width) <= before
-            if ok:
-                welds += 1
-                made += 1
-            else:
+                trial = dict(pos)
+                trial.update(new)
+                before = (_neck_count(pm, moving, trial, neck_width)
+                          + _neck_count(pm, host, trial, neck_width))
+                ok = _neck_count(pm, moving | host, trial, neck_width) <= before
+            if not ok:
                 forest.remove_edge(a, b)
+                continue
+
+            pos.update(new)
+            geo.pop(cb, None)           # it has grown; its index is stale now
+            geo.pop(ca, None)
+            members[cb] = host | moving
+            area[cb] += area[ca]
+            for f in moving:
+                comp_of[f] = cb
+            del members[ca], area[ca]
+            welds += 1
+            made += 1
         if not made:
             break
 
@@ -1062,7 +1334,8 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
            max_size: tuple[float, float] | None = None,
            forced_cuts: set = (), forced_folds: set = (),
            verbose: bool = False, splinter_width: float = 0.0,
-           neck_width: float = 0.0, weights=None):
+           neck_width: float = 0.0, weights=None, mat=None,
+           budget: int = 10, finalists: int = 3, progress=None):
     """Full unfold: search, repair overlaps, then split anything too big.
 
     max_size is the island limit in mm, which should already have room
@@ -1075,37 +1348,50 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
     has no business knowing about flutes and kerfs, and because passing 0
     gives back the old unweighted behaviour exactly - which is what makes the
     two comparable on the bench.
+
+    `mat` turns on the cost-driven tree search (`optimise`), which needs a
+    whole Material because the cost function does - the bed, the splinter
+    threshold, the board. Without it the old `search` runs, ranking candidates
+    by overlap count, which is measurably the wrong way round; both paths are
+    kept for exactly that comparison. `progress(done, total, note) -> bool`
+    reports through the search and cancels it by returning False.
     """
     G_full = pm.dual_graph()
     G, notes = apply_constraints(G_full, forced_cuts, forced_folds)
 
-    forest, pos, bad, used = search(pm, G, trials=trials, seed=seed,
-                                    verbose=verbose, max_size=max_size)
-    extra = welds = 0
-    if bad:
-        forest, pos, bad, extra = repair(pm, forest, bad,
-                                         splinter_width=splinter_width,
-                                         weights=weights)
-        # Greedy cover cannot regret a cut, and later cuts routinely make an
-        # earlier one pointless. Only worth running where repair actually ran.
-        forest, pos, welds = reattach(pm, G, forest, pos,
-                                      neck_width=neck_width)
-        bad = overlapping_pairs(forest, pos)
+    cost = None
+    if mat is not None:
+        forest, pos, bad, st = optimise(
+            pm, G, mat, trials=trials, seed=seed, max_size=max_size,
+            budget=budget, finalists=finalists, weights=weights,
+            splinter_width=splinter_width, neck_width=neck_width,
+            progress=progress, verbose=verbose)
+        used, extra, welds = st["trials_used"], st["extra_cuts"], st["rewelds"]
+        splits, oversize, bed = st["size_splits"], st["oversize"], st["bed"]
+        cost = st["cost"]
+    else:
+        forest, pos, bad, used = search(pm, G, trials=trials, seed=seed,
+                                        verbose=verbose, max_size=max_size)
+        forest, pos, bad, extra, welds = mend(pm, G, forest, pos, bad,
+                                              splinter_width=splinter_width,
+                                              neck_width=neck_width,
+                                              weights=weights)
+        splits = oversize = 0
+        bed = []
+        if max_size is not None:
+            forest, pos, splits, oversize, bed = split_to_fit(pm, forest, pos,
+                                                              *max_size)
+            bad = overlapping_pairs(forest, pos)
 
-    splits = oversize = 0
-    bed_arcs = []
-    if max_size is not None:
-        forest, pos, splits, oversize, bed = split_to_fit(pm, forest, pos,
-                                                          *max_size)
-        bed_arcs = sorted({tuple(sorted(G_full[a][b]["verts"]))
-                           for a, b in bed if "verts" in G_full[a][b]})
-        bad = overlapping_pairs(forest, pos)
+    bed_arcs = sorted({tuple(sorted(G_full[a][b]["verts"]))
+                       for a, b in bed if "verts" in G_full[a][b]})
 
     # seams are reported against the full dual so forced cuts still get tabs
     islands = build_islands(pm, G_full, forest, pos)
     report = dict(cut_arcs=cut_arcs(G_full, forest), bed_cut_arcs=bed_arcs,
                   trials_used=used, extra_cuts=extra, rewelds=welds,
                   size_splits=splits,
+                  cost=cost,
                   islands=len(islands), unresolved=len(bad),
                   oversize_islands=oversize, notes=notes,
                   isometry_error=isometry_error(pm, pos))

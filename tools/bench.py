@@ -72,7 +72,8 @@ def corpus(height_mm: float, max_tris: int = 20000):
     return out
 
 
-def measure(name, tm, mat, height_mm, trials, seed):
+def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
+            budget=10):
     """One row. Returns a dict of plain numbers, nothing shapely."""
     pm = PolyMesh.from_trimesh(tm).scale_to_height(height_mm)
     pad = 2 * mat.tab_depth + 2 * mat.kerf
@@ -80,7 +81,8 @@ def measure(name, tm, mat, height_mm, trials, seed):
 
     t0 = time.perf_counter()
     islands, rep = unfold(pm, trials=trials, seed=seed, max_size=limit,
-                          splinter_width=mat.splinter_width)
+                          splinter_width=mat.splinter_width,
+                          mat=mat if optimise else None, budget=budget)
     t_unfold = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -188,6 +190,10 @@ def main(argv=None):
     ap.add_argument("--max-tris", type=int, default=20000,
                     dest="max_tris",
                     help="skip models bigger than this")
+    ap.add_argument("--optimise", action="store_true",
+                    help="cost-driven tree search instead of overlap count")
+    ap.add_argument("--budget", type=int, default=10,
+                    help="candidates the cost search may mend")
     ap.add_argument("--only", default=None, help="substring filter on model name")
     ap.add_argument("--json", default=None, help="write the rows here")
     ap.add_argument("--baseline", default=None, help="diff against this file")
@@ -210,7 +216,8 @@ def main(argv=None):
             continue
         # printed as it goes: a silent ten-minute run looks like a hang, which
         # is the same complaint the optimiser's progress hook exists for
-        r = measure(name, tm, mat, a.height, a.trials, a.seed)
+        r = measure(name, tm, mat, a.height, a.trials, a.seed,
+                    optimise=a.optimise, budget=a.budget)
         rows.append(r)
         say(row(r))
     say(f"total {time.perf_counter() - t0:.1f} s")

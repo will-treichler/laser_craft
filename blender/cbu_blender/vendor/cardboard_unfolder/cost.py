@@ -33,10 +33,16 @@ buildable. Ranking by count puts the unbuildable net first. That is why the
 penalty is summed per island and steep rather than counted, and why
 `tools/bench.py` reports a `tiny` column beside `splinters`.
 
-Sheets are only ever counted, never guessed: the total island area is
-conserved no matter where the net is cut, so any area-based sheet estimate is
-the same constant for every candidate and ranks nothing at all. Pass a real
-packing result or leave the term out.
+**Sheets are counted, never estimated, and both ways of estimating them were
+tried.** Area cannot do it: the total island area is conserved no matter where
+the net is cut, so an area-based estimate is the same constant for every
+candidate and ranks nothing. Shelving the islands' minimum-area RECTANGLES
+does vary with the cut and is 918x faster than the real packer - and ranks
+BACKWARDS where it matters. Measured over 20 nets: spearman 0.77 across
+models, which is just model size, and within one model pikachu came out at
+estimate [3, 4, 4, 4] against a real [3, 2, 2, 2]. Rectangles cannot see
+nesting, and these nets nest. So the term is present only when a caller hands
+in a real packing.
 """
 from __future__ import annotations
 

@@ -26,6 +26,8 @@ from cardboard_unfolder.unfold import (unfold, isometry_error, overlapping_pairs
                                        split_to_fit, split_island, unfold_tree,
                                        join_islands, cut_arcs,
                                        reattach, repair, _side_areas,
+                                       optimise, mend, _trial,
+                                       place_across, place_branch,
                                        _face_area,
                                        mirrored_faces, _face_local)
 from cardboard_unfolder.folds import (relief_width, perf_segments, plan_folds,
@@ -658,6 +660,116 @@ def test_reattach_never_makes_a_net_worse(name, tm):
     seam_after = sum(d.get("length", 0.0) for *_e, d in G.edges(data=True)
                      if not out.has_edge(*_e[:2]))
     assert seam_after <= seam_before + 1e-9, "welding cannot lengthen the seam"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_placing_one_branch_agrees_with_placing_the_whole_tree(name, tm):
+    """`place_branch` is the reason a weld costs five placements, not 255.
+
+    It has to put the branch exactly where a full `unfold_tree` rooted on the
+    other side would have - not merely somewhere valid. If the two ever
+    disagree, welding would nudge the net by a hair and every net would depend
+    on which code path happened to place it.
+    """
+    pm = PolyMesh.from_trimesh(tm)
+    G = pm.dual_graph()
+    forest, pos, _bad, _ = search(pm, G, trials=20, seed=0)
+    comp = max(nx.connected_components(forest), key=len)
+    sub = forest.subgraph(comp)
+    if sub.number_of_edges() == 0:
+        pytest.skip("needs a component with an arc to place across")
+    root = min(comp)
+    whole = unfold_tree(pm, sub, root)
+
+    # cut one arc, then put that branch back with place_branch alone
+    for parent, child in nx.bfs_edges(sub, root):
+        cut = sub.copy()
+        cut.remove_edge(parent, child)
+        branch = nx.node_connected_component(cut, child)
+        got = place_branch(pm, sub, whole, parent, child, branch)
+        worst = max(float(np.abs(got[f] - whole[f]).max()) for f in branch)
+        assert worst == 0.0, (
+            f"branch at {parent}->{child} moved by {worst:.2e} mm")
+        break
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_repairs_fast_path_never_ends_on_an_overlap(name, tm):
+    """Filtering the overlap set by component is optimistic and known to be.
+
+    Cutting a tree arc moves nothing relative to its own half, so the set can
+    only shrink - but `_forest_positions` re-roots every component afterwards
+    and GEOS then decides a borderline touch the other way. Measured on
+    pikachu: 8 of 124 cuts differed by up to 6 pairs. So repair may only LEAVE
+    the loop on a real measurement, and this is that guarantee.
+    """
+    pm = PolyMesh.from_trimesh(tm)
+    G = pm.dual_graph()
+    forest, pos, bad, _ = search(pm, G, trials=20, seed=0)
+    forest, pos, bad, cuts = repair(pm, forest, bad)
+    assert bad == overlapping_pairs(forest, pos), \
+        "repair returned an overlap set it had not actually measured"
+    assert not bad, f"repair stopped with {len(bad)} overlap(s) outstanding"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_the_optimiser_answers_with_a_net_that_could_be_cut(name, tm):
+    pm = PolyMesh.from_trimesh(tm)
+    G = pm.dual_graph()
+    mat = Material()
+    out = optimise(pm, G, mat, trials=8, seed=0, budget=3, finalists=2)
+    assert out is not None
+    forest, pos, bad, stats = out
+    assert set(forest) == set(G), "every face must survive the search"
+    assert not overlapping_pairs(forest, pos)
+    assert isometry_error(pm, pos) < 1e-6
+    assert not mirrored_faces(pm, pos)
+    assert stats["mended"] <= 3, "the mending budget is a budget"
+    assert stats["candidates"] >= 1
+
+
+def test_the_optimiser_stops_when_progress_says_to():
+    """A minute of silence is indistinguishable from a hang, so the core
+    reports - and a caller that reports can also refuse to continue."""
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=2))
+    G = pm.dual_graph()
+    mat = Material()
+    seen = []
+
+    def stop_after_two(done, total, note):
+        seen.append((done, total, note))
+        return done < 2
+
+    out = optimise(pm, G, mat, trials=30, seed=0, budget=30, finalists=1,
+                   progress=stop_after_two)
+    assert out is not None, "cancelling must still answer with the best so far"
+    forest, pos, bad, stats = out
+    assert stats["candidates"] == 2, \
+        f"it kept going after being told to stop ({stats['candidates']})"
+    assert not overlapping_pairs(forest, pos)
+    assert seen and seen[0][1] == 30
+
+
+def test_the_optimiser_never_loses_to_the_first_candidate():
+    """It ranks, so the answer can tie the first candidate but not lose to it.
+
+    Worth asserting because the ranking key (quick cost on the mended net) is
+    NOT the key the answer is chosen by (full cost after bed splitting), and a
+    two-key scheme can quietly pick the worse of two things it has both scored.
+    """
+    from cardboard_unfolder.cost import score_islands
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=2))
+    G = pm.dual_graph()
+    mat = Material()
+    limit = mat.usable_bed
+
+    one = optimise(pm, G, mat, trials=1, seed=0, max_size=limit, budget=1,
+                   finalists=1)
+    many = optimise(pm, G, mat, trials=6, seed=0, max_size=limit, budget=6,
+                    finalists=3)
+    assert many[3]["cost"] <= one[3]["cost"] + 1e-9, (
+        f"scoring 6 candidates ({many[3]['cost']:.2f}) did worse than taking "
+        f"the first ({one[3]['cost']:.2f})")
 
 
 def test_reattach_has_nothing_left_to_do_the_second_time():

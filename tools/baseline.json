@@ -18,7 +18,7 @@
   "unresolved": 0,
   "iso": 0.0,
   "t_unfold": 0.04,
-  "t_pack": 0.09
+  "t_pack": 0.08
  },
  {
   "model": "cone",
@@ -59,7 +59,7 @@
   "mirrored": 0,
   "unresolved": 0,
   "iso": 7.284243815040289e-16,
-  "t_unfold": 0.12,
+  "t_unfold": 0.11,
   "t_pack": 0.09
  },
  {
@@ -80,7 +80,7 @@
   "mirrored": 0,
   "unresolved": 0,
   "iso": 6.500455238584761e-16,
-  "t_unfold": 0.49,
+  "t_unfold": 0.46,
   "t_pack": 0.16
  },
  {
@@ -101,8 +101,8 @@
   "mirrored": 0,
   "unresolved": 0,
   "iso": 4.789725104467666e-16,
-  "t_unfold": 0.84,
-  "t_pack": 0.79
+  "t_unfold": 2.55,
+  "t_pack": 3.74
  },
  {
   "model": "capsule",
@@ -122,8 +122,8 @@
   "mirrored": 0,
   "unresolved": 0,
   "iso": 1.3951687745094583e-15,
-  "t_unfold": 1.24,
-  "t_pack": 1.0
+  "t_unfold": 5.98,
+  "t_pack": 3.56
  },
  {
   "model": "torus",
@@ -143,8 +143,8 @@
   "mirrored": 0,
   "unresolved": 0,
   "iso": 6.560477040924982e-16,
-  "t_unfold": 2.19,
-  "t_pack": 9.65
+  "t_unfold": 9.75,
+  "t_pack": 31.81
  },
  {
   "model": "icosphere2",
@@ -164,28 +164,28 @@
   "mirrored": 0,
   "unresolved": 0,
   "iso": 1.120050679146578e-15,
-  "t_unfold": 4.33,
-  "t_pack": 0.73
+  "t_unfold": 17.82,
+  "t_pack": 2.43
  },
  {
   "model": "pikachu",
   "faces": 277,
-  "islands": 7,
+  "islands": 8,
   "splinters": 2,
   "tiny": 1,
   "min_width": 3.3,
-  "med_width": 36.3,
-  "necks": 102,
+  "med_width": 34.2,
+  "necks": 99,
   "sheets": 3,
   "oversize": 0,
   "util": 26.3,
-  "seam_mm": 6058,
-  "extra_cuts": 25,
+  "seam_mm": 6176,
+  "extra_cuts": 26,
   "size_splits": 3,
   "mirrored": 0,
   "unresolved": 0,
   "iso": 1.6478224192313925e-05,
-  "t_unfold": 8.44,
-  "t_pack": 6.71
+  "t_unfold": 18.73,
+  "t_pack": 11.67
  }
 ]

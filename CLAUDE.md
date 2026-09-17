@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 252 core invariants (~90 s)
+python -m pytest tests -q               # 275 core invariants (~2 min)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -25,6 +25,7 @@ python blender/dev_install.py           # symlink add-on into Blender
 
 python tools/bench.py --json base.json  # the corpus, saved
 python tools/bench.py --baseline base.json   # ...and what moved since
+python tools/bench.py --optimise             # cost-driven tree search
 ```
 
 ## Architecture
@@ -60,22 +61,27 @@ moves several of these in opposite directions at once - fewer sheets can cost
 splinters, fewer islands can cost a sheet - so a claim about it is a claim
 about this table, not about one number.
 
-Where it started (200 mm, 300x300 bed, gap 1, tabs off) and where Phase 2
-left it:
+Where it started (200 mm, 300x300 bed, gap 1, tabs off), where regret left
+it, and what `--optimise` adds on top:
 
-| model | islands | splinters | tiny | sheets | seam mm |
-|---|---|---|---|---|---|
-| pikachu | 26 -> **7** | 12 -> **2** | 4 -> 1 | 2 -> *3* | 6998 -> 6058 |
-| torus | 57 -> 53 | 0 | 0 | 21 -> *22* | 32858 -> 31906 |
-| annulus | 35 -> 34 | 0 | 0 | 13 | 16949 -> 16712 |
-| icosphere2 | 9 | 0 | 0 | 4 | 9976 |
+| model | islands | splinters | tiny | min width | sheets | seam mm |
+|---|---|---|---|---|---|---|
+| pikachu | 26 -> 8 -> **9** | 12 -> 2 -> **2** | 4 -> 1 -> **0** | 3.1 -> 3.3 -> **10.3** | 2 -> 3 -> **2** | 6998 -> 6176 -> 6169 |
+| annulus | 35 -> 34 -> **26** | 0 | 0 | 32.9 -> 32.9 -> **70.8** | 13 | 16949 -> 16712 -> **14786** |
+| icosphere2 | 9 -> 9 -> **8** | 0 | 0 | 26.8 | 4 | 9976 -> 9976 -> 9880 |
+| capsule | 6 -> 6 -> *7* | 0 | 0 | 38.6 -> *18.0* | 2 | 5183 -> 5183 -> **4937** |
+| torus | 57 -> 53 -> 53 | 0 | 0 | 63.4 | 21 -> 22 -> *23* | 32858 -> 31906 -> *32383* |
 
 Half of pikachu's islands could not be held, and **repair was where they came
-from**: 25 extra cuts against 0-1 from bed splitting. The sheet each model
-gave up is the trade the priority ordering asks for - splinters first, then
-sheets - and it is a packing problem, not an unfolding one: 7 large islands
-pack to 26% of a sheet where 26 small ones reached 39%. Fracturing islands to
-pack better is a separate lever and belongs after a better packer.
+from**: 25 extra cuts against 0-1 from bed splitting. Phase 2's regret pass
+fixed the count; the cost-driven search fixed the *shape*, taking the worst
+piece from 3.3 mm to 10.3 mm and winning back the sheet that consolidating
+had cost. torus is the one that goes backwards, and the reason is known and
+named below: the search cannot see sheets.
+
+`--optimise` is opt-in and the committed baseline is the plain path, because
+it costs roughly 3x the time - it has to mend each candidate before it can
+score one.
 
 **A splinter is measured by `layout.inscribed_width`, not by area.** The
 largest circle that fits is the honest answer to "can I hold this while the
@@ -128,6 +134,77 @@ what recovers what the tree cost. It is on wherever a Material is in hand, and
 `splinter_width=0` reproduces the old rule exactly, which is what makes the
 two comparable on the bench. The side areas it prices with come from one
 rooted DFS per component (`_side_areas`), not one traversal per candidate arc.
+
+**The tree search was ranking candidates backwards.** `search` scores only
+the trees that overlap not at all, and falls back to fewest-overlaps
+otherwise. On the model where that matters most it does neither job: pikachu
+has no clean tree in 60 restarts, so the scoring branch never ran at all, and
+the fallback is **anti-correlated** with the answer - spearman -0.30 to -0.46
+against the finished cost, and the fewest-overlaps tree costs **+74% to +114%**
+more than the best of the same 24 candidates. Many overlaps usually means the
+net wraps densely, and a dense wrap consolidates into a few large islands once
+mended; a tree that starts tidy often ends up in fragments.
+
+So `unfold.optimise` ranks after `mend`, where the quick cost reaches spearman
+**+0.97** on pikachu and +0.73 on icosphere2 and picks the best of 16
+outright. There is no cheaper signal - that was looked for, and `len(bad)` was
+the one that was there.
+
+Which makes `budget` the design. Mending is what costs, so only candidates
+that need mending count against it; clean trees are nearly free and every
+restart gets one. The best `finalists` are then bed-split and scored with the
+full cost. Two things that looked more principled and were measured out:
+
+- **Ranking after a cheap bed split.** A torus unfolds to a handful of islands
+  and leaves the splitter to make 53, so ranking a pre-split net there is
+  ranking almost nothing. Fixing it cost 30% more time across the corpus and
+  changed nothing it was meant to: torus stayed at 23 sheets and its repair
+  cuts went 6 to 15.
+- **Estimating sheets from bounding boxes.** Area cannot do it (it is
+  conserved, so every candidate gets the same number), but shelving each
+  island's minimum-area rectangle does vary with the cut and is 918x faster
+  than the real packer. It also ranks BACKWARDS where it matters: over 20 nets
+  spearman 0.77 across models - which is just model size - and *within*
+  pikachu the estimate read [3, 4, 4, 4] against a real [3, 2, 2, 2].
+  Rectangles cannot see nesting, and these nets nest.
+
+So **the search has no sheet term**, and that is exactly why torus loses one:
+22 to 23 sheets is 20 points of cost the optimiser cannot see, against an
+islands/seam trade that nets out near zero. Hooking the real packer in belongs
+with the packer rewrite; `layout.pack` is 29 s on a torus, which is not a
+thing to call once per candidate.
+
+**Mend had to get 10x faster before any of this was affordable**, and the two
+fixes are both "stop recomputing what cannot have changed":
+
+- `repair` re-placed the whole net and re-intersected it after every cut.
+  Cutting a tree arc moves nothing relative to anything in its own half - the
+  fact `split_to_fit` is already built on - so the overlap set can only
+  shrink, and only by pairs that just landed in different components, which
+  `overlapping_pairs` excludes anyway. Filtering by component is the same
+  answer for a fraction of the cost. *Almost*: measured identical on four of
+  five corpus models, and on pikachu 8 of 124 cuts differed by up to 6 pairs,
+  because `_forest_positions` re-roots each component and GEOS then decides a
+  borderline touch the other way. So the filter may end the loop early and a
+  real measurement decides whether it was right to
+  (`test_repairs_fast_path_never_ends_on_an_overlap`).
+- `reattach` re-placed the whole merged component and re-intersected all of it
+  for **every candidate arc**. Now the smaller side is moved onto the larger
+  (`place_branch`, which must agree exactly with a full `unfold_tree` -
+  `test_placing_one_branch_agrees_with_placing_the_whole_tree`), only the
+  cross pairs are tested, and the host's polygons and STRtree are cached until
+  a weld actually lands. That last one alone was 3.1 s of a 4.9 s mend.
+
+17.3 s -> 1.69 s on a pikachu net. The one behavioural change is the repair
+filter picking slightly different cuts: pikachu 7 -> 8 islands, 25 -> 26 cuts,
+seam 6058 -> 6176 on the plain path.
+
+**Time columns are not comparable across sessions.** Chasing an apparent 2-4x
+slowdown after this work, the giveaway was `t_pack` tripling too - and nothing
+in `layout.py` had changed. A worktree at the previous commit timed identically
+on the same machine (`git worktree add <dir> HEAD`), and stray background
+probe processes were eating the CPU. Compare against a run taken *now*, not
+against a saved baseline, and check an untouched column first.
 
 **"Low poly" in a filename is not a fact.** The spartan helmet is **499,992
 triangles** and the coplanar merge removes only 18% of them - it is a smooth
@@ -1179,6 +1256,13 @@ Not done, roughly in value order:
   them in the add-on (`props.py` → `ui.py` → `ops.py`).
 - Wrap expensive stages in `with cbulog.stage(T, "name"):` so they appear in
   the add-on's Timings box.
+- Anything that can run for tens of seconds takes
+  `progress(done, total, note) -> bool` and calls it per unit of work;
+  returning False stops the work and answers with the best it has. The add-on
+  wires it to `wm.progress_*`, which is the only readout that updates from
+  inside a blocking `execute` - a panel does not redraw until the operator
+  returns. Actually *cancelling* from the UI needs the solver driven from a
+  modal timer, which is not built yet; the core half is.
 - Tests assert invariants, not snapshots. Prefer a property that must hold
   (area conserved, nothing exceeds the bed) over a golden file.
 - Empirical constants live in `material.py` and are exposed in the UI; derived

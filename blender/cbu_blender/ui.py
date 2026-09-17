@@ -244,6 +244,10 @@ class CBU_PT_solver(_Base, bpy.types.Panel):
         sub.prop(s, "merge_tol")
         lay.prop(s, "trials")
         lay.prop(s, "seed")
+        lay.prop(s, "optimise")
+        sub = lay.column()
+        sub.enabled = s.optimise
+        sub.prop(s, "budget")
         lay.prop(s, "limit_to_bed")
         lay.separator()
         lay.prop(s, "out_dir")

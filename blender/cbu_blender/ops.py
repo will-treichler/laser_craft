@@ -397,6 +397,40 @@ class CBU_OT_select_marked(bpy.types.Operator):
 
 # --------------------------------------------------------------- unfold
 
+def _progress(context):
+    """A progress callback for the core, wired to Blender's own readout.
+
+    The optimiser mends every candidate before it can score one, so a run is
+    tens of seconds on a real model and silence is indistinguishable from a
+    hang. `wm.progress_*` drives the cursor readout, which is the only thing
+    that reliably updates from inside a blocking execute - a panel will not
+    redraw until the operator returns.
+
+    It never returns False: cancelling means letting the user interrupt a call
+    that is not yielding to the event loop, which needs the solver driven from
+    a modal timer rather than a progress hook. The core supports it (returning
+    False stops the search and answers with the best candidate so far) and
+    nothing here uses it yet.
+    """
+    wm = context.window_manager
+    started = [False]
+
+    def report(done, total, note):
+        try:
+            if not started[0]:
+                wm.progress_begin(0, max(1, total))
+                started[0] = True
+            wm.progress_update(done)
+            if done >= total:
+                wm.progress_end()
+                started[0] = False
+        except Exception:                               # noqa: BLE001
+            pass            # a progress readout must never break a solve
+        return True
+
+    return report
+
+
 class CBU_OT_unfold(bpy.types.Operator):
     bl_idname = "cbu.unfold"
     bl_label = "Unfold"
@@ -454,10 +488,12 @@ class CBU_OT_unfold(bpy.types.Operator):
                 log.debug("island size limit %.1f x %.1f mm", *limit)
 
             with cbulog.stage(T, "unfold"):
-                islands, rep = U.unfold(pm, trials=s.trials, seed=s.seed,
-                                        max_size=limit, forced_cuts=cuts,
-                                        forced_folds=folds,
-                                        splinter_width=mat.splinter_width)
+                islands, rep = U.unfold(
+                    pm, trials=s.trials, seed=s.seed, max_size=limit,
+                    forced_cuts=cuts, forced_folds=folds,
+                    splinter_width=mat.splinter_width,
+                    mat=mat if s.optimise else None, budget=s.budget,
+                    progress=_progress(context) if s.optimise else None)
             for isl in islands:
                 log.debug("island %d: %d face(s), %.0f x %.0f mm, %.0f mm2",
                           isl.id, len(isl.faces), *isl.size(), isl.area())

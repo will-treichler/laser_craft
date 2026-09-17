@@ -166,6 +166,17 @@ class CBUSettings(bpy.types.PropertyGroup):
         description="Randomised restarts before falling back to splitting")
     seed: IntProperty(name="Seed", default=0, min=0,
                       description="Change this if a net comes out badly pinched")
+    optimise: BoolProperty(
+        name="Optimise", default=False,
+        description="Choose the tree by what the finished net costs instead of "
+                    "by how many faces overlap to begin with - measurably the "
+                    "wrong way round. Slower: it has to mend each candidate "
+                    "before it can score one")
+    budget: IntProperty(
+        name="Candidates", default=10, min=1, max=100,
+        description="How many candidates the optimiser may mend and score. "
+                    "Trees that need no mending are nearly free and do not "
+                    "count against this")
     limit_to_bed: BoolProperty(
         name="Split to fit bed", default=True,
         description="Cut extra seams, along fold edges, until every island "
