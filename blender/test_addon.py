@@ -1220,7 +1220,9 @@ finally:
     overlay._batches.pop(obj.name, None)
 
 # Both rebuild call sites must pass the setting; one of them silently did not.
-for _fn in (ops.CBU_OT_unfold.execute, ops.CBU_OT_edit_seam._local):
+# Unfold's is in `apply` rather than `execute` since the solve was split out
+# onto a worker thread - the rule is about the call site, not the method name.
+for _fn in (ops.CBU_OT_unfold.apply, ops.CBU_OT_edit_seam._local):
     check("overlay_alpha" in _fn.__code__.co_names,
           f"{_fn.__qualname__} passes the opacity setting through")
 
@@ -1350,6 +1352,64 @@ check(len(_lk) == len(obj.data.edges) and not _lk.any(),
 
 bpy.ops.cbu.clear_marks()
 bpy.ops.cbu.clear_locks()
+
+# ------------------------------------------------- cancelling a long solve
+# The optimiser mends every candidate before it can score one, so a run is tens
+# of seconds and needs a way out. The solve moves to a worker thread; that is
+# only legal because the core imports no bpy, so these checks are about that
+# boundary rather than about the threading.
+_names = ops.Solve.run.__code__.co_names
+check("bpy" not in _names and "context" not in _names,
+      f"Solve.run touches no Blender data (names: {_names})")
+check("Exception" in _names and "error" in _names,
+      "Solve.run cannot raise out of the worker thread")
+_src = ops.CBU_OT_unfold.prepare.__doc__ or ""
+check(hasattr(ops.CBU_OT_unfold, "prepare")
+      and hasattr(ops.CBU_OT_unfold, "apply"),
+      "the unfold operator is split around the solve")
+check("progress" not in ops.CBU_OT_unfold.apply.__code__.co_names,
+      "apply does not re-enter the solver")
+
+# A script always takes execute(), never the modal path - which is what makes
+# every other check in this file independent of a window existing.
+check("prepare" in ops.CBU_OT_unfold.execute.__code__.co_names
+      and "apply" in ops.CBU_OT_unfold.execute.__code__.co_names,
+      "execute runs the whole job synchronously")
+check("modal_handler_add" in ops.CBU_OT_unfold.invoke.__code__.co_names,
+      "invoke is the modal path")
+check("execute" in ops.CBU_OT_unfold.invoke.__code__.co_names,
+      "...and falls straight through to execute when the optimiser is off")
+
+# Stopping is cooperative and must still answer with a net. Drive Solve
+# directly: the modal loop needs a window, the contract does not.
+obj = fresh("Cancel", "ico_sphere", subdivisions=1)
+obj.scale = (0.12,) * 3
+bpy.ops.object.transform_apply(scale=True)
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+_pm = bridge.polymesh_from_object(obj, merge_coplanar=True, mm_per_unit=1000.0)
+_mat = props.material_from(bpy.context.scene.cbu, obj)
+_U = ops._core()[0]
+_job = ops.Solve(_U, _pm, dict(trials=30, seed=0, mat=_mat, budget=30))
+_seen = []
+_real_progress = _job.progress
+
+
+def _stop_at_two(done, total, note):
+    _seen.append(done)
+    if done >= 2:
+        _job.stop()
+    return _real_progress(done, total, note)
+
+
+_job.progress = _stop_at_two
+_job.run()
+check(_job.error is None, f"a cancelled solve does not fail ({_job.error})")
+check(_job.islands, "a cancelled solve still answers with a net")
+check(_job.stopping, "and it knows it was stopped")
+check(len(_seen) <= 3, f"it stopped when told ({len(_seen)} candidates)")
+check(sum(len(i.faces) for i in _job.islands) == len(_pm.faces),
+      "no face went missing when the search was cut short")
 
 # ------------------------------------------------------- reload operator
 # reload_all() unregisters CBU_OT_reload itself, so the operator must not

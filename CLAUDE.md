@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 256 checks, real Blender API
+python blender/test_addon.py            # 266 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -198,6 +198,35 @@ fixes are both "stop recomputing what cannot have changed":
 17.3 s -> 1.69 s on a pikachu net. The one behavioural change is the repair
 filter picking slightly different cuts: pikachu 7 -> 8 islands, 25 -> 26 cuts,
 seam 6058 -> 6176 on the plain path.
+
+**A long solve runs off the main thread, and only the bpy-free core can.**
+`CBU_OT_unfold` is split in three: `prepare` reads the mesh, `Solve.run`
+unfolds, `apply` writes the net back - and only the middle one moves. That is
+the load-bearing use of "the core imports no bpy": `run` holds a PolyMesh copy
+and touches nothing Blender owns, which is asserted on the code object
+(`Solve.run touches no Blender data`) rather than trusted.
+
+`execute` runs all three in order, so **a script never takes the modal path** -
+`bpy.ops.cbu.unfold()` from Python is EXEC_DEFAULT - and every headless check
+stays independent of a window existing. `invoke` starts the thread and a
+0.1 s timer only when the optimiser is on; the plain search is a second or two
+and a modal loop around it would be pure machinery.
+
+Three things that are easy to get wrong here:
+
+- **Cancelling is cooperative and has to be.** The thread is inside numpy and
+  shapely calls that cannot be interrupted, so ESC sets a flag, the core reads
+  it between candidates, and the search answers with the best it has. So ESC
+  gives you a net rather than nothing - which matters, because the first
+  candidate is usually already better than the old rule's answer. The status
+  bar says `ESC to stop` and then `(stopping)`.
+- **`run` must not raise.** An exception on a thread nobody joins simply
+  disappears, and the operator would then report success for a net that was
+  never built. It stores the exception and `apply` re-raises it on the main
+  thread.
+- **The mesh must not change under the solve.** `prepare` takes an
+  `overlay.geometry_fingerprint` and `apply` checks it, because writing a net
+  onto geometry that has moved is wrong even though the solve itself was safe.
 
 **Time columns are not comparable across sessions.** Chasing an apparent 2-4x
 slowdown after this work, the giveaway was `t_pack` tripling too - and nothing
@@ -1258,11 +1287,7 @@ Not done, roughly in value order:
   the add-on's Timings box.
 - Anything that can run for tens of seconds takes
   `progress(done, total, note) -> bool` and calls it per unit of work;
-  returning False stops the work and answers with the best it has. The add-on
-  wires it to `wm.progress_*`, which is the only readout that updates from
-  inside a blocking `execute` - a panel does not redraw until the operator
-  returns. Actually *cancelling* from the UI needs the solver driven from a
-  modal timer, which is not built yet; the core half is.
+  returning False stops the work and answers with the best it has.
 - Tests assert invariants, not snapshots. Prefer a property that must hold
   (area conserved, nothing exceeds the bed) over a golden file.
 - Empirical constants live in `material.py` and are exposed in the UI; derived

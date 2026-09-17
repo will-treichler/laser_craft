@@ -2,6 +2,7 @@
 so it inherits loop select, shortest path, box/lasso and undo for free."""
 from __future__ import annotations
 
+import threading
 import traceback
 
 import bmesh
@@ -397,38 +398,58 @@ class CBU_OT_select_marked(bpy.types.Operator):
 
 # --------------------------------------------------------------- unfold
 
-def _progress(context):
-    """A progress callback for the core, wired to Blender's own readout.
+class Solve:
+    """The bpy-free half of an unfold, packaged so it can run off the main
+    thread while the operator keeps taking events.
 
-    The optimiser mends every candidate before it can score one, so a run is
-    tens of seconds on a real model and silence is indistinguishable from a
-    hang. `wm.progress_*` drives the cursor readout, which is the only thing
-    that reliably updates from inside a blocking execute - a panel will not
-    redraw until the operator returns.
+    The core imports no bpy at all, and that separation - the whole reason the
+    two layers are split - is what makes this legal rather than merely lucky.
+    Everything that touches Blender data happens before (`CBU_OT_unfold.prepare`)
+    or after (`apply`) on the main thread; only `run` moves, and it touches
+    nothing but the PolyMesh copy it was handed.
 
-    It never returns False: cancelling means letting the user interrupt a call
-    that is not yielding to the event loop, which needs the solver driven from
-    a modal timer rather than a progress hook. The core supports it (returning
-    False stops the search and answers with the best candidate so far) and
-    nothing here uses it yet.
+    Cancelling is cooperative: `stop()` sets a flag, the core's progress hook
+    reads it between candidates and returns False, and the search answers with
+    the best candidate it has rather than nothing. So ESC gives you a net, not
+    an empty result - which matters, because the first candidate is usually
+    already better than the old rule's answer.
     """
-    wm = context.window_manager
-    started = [False]
 
-    def report(done, total, note):
+    def __init__(self, U, pm, kwargs):
+        self.U, self.pm, self.kwargs = U, pm, kwargs
+        self.islands = self.rep = self.error = None
+        self.done = self.total = 0
+        self.note = ""
+        self._stop = False
+        self.ui = None          # optional main-thread callback, set by the caller
+
+    def stop(self):
+        self._stop = True
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop
+
+    def progress(self, done, total, note):
+        self.done, self.total, self.note = done, total, note
+        if self.ui is not None:
+            try:
+                self.ui(done, total, note)
+            except Exception:                           # noqa: BLE001
+                pass        # a progress readout must never break a solve
+        return not self._stop
+
+    def run(self):
+        """Runs on a worker thread. Must not raise out of it: an exception on
+        a thread nobody joins disappears, and the operator would report
+        success for a net that was never built."""
         try:
-            if not started[0]:
-                wm.progress_begin(0, max(1, total))
-                started[0] = True
-            wm.progress_update(done)
-            if done >= total:
-                wm.progress_end()
-                started[0] = False
-        except Exception:                               # noqa: BLE001
-            pass            # a progress readout must never break a solve
-        return True
-
-    return report
+            self.islands, self.rep = self.U.unfold(self.pm,
+                                                   progress=self.progress,
+                                                   **self.kwargs)
+        except Exception as exc:                        # noqa: BLE001
+            traceback.print_exc()
+            self.error = exc
 
 
 class CBU_OT_unfold(bpy.types.Operator):
@@ -444,13 +465,122 @@ class CBU_OT_unfold(bpy.types.Operator):
                 and context.active_object.type == "MESH")
 
     def execute(self, context):
+        """The synchronous path, and the only one a script ever takes.
+
+        `bpy.ops.cbu.unfold()` from Python runs EXEC_DEFAULT, which comes
+        straight here - so every headless check exercises this and none of
+        them depend on a modal loop or a window.
+        """
+        job = self.prepare(context)
+        if job is None:
+            return {"CANCELLED"}
+        wm = context.window_manager
+        started = [False]
+
+        def show(done, total, _note):
+            # wm.progress_* drives the cursor readout, the only thing that
+            # updates from inside a blocking execute - a panel does not redraw
+            # until the operator returns.
+            if not started[0]:
+                wm.progress_begin(0, max(1, total))
+                started[0] = True
+            wm.progress_update(done)
+
+        job.ui = show
+        try:
+            job.run()
+        finally:
+            if started[0]:
+                try:
+                    wm.progress_end()
+                except Exception:                       # noqa: BLE001
+                    pass
+        return self.apply(context, job)
+
+    def invoke(self, context, event):
+        """Modal only where it buys something: a cancellable optimiser run.
+
+        The plain search is a second or two and a modal loop around it would
+        be pure machinery. The optimiser mends every candidate before it can
+        score one, so it runs for tens of seconds and the user needs both a
+        readout and a way out.
+        """
+        s = context.scene.cbu
+        if not s.optimise:
+            return self.execute(context)
+        job = self.prepare(context)
+        if job is None:
+            return {"CANCELLED"}
+
+        self._job = job
+        self._thread = threading.Thread(target=job.run, daemon=True)
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.1, window=context.window)
+        wm.progress_begin(0, 100)
+        self._thread.start()
+        wm.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        wm = context.window_manager
+        if event.type in {"ESC"} and event.value == "PRESS":
+            # Cooperative, and it has to be: the thread is inside numpy and
+            # shapely calls that cannot be interrupted, so it stops at the
+            # next candidate boundary. The core then answers with the best
+            # candidate so far, which is why this applies the result rather
+            # than throwing the work away.
+            if not self._job.stopping:
+                self._job.stop()
+                self.report({"INFO"}, "stopping after this candidate...")
+            return {"RUNNING_MODAL"}
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+
+        job = self._job
+        if self._thread.is_alive():
+            try:
+                total = max(1, job.total)
+                wm.progress_update(int(100 * job.done / total))
+                context.workspace.status_text_set(
+                    f"Unfolding: {job.note or 'searching'}"
+                    + ("  (stopping)" if job.stopping else "  -  ESC to stop"))
+            except Exception:                           # noqa: BLE001
+                pass
+            return {"RUNNING_MODAL"}
+
+        self._cleanup(context)
+        return self.apply(context, job)
+
+    def cancel(self, context):
+        """Blender's own cancel - a file load or a quit, not the user's ESC."""
+        if getattr(self, "_job", None) is not None:
+            self._job.stop()
+        self._cleanup(context)
+
+    def _cleanup(self, context):
+        wm = context.window_manager
+        if getattr(self, "_timer", None) is not None:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        try:
+            wm.progress_end()
+            context.workspace.status_text_set(None)
+        except Exception:                               # noqa: BLE001
+            pass
+
+    def prepare(self, context):
+        """Everything that touches Blender data, before the solve.
+
+        Returns a Solve, or None after reporting why not. Kept apart from
+        `apply` so the solve between them can run on a worker thread.
+        """
         obj, err = _active_mesh(context)
         if err:
             self.report({"ERROR"}, err)
-            return {"CANCELLED"}
+            return None
 
-        was_edit = context.mode == "EDIT_MESH"
-        if was_edit:
+        self.was_edit = context.mode == "EDIT_MESH"
+        if self.was_edit:
             bpy.ops.object.mode_set(mode="OBJECT")
 
         s = context.scene.cbu
@@ -459,6 +589,9 @@ class CBU_OT_unfold(bpy.types.Operator):
         log = cbulog.get()
         T = cbulog.Timings()
         LAST_TIMINGS.clear()
+        self.obj_name = obj.name
+        self.mat = mat
+        self.T = T
         try:
             with cbulog.stage(T, "read mesh"):
                 pm = bridge.polymesh_from_object(
@@ -487,13 +620,44 @@ class CBU_OT_unfold(bpy.types.Operator):
                 limit = (mat.usable_bed[0] - pad, mat.usable_bed[1] - pad)
                 log.debug("island size limit %.1f x %.1f mm", *limit)
 
-            with cbulog.stage(T, "unfold"):
-                islands, rep = U.unfold(
-                    pm, trials=s.trials, seed=s.seed, max_size=limit,
-                    forced_cuts=cuts, forced_folds=folds,
-                    splinter_width=mat.splinter_width,
-                    mat=mat if s.optimise else None, budget=s.budget,
-                    progress=_progress(context) if s.optimise else None)
+        except Exception as exc:                       # noqa: BLE001
+            traceback.print_exc()
+            log.error("unfold failed", exc_info=True)
+            self.report({"ERROR"},
+                        f"{type(exc).__name__}: {exc}  (full traceback in the "
+                        f"system console)")
+            if self.was_edit:
+                bpy.ops.object.mode_set(mode="EDIT")
+            return None
+
+        # The mesh must not change under a solve that is already running on
+        # its own thread, so remember what it looked like and check on the way
+        # back out. The solve itself is safe either way - it holds a PolyMesh
+        # copy - but writing a net onto geometry that has moved is not.
+        self.fingerprint = overlay.geometry_fingerprint(obj.data)
+        return Solve(U, pm, dict(
+            trials=s.trials, seed=s.seed, max_size=limit,
+            forced_cuts=cuts, forced_folds=folds,
+            splinter_width=mat.splinter_width,
+            mat=mat if s.optimise else None, budget=s.budget))
+
+    def apply(self, context, job):
+        """Everything that touches Blender data, after the solve."""
+        obj = bpy.data.objects.get(self.obj_name)
+        s = context.scene.cbu
+        mat = self.mat
+        _U, L, _ = _core()
+        log = cbulog.get()
+        T = self.T
+        try:
+            if obj is None or obj.type != "MESH":
+                raise RuntimeError("the object went away while unfolding")
+            if job.error is not None:
+                raise job.error
+            if overlay.geometry_fingerprint(obj.data) != self.fingerprint:
+                raise RuntimeError(
+                    "the mesh changed while unfolding - run Unfold again")
+            pm, islands, rep = job.pm, job.islands, job.rep
             for isl in islands:
                 log.debug("island %d: %d face(s), %.0f x %.0f mm, %.0f mm2",
                           isl.id, len(isl.faces), *isl.size(), isl.area())
@@ -536,7 +700,10 @@ class CBU_OT_unfold(bpy.types.Operator):
             for w in warns[:6]:
                 self.report({"WARNING"}, w)
 
-            self.report({"INFO"}, s.last_report)
+            if job.stopping:
+                self.report({"INFO"}, "stopped early - " + s.last_report)
+            else:
+                self.report({"INFO"}, s.last_report)
         except Exception as exc:                       # noqa: BLE001
             traceback.print_exc()
             log.error("unfold failed", exc_info=True)
@@ -545,7 +712,7 @@ class CBU_OT_unfold(bpy.types.Operator):
                         f"system console)")
             return {"CANCELLED"}
         finally:
-            if was_edit:
+            if self.was_edit:
                 bpy.ops.object.mode_set(mode="EDIT")
         return {"FINISHED"}
 
