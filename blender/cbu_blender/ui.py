@@ -40,6 +40,14 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         col = lay.column(align=True)
         col.scale_y = 1.4
         col.operator("cbu.unfold", icon="MOD_UVPROJECT")
+        # Beside the button it modifies, not in the closed Solver sub-panel
+        # next to the output directory. It went there first and the only
+        # feedback was "how do I run the optimiser?" - a mode for Unfold that
+        # you cannot see from Unfold is a mode nobody runs. Same mistake as
+        # show_overlay, which lived in that panel and hid the seam marks.
+        lay.prop(s, "optimise", toggle=True, icon="MOD_ARRAY")
+        if s.optimise:
+            lay.label(text="Unfold is slower; ESC stops it", icon="INFO")
         # A bent face has no flat image, so it has to be triangulated in the
         # mesh - the core cannot paper over it. Offered next to Unfold because
         # that is where the warning about it appears.
@@ -244,7 +252,8 @@ class CBU_PT_solver(_Base, bpy.types.Panel):
         sub.prop(s, "merge_tol")
         lay.prop(s, "trials")
         lay.prop(s, "seed")
-        lay.prop(s, "optimise")
+        # The switch itself is on the main panel, beside Unfold; this is the
+        # knob that only matters once it is on.
         sub = lay.column()
         sub.enabled = s.optimise
         sub.prop(s, "budget")

@@ -674,6 +674,16 @@ in the UV panel is `cbu.edit_seam`, which calls `cbu.mark`, so it writes
 exactly the same red and blue as the Seams panel. Putting the legend at the
 top of the UV panel, several boxes away from those buttons, is not a key.
 
+**A mode you cannot see from the button it modifies is a mode nobody runs.**
+The optimiser is not an operator - there is no Optimize button, it is a switch
+that changes what Unfold does - and it went into the Solver sub-panel, which
+is `DEFAULT_CLOSED`, next to the output directory. The only feedback it got was
+"how do I run the optimiser? I only see the repack and nest buttons". So the
+toggle sits under Unfold on the main panel, and `budget`, which only matters
+once it is on, stays in Solver. Exactly the mistake `show_overlay` made in
+that same panel; twice is a pattern, and the rule is that a switch belongs
+beside what it switches.
+
 **Four switches in a row truncate to nothing.** Blender gives each item in
 an aligned row an equal share of the panel width, so `Show bed / Show cut /
 Annotation / Marks` side by side reads as `Sho..` four times at any sane
