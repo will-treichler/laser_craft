@@ -105,9 +105,13 @@ for name, tm in bench.corpus(HEIGHT):
         # A one-sheet model still needs a figure wide enough for the caption,
         # which is where the bed and the height live - a picture that crops
         # them is a picture you cannot judge a packing from.
+        # A one-sheet model still needs a figure wide enough for the caption,
+        # which is where the bed and the height live - a picture that crops
+        # them is a picture you cannot judge a packing from, and the caption
+        # is the whole point of drawing it.
         fig, axes = plt.subplots(rows, cols,
-                                 figsize=(max(2.5 * cols, 7.5),
-                                          2.8 * rows + 0.5),
+                                 figsize=(max(2.5 * cols, 10.0),
+                                          2.8 * rows + 0.6),
                                  squeeze=False)
         total = 0.0
         for k in range(rows * cols):
@@ -126,8 +130,8 @@ for name, tm in bench.corpus(HEIGHT):
             f"{mat.part_gap:.0f} mm gap\n"
             f"{len(isl)} island(s), {sheets} sheet(s), "
             f"{100 * total / max(sheets, 1) / BED_AREA:.1f}% mean fill "
-            f"({dt:.0f}s)", fontsize=10)
-        fig.tight_layout(rect=(0, 0, 1, 1.0 - 0.5 / (2.8 * rows + 0.5)))
+            f"({dt:.0f}s)", fontsize=9)
+        fig.tight_layout(rect=(0, 0, 1, 1.0 - 0.6 / (2.8 * rows + 0.6)))
         path = OUT / f"pack_{name}_{HEIGHT:.0f}mm_{label}.png"
         fig.savefig(path, dpi=110)
         plt.close(fig)

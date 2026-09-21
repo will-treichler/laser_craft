@@ -26,7 +26,8 @@ python blender/dev_install.py           # symlink add-on into Blender
 python tools/bench.py --json base.json  # the corpus, saved
 python tools/bench.py --baseline base.json   # ...and what moved since
 python tools/bench.py --optimise             # cost-driven tree search
-python tools/render_packs.py                 # draw every sheet, to out/packs
+python tools/render_packs.py [dir] [model] [height]   # draw every sheet
+python tools/bench.py --height 100           # ...and at other scales
 ```
 
 ## Architecture
@@ -85,6 +86,40 @@ it costs roughly 3x the time - it has to mend each candidate before it can
 score one, and now pack each finalist on top of that. **No model is worse on
 sheets**; what it trades away is island count and seam length, in that order,
 which is the priority it was given.
+
+**One height is one point off a curve.** The same net is a different problem
+at each scale, and running only 200 mm hides both ends of it. Sheets, plain
+path then `--optimise`, with parts no sheet can hold in brackets:
+
+| model | 100 mm | 200 mm | 400 mm |
+|---|---|---|---|
+| icosphere1 | 2 -> **1** | 3 | 13 -> **12** |
+| icosphere2 | 2 -> **1** | 4 | 12 -> **11** |
+| pikachu | 1 | 3 -> **2** | 7 |
+| annulus | 4 | 12 -> **11** | 22 -> *24* [28] |
+| torus | 7 | 21 -> **20** | 57 -> **56** [32] |
+| box / cone / cylinder | 2 / 1 / 1 | 6 / 3 / 5 | *0* [6 / 13 / 18] |
+
+Mean sheet fill on the plain path runs 18-58% at 100 mm, 26-62% at 200 and
+41-67% at 400 - **rising with scale**, which is the opposite of the intuition
+that small parts pack better. They do; there are just not enough of them. At
+100 mm a model needs one or two sheets and the half-empty last one is most of
+the average, while at 400 mm there are dozens of sheets and only the tail is
+wasted. Utilisation is a statement about how many sheets there are as much as
+about the packer.
+
+**At 400 mm the primitives cannot be cut at all.** A 400 mm box is six faces
+each larger than the bed, and bed splitting only cuts along fold edges, so
+nothing can be done with them - that is milestone 4, and the `oversize` column
+is what makes it visible. It reported `0 sheets` and `1190% util` before:
+utilisation was area over `max(sheets, 1)` counting parked parts that are on
+no sheet, and zero sheets reads as the best score in the column.
+
+Which is also a live incentive in the cost function, since the sheet count
+only counts PLACED parts: without `Weights.oversize` a candidate that makes
+more parts too big to place reports FEWER sheets and scores better for it.
+Nothing in the corpus has exercised that yet. The weight is 500 - worse than
+any number of sheets, because it is not a cost but a part that cannot be cut.
 
 **A splinter is measured by `layout.inscribed_width`, not by area.** The
 largest circle that fits is the honest answer to "can I hold this while the
@@ -179,14 +214,27 @@ pack's 23, 13 and 2 on torus, annulus and pikachu) for 2x to 12x less time,
 and `pack` runs it anyway, so the reported number can only be this one or
 better. A finalist costs 10.6 s on a torus rather than 22.1.
 
-**Six finalists, not three, and annulus is why.** Its best net - 11 sheets -
-ranks *fifth* on the quick score, so a three-deep shortlist never saw it and
-the optimiser settled for 13. The quick score ranks well enough to shortlist
-and nowhere near well enough to decide, which is the whole reason the two
-tiers exist; the answer is to let more candidates through, not to trust the
-cheap one further. With six: annulus 12 sheets to **11** and utilisation 57.5
-to 62.7, torus back to 21, pikachu 3 to 2. `count_sheets=False` restores the
-old blindness, which is what the switch is for.
+**The shortlist depth is the binding constraint, and it has to follow what a
+pack costs.** Six rather than three because of annulus, whose best net - 11
+sheets - ranks *fifth* on the quick score. Then a 100 mm cylinder showed the
+other end of it: every candidate scored 44.3 or 44.4, so the order among them
+is arbitrary, the one thing that differs (one sheet or two) is invisible to
+the cheap tier, and the optimiser returned a 2-sheet net while the plain path
+found a 1-sheet one. The quick score ranks well enough to shortlist and
+nowhere near well enough to decide - which is the entire reason there are two
+tiers - so where packs are cheap, pack far more of them.
+
+`FINALIST_WORK // islands`, floored at `finalists` and capped at
+`FINALIST_CAP`: 2 islands buys 24 finalists, a 53-island torus gets 6. A
+function of the ISLAND COUNT and deliberately not of a clock - a time budget
+would make the answer depend on the machine, and a net that changes when you
+run it somewhere else is not one you can hand to anybody.
+
+It does not fix everything, and the place it cannot is worth naming: a 400 mm
+annulus has 62 islands, so it gets the floor of six, and its 22-sheet net is
+not among them - the optimiser returns 24 where the plain path finds 22. Depth
+is affordable exactly where it is least needed. `count_sheets=False` restores
+the old blindness, which is what the switch is for.
 
 Note the term changes what the optimiser *wants*: annulus goes from 26 islands
 at 13 sheets to 36 islands at 11, and pays 4% more seam for it. That is the

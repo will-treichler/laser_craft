@@ -452,6 +452,7 @@ def tighten(parts: list[Part], sheets: int, mat: Material) -> int:
     for src in sorted(by, reverse=True):
         targets = sorted(k for k in by if k < src)
         for part in list(by[src]):
+            masks = None
             for dst in targets:
                 geo = [q.cut for q in by[dst]]
                 spot = find_spot(part, geo, [q.bounds for q in by[dst]],
@@ -460,7 +461,9 @@ def tighten(parts: list[Part], sheets: int, mat: Material) -> int:
                     if dst not in grids:
                         occ, shape = sheet_occupancy(parts, dst, mat)
                         grids[dst] = (np.fft.rfft2(occ, s=shape), shape)
-                    spot = raster_spot(part, *grids[dst], mat)
+                    if masks is None:
+                        masks = part_masks(part, mat)
+                    spot = raster_spot(part, *grids[dst], mat, masks=masks)
                 if spot is None and budget > 0:
                     # Exact geometry, where the raster is conservative by most
                     # of a cell. Last because it is the expensive one.
@@ -670,22 +673,35 @@ def sheet_occupancy(parts, sheet: int, mat: Material, res: float = RASTER_RES):
     return occ, (gh, gw)
 
 
+def part_masks(part: Part, mat: Material, res: float = RASTER_RES,
+               angles=RASTER_ANGLES) -> list:
+    """Every rotation of one part, rasterised once.
+
+    Rasterising is `shapely.contains_xy` over a grid and costs far more than
+    the transform that consumes it, so a part asked about twenty sheets must
+    be rasterised once rather than twenty times. At a 400 mm model that is the
+    difference between seconds and minutes.
+    """
+    return [raster_mask(affinity.rotate(part.cut, a, origin="centroid"),
+                        res, mat.part_gap) for a in angles]
+
+
 def raster_spot(part: Part, F, shape, mat: Material, res: float = RASTER_RES,
-                angles=RASTER_ANGLES):
+                angles=RASTER_ANGLES, masks=None):
     """Bottom-left room for one part on an already-transformed sheet, as a
     `_put` result - or None if there is none.
 
     `F` is the sheet's occupancy transform, shared across every part tried
-    against that sheet, which is what makes asking twenty sheets about one
+    against that sheet; `masks` is the part's own rasters, shared across every
+    sheet it is tried on. Both are what make asking twenty sheets about one
     part affordable.
     """
     gh, gw = shape
     pad = mat.part_gap / 2.0 + res * 0.7072
     best = None
-    for ang in angles:
-        m, _mx0, _my0 = raster_mask(affinity.rotate(part.cut, ang,
-                                                    origin="centroid"),
-                                    res, mat.part_gap)
+    for ang, (m, _mx0, _my0) in zip(angles,
+                                    masks or part_masks(part, mat, res,
+                                                        angles)):
         ok = free_offsets(F, shape, m)
         if ok is None or not ok.any():
             continue

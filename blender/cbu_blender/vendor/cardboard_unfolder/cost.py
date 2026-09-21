@@ -80,6 +80,14 @@ class Weights:
     compared with each other and stay meaningful when the model changes scale.
     """
     splinter: float = 100.0    # islands too small to hold. Dominant, by intent.
+    # Per part no sheet can hold. Worse than any number of sheets, because it
+    # is not a cost at all - it is a part that cannot be cut, and a net with
+    # one is not a net. It has to be weighted rather than ignored: the sheet
+    # count only counts PLACED parts, so without this a candidate that makes
+    # more parts too big to place reports FEWER sheets and scores better for
+    # it. Nothing in the corpus has exercised that yet; the incentive is real
+    # whether or not it has fired.
+    oversize: float = 500.0
     sheet: float = 20.0        # per sheet
     seam: float = 6.0          # total cut length, in units of sqrt(net area)
     neck: float = 3.0          # per near-pinch
@@ -157,7 +165,7 @@ def island_widths(islands: list[Island], quick: bool = False) -> list:
 
 def score_islands(islands: list[Island], mat: Material, sheets: int | None = None,
                   w: Weights | None = None, quick: bool = False,
-                  widths: list | None = None) -> Score:
+                  widths: list | None = None, oversize: int = 0) -> Score:
     """One number for a whole net, plus the breakdown that justifies it.
 
     `sheets` is the packed sheet count when one is in hand; leave it None in
@@ -235,6 +243,8 @@ def score_islands(islands: list[Island], mat: Material, sheets: int | None = Non
         terms["neck"] = w.neck * necks
     if sheets is not None:
         terms["sheet"] = w.sheet * float(sheets)
+    if oversize:
+        terms["oversize"] = w.oversize * float(oversize)
 
     return Score(total=float(sum(terms.values())), terms=terms,
                  widths=list(widths), splinters=splinters)

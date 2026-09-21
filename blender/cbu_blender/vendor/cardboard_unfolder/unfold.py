@@ -420,6 +420,15 @@ def mend(pm: PolyMesh, G: nx.Graph, forest: nx.Graph, pos: dict,
     return forest, pos, bad, extra, welds
 
 
+# Roughly how many island-packs a finalist stage may spend, and the ceiling
+# on how many candidates that can buy. Packing cost is close to linear in the
+# island count, so dividing by it spends about the same effort on a 2-island
+# model as on a 50-island one - and spends it where it buys something, since
+# that is exactly where the quick score has nothing to say.
+FINALIST_WORK = 60
+FINALIST_CAP = 24
+
+
 def optimise(pm: PolyMesh, G: nx.Graph, mat, trials: int = 60, seed: int = 0,
              max_size: tuple | None = None, budget: int = 10,
              finalists: int = 6, weights=None, splinter_width: float = 0.0,
@@ -472,6 +481,20 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
     affordable, and six is what annulus needs: its best net (11 sheets) ranks
     fifth on the quick score and never reached a three-deep shortlist.
 
+    **How many finalists is decided by how much a pack costs**, which is the
+    island count and nothing else. On a small model the quick score has almost
+    nothing to separate candidates by - a 100 mm cylinder scored every one of
+    them 44.3 or 44.4 - so the shortlist is essentially arbitrary, and the
+    thing that actually differs (one sheet or two) is invisible to it. There
+    the packs are cheap and the answer is to pack far more of them: 2 islands
+    buys 24 finalists. A 53-island torus pays ten seconds a pack and gets the
+    floor of six.
+
+    `finalists` is that floor and `FINALIST_WORK` the numerator. Deliberately
+    a function of the ISLAND COUNT rather than of a clock: a time budget would
+    make the answer depend on the machine, and a net that changes when you run
+    it somewhere else is not one you can hand to anybody.
+
     `count_sheets=False` turns it off, which is what the term's absence used
     to be.
 
@@ -511,26 +534,33 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
         return None
 
     cands.sort(key=lambda c: c[0])
+    n_isl = max(1, len(build_islands(pm, G, cands[0][2], cands[0][3])))
+    deep = int(min(FINALIST_CAP, max(finalists, FINALIST_WORK // n_isl)))
+    if verbose:
+        print(f"  {len(cands)} candidate(s), {n_isl} island(s) in the best -> "
+              f"{deep} finalist(s)")
     best = None
     for rank, (_q, i, T, pos, bad, extra, welds) in enumerate(
-            cands[:max(1, finalists)]):
+            cands[:max(1, deep)]):
         splits = oversize = 0
         bed = []
         if max_size is not None:
             T, pos, splits, oversize, bed = split_to_fit(pm, T, pos, *max_size)
             bad = overlapping_pairs(T, pos)
         isl = build_islands(pm, G, T, pos)
-        sheets = None
+        sheets, n_over = None, 0
         if count_sheets and mat is not None:
             # Deferred, and it has to be: layout imports this module, so the
             # two can only meet inside a call. Packing throwaway copies, so
             # nothing the caller holds is moved by the measurement.
             from .layout import build_parts, raster_pack
             try:
-                sheets, _over = raster_pack(build_parts(isl, mat), mat)
+                sheets, over = raster_pack(build_parts(isl, mat), mat)
+                n_over = len(over)
             except Exception:                           # noqa: BLE001
                 sheets = None       # a cost term is never worth failing a solve
-        full = score_islands(isl, mat, sheets=sheets, w=weights)
+        full = score_islands(isl, mat, sheets=sheets, w=weights,
+                             oversize=n_over)
         if verbose:
             print(f"  finalist {rank + 1} (trial {i + 1}): "
                   f"{sheets} sheet(s), {full.report()}")
@@ -540,8 +570,7 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
         if best is None or full.total < best[3]["cost"]:
             best = (T, pos, bad, stats)
         if progress is not None and not progress(
-                rank + 1, min(finalists, len(cands)),
-                f"scoring {rank + 1}"):
+                rank + 1, min(deep, len(cands)), f"scoring {rank + 1}"):
             break
 
     T, pos, bad, stats = best
