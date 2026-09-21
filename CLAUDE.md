@@ -26,6 +26,7 @@ python blender/dev_install.py           # symlink add-on into Blender
 python tools/bench.py --json base.json  # the corpus, saved
 python tools/bench.py --baseline base.json   # ...and what moved since
 python tools/bench.py --optimise             # cost-driven tree search
+python tools/render_packs.py                 # draw every sheet, to out/packs
 ```
 
 ## Architecture
