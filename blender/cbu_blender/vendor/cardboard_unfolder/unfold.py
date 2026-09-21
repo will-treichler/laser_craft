@@ -422,8 +422,9 @@ def mend(pm: PolyMesh, G: nx.Graph, forest: nx.Graph, pos: dict,
 
 def optimise(pm: PolyMesh, G: nx.Graph, mat, trials: int = 60, seed: int = 0,
              max_size: tuple | None = None, budget: int = 10,
-             finalists: int = 3, weights=None, splinter_width: float = 0.0,
-             neck_width: float = 0.0, progress=None, verbose: bool = False):
+             finalists: int = 6, weights=None, splinter_width: float = 0.0,
+             neck_width: float = 0.0, count_sheets=True, progress=None,
+             verbose: bool = False):
     """Choose a tree by what the finished net costs, not by how it starts.
 
     `search` ranks candidates by how many faces overlap, and only among the
@@ -453,8 +454,26 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
     (torus stayed at 23 sheets, its repair cuts went 6 to 15). Kept cheap.
 
     The finalists ARE split properly and scored with the full cost, which the
-    quick tier cannot match: it bounds splinters rather than measuring them
-    and never looks at necks.
+    quick tier cannot match: it bounds splinters rather than measuring them,
+    never looks at necks, and - until the packer got fast enough - could not
+    see sheets at all.
+
+    **Sheets are counted by actually packing the finalists.** Both cheap
+    estimates were tried and neither ranks: area is conserved so it is the
+    same constant for every candidate, and shelving the minimum-area
+    rectangles reads [3, 4, 4, 4] against a real [3, 2, 2, 2] on pikachu,
+    because rectangles cannot see nesting and these nets nest.
+
+    `raster_pack` alone rather than `pack`, because it gives the SAME count -
+    23, 13 and 2 sheets against pack's 23, 13 and 2 on torus, annulus and
+    pikachu - for 2x to 12x less time, and because `pack` runs it anyway, so
+    the final reported number can only be this one or better. A finalist then
+    costs 10.6 s on a torus instead of 22.1, which is what makes six of them
+    affordable, and six is what annulus needs: its best net (11 sheets) ranks
+    fifth on the quick score and never reached a three-deep shortlist.
+
+    `count_sheets=False` turns it off, which is what the term's absence used
+    to be.
 
     `progress(done, total, note) -> bool` is called once per candidate and
     returning False stops the search, which then answers with the best it has.
@@ -501,12 +520,23 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
             T, pos, splits, oversize, bed = split_to_fit(pm, T, pos, *max_size)
             bad = overlapping_pairs(T, pos)
         isl = build_islands(pm, G, T, pos)
-        full = score_islands(isl, mat, w=weights)
+        sheets = None
+        if count_sheets and mat is not None:
+            # Deferred, and it has to be: layout imports this module, so the
+            # two can only meet inside a call. Packing throwaway copies, so
+            # nothing the caller holds is moved by the measurement.
+            from .layout import build_parts, raster_pack
+            try:
+                sheets, _over = raster_pack(build_parts(isl, mat), mat)
+            except Exception:                           # noqa: BLE001
+                sheets = None       # a cost term is never worth failing a solve
+        full = score_islands(isl, mat, sheets=sheets, w=weights)
         if verbose:
-            print(f"  finalist {rank + 1} (trial {i + 1}): {full.report()}")
+            print(f"  finalist {rank + 1} (trial {i + 1}): "
+                  f"{sheets} sheet(s), {full.report()}")
         stats = dict(extra_cuts=extra, rewelds=welds, size_splits=splits,
                      oversize=oversize, bed=bed, cost=full.total,
-                     terms=full.terms, trial=i + 1)
+                     terms=full.terms, trial=i + 1, sheets=sheets)
         if best is None or full.total < best[3]["cost"]:
             best = (T, pos, bad, stats)
         if progress is not None and not progress(
@@ -1335,7 +1365,8 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
            forced_cuts: set = (), forced_folds: set = (),
            verbose: bool = False, splinter_width: float = 0.0,
            neck_width: float = 0.0, weights=None, mat=None,
-           budget: int = 10, finalists: int = 3, progress=None):
+           budget: int = 10, finalists: int = 6, count_sheets: bool = True,
+           progress=None):
     """Full unfold: search, repair overlaps, then split anything too big.
 
     max_size is the island limit in mm, which should already have room
@@ -1365,7 +1396,7 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
             pm, G, mat, trials=trials, seed=seed, max_size=max_size,
             budget=budget, finalists=finalists, weights=weights,
             splinter_width=splinter_width, neck_width=neck_width,
-            progress=progress, verbose=verbose)
+            count_sheets=count_sheets, progress=progress, verbose=verbose)
         used, extra, welds = st["trials_used"], st["extra_cuts"], st["rewelds"]
         splits, oversize, bed = st["size_splits"], st["oversize"], st["bed"]
         cost = st["cost"]

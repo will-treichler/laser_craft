@@ -728,6 +728,35 @@ def test_the_optimiser_answers_with_a_net_that_could_be_cut(name, tm):
     assert stats["candidates"] >= 1
 
 
+def test_the_optimiser_can_see_sheets():
+    """The term it spent two failed estimates trying to avoid paying for.
+
+    Area cannot rank candidates (it is conserved) and bounding boxes rank them
+    backwards, so the count comes from actually packing each finalist. That
+    costs real time, so the switch has to exist - and has to be the thing that
+    decides whether the term is there at all, rather than the term quietly
+    going missing.
+    """
+    from cardboard_unfolder.cost import Weights
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    G = pm.dual_graph()
+    mat = Material()
+    limit = mat.usable_bed
+
+    on = optimise(pm, G, mat, trials=4, seed=0, max_size=limit, budget=4,
+                  finalists=2, count_sheets=True)
+    off = optimise(pm, G, mat, trials=4, seed=0, max_size=limit, budget=4,
+                   finalists=2, count_sheets=False)
+    assert on[3]["sheets"] is not None and on[3]["sheets"] >= 1
+    assert off[3]["sheets"] is None
+    assert "sheet" in on[3]["terms"], "the term is missing when it was asked for"
+    assert "sheet" not in off[3]["terms"], "the term is there when it was not"
+    # ...and it is worth what the weights say it is worth
+    w = Weights()
+    assert on[3]["terms"]["sheet"] == pytest.approx(
+        w.sheet * on[3]["sheets"], rel=1e-9)
+
+
 def test_the_optimiser_stops_when_progress_says_to():
     """A minute of silence is indistinguishable from a hang, so the core
     reports - and a caller that reports can also refuse to continue."""

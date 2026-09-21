@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 284 core invariants (~100 s)
+python -m pytest tests -q               # 285 core invariants (~110 s)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -66,11 +66,11 @@ it, and what `--optimise` adds on top:
 
 | model | islands | splinters | tiny | min width | sheets | seam mm |
 |---|---|---|---|---|---|---|
-| pikachu | 26 -> 8 -> **9** | 12 -> 2 -> **2** | 4 -> 1 -> **0** | 3.1 -> 3.3 -> **10.3** | 2 -> 3 -> **2** | 6998 -> 6176 -> 6169 |
-| annulus | 35 -> 34 -> **26** | 0 | 0 | 32.9 -> 32.9 -> **70.8** | 13 -> 12 -> *13* | 16949 -> 16712 -> **14786** |
+| pikachu | 26 -> 8 -> **8** | 12 -> 2 -> **2** | 4 -> 1 -> **0** | 3.1 -> 3.3 -> **9.9** | 2 -> 3 -> **2** | 6998 -> 6176 -> 6197 |
+| annulus | 35 -> 34 -> *36* | 0 | 0 | 32.9 | 13 -> 12 -> **11** | 16949 -> 16712 -> *17349* |
 | icosphere2 | 9 -> 9 -> **8** | 0 | 0 | 26.8 | 4 | 9976 -> 9976 -> 9880 |
-| capsule | 6 -> 6 -> *7* | 0 | 0 | 38.6 -> *18.0* | 2 | 5183 -> 5183 -> **4937** |
-| torus | 57 -> 53 -> 53 | 0 | 0 | 63.4 | 21 -> 21 -> *22* | 32858 -> 31906 -> *32383* |
+| capsule | 6 -> 6 -> *7* | 0 | 0 | 38.6 -> *18.0* | 2 | 5183 -> 5183 -> **5031** |
+| torus | 57 -> 53 -> 53 | 0 | 0 | 63.4 | 21 | 32858 -> 31906 -> *32695* |
 
 Half of pikachu's islands could not be held, and **repair was where they came
 from**: 25 extra cuts against 0-1 from bed splitting. Phase 2's regret pass
@@ -81,10 +81,9 @@ named below: the search cannot see sheets.
 
 `--optimise` is opt-in and the committed baseline is the plain path, because
 it costs roughly 3x the time - it has to mend each candidate before it can
-score one. It still gives up a sheet on annulus and torus, which is the same
-one cause each time and is named below: **the search has no sheet term**. The
-raster packer took the plain path to 12 and 21 sheets there, so what the
-optimiser now trades away is a better number than it used to be beaten by.
+score one, and now pack each finalist on top of that. **No model is worse on
+sheets**; what it trades away is island count and seam length, in that order,
+which is the priority it was given.
 
 **A splinter is measured by `layout.inscribed_width`, not by area.** The
 largest circle that fits is the honest answer to "can I hold this while the
@@ -171,11 +170,27 @@ full cost. Two things that looked more principled and were measured out:
   pikachu the estimate read [3, 4, 4, 4] against a real [3, 2, 2, 2].
   Rectangles cannot see nesting, and these nets nest.
 
-So **the search has no sheet term**, and that is exactly why torus loses one:
-22 to 23 sheets is 20 points of cost the optimiser cannot see, against an
-islands/seam trade that nets out near zero. Hooking the real packer in belongs
-with the packer rewrite; `layout.pack` is 29 s on a torus, which is not a
-thing to call once per candidate.
+So the sheet count is **measured, by packing each finalist** - the only
+option left once both estimates had been tried. That was out of the question
+while a torus pack cost 29 s and is affordable now that `raster_pack` does it
+in one: it returns the SAME count as `pack` (23, 13 and 2 sheets against
+pack's 23, 13 and 2 on torus, annulus and pikachu) for 2x to 12x less time,
+and `pack` runs it anyway, so the reported number can only be this one or
+better. A finalist costs 10.6 s on a torus rather than 22.1.
+
+**Six finalists, not three, and annulus is why.** Its best net - 11 sheets -
+ranks *fifth* on the quick score, so a three-deep shortlist never saw it and
+the optimiser settled for 13. The quick score ranks well enough to shortlist
+and nowhere near well enough to decide, which is the whole reason the two
+tiers exist; the answer is to let more candidates through, not to trust the
+cheap one further. With six: annulus 12 sheets to **11** and utilisation 57.5
+to 62.7, torus back to 21, pikachu 3 to 2. `count_sheets=False` restores the
+old blindness, which is what the switch is for.
+
+Note the term changes what the optimiser *wants*: annulus goes from 26 islands
+at 13 sheets to 36 islands at 11, and pays 4% more seam for it. That is the
+priority ordering working, not a regression - but it is why island count and
+seam are the columns that now move the wrong way.
 
 **Mend had to get 10x faster before any of this was affordable**, and the two
 fixes are both "stop recomputing what cannot have changed":
@@ -381,6 +396,12 @@ the win is the question being asked, not the resolution it is asked at - and
 "a finer sweep" is exactly what plateaued before. Restarting with a jittered
 order buys one more sheet on torus (21 -> 20) for six times the work, which is
 why the single pass is what ships.
+
+**2 mm is a floor, though, not the middle of a plateau.** Turning the cell
+size *down* changes nothing; turning it up costs sheets immediately - 3 mm
+takes torus 23 to 24 and annulus 13 to 14, and 4 mm takes pikachu 2 to 3. The
+padding is half a cell diagonal, so a coarser grid does not just blur the
+answer, it fattens every part.
 
 **The mask must be a provable superset of the part, and dilation is not.**
 Sampling cell centres under-covers by up to a cell, and a cell is 2 mm of real
@@ -1305,27 +1326,21 @@ Done: M1 (core), M4 (Blender add-on), debug tooling.
 
 Not done, roughly in value order:
 
-1. **A sheet term in the cost function.** The search is blind to the one
-   number after splinters that the user cares about, and it costs a sheet on
-   annulus and torus. Both cheap estimates were measured and ranked backwards
-   (see above), so this needs the real packer in the finalist stage - now
-   affordable in a way it was not, since `raster_pack` is ten times faster
-   than `pack` on pikachu.
-2. **2D seam editing.** Partly done: `cbu.edit_seam` cuts or welds the
+1. **2D seam editing.** Partly done: `cbu.edit_seam` cuts or welds the
    selected edge from the UV editor and re-unfolds, and `cbu.repack` re-nests
    on demand. Still click-to-pick only - no modal drag-along-a-path tool.
    PolyZamboni's `operators.py:890` is a working reference for Image-Editor
    modal plumbing.
-3. **Better sequences for the raster packer.** It is still greedy
+2. **Better sequences for the raster packer.** It is still greedy
    bottom-left in decreasing-area order; jittered restarts already find one
    more sheet on torus, and annealing over sequence and rotation is the
    documented way past that. The collision test is no longer what limits it.
-4. **Live re-unfold** on seam change.
-5. **Splitting a single oversized face.** Bed splitting only cuts along fold
+3. **Live re-unfold** on seam change.
+4. **Splitting a single oversized face.** Bed splitting only cuts along fold
    edges, so one face bigger than the bed still fails. Needs an in-plane cut
    plus a splice — for cardboard, a glued backing strip, not an interlock.
-6. **Tab side assignment as 2-SAT** (currently greedy; skipped seams get taped).
-7. **Flute-direction constraint.** Deliberately off (`Material.lock_grain`);
+5. **Tab side assignment as 2-SAT** (currently greedy; skipped seams get taped).
+6. **Flute-direction constraint.** Deliberately off (`Material.lock_grain`);
    costume tolerance doesn't need it. Turn on if a part visibly racks.
 
 ## Conventions
