@@ -31,6 +31,32 @@ from cardboard_unfolder.layout import (build_parts, inscribed_width,  # noqa: E4
 from cardboard_unfolder.unfold import mirrored_faces, unfold          # noqa: E402
 
 
+def stl_triangles(path) -> int | None:
+    """How many triangles a binary STL holds, from its header alone.
+
+    A binary STL is an 80-byte header, a uint32 count, then exactly 50 bytes
+    per triangle - so the size arithmetic both gives the count and proves the
+    file really is binary. None means "could not tell, load it and see".
+
+    Worth the 84 bytes: the helmet is over the budget and gets skipped, but it
+    was being fully parsed first, which is most of a minute of every single
+    bench run before any measuring starts.
+    """
+    try:
+        size = path.stat().st_size
+        if size < 84:
+            return None
+        with open(path, "rb") as fh:
+            head = fh.read(84)
+        # Note the leading word is NOT the test: an ASCII file starts
+        # "solid", and so can a binary one whose 80-byte header happens to.
+        # The size arithmetic is what settles it.
+        n = int.from_bytes(head[80:84], "little")
+        return n if 84 + 50 * n == size else None
+    except OSError:
+        return None
+
+
 def corpus(height_mm: float, max_tris: int = 20000):
     """Models that stress different things, smallest first.
 
@@ -58,12 +84,20 @@ def corpus(height_mm: float, max_tris: int = 20000):
         f = ROOT / path
         if not f.is_file():
             continue
-        tm = trimesh.load(str(f), force="mesh", process=True)
         # A budget, because "low poly" in a filename is not a fact. The spartan
         # helmet is 499,992 triangles and the coplanar merge only removes 18%
         # of them - it is a smooth scan, not a faceted model, and there is
         # nothing here to unfold until it has been decimated. Benchmarking it
         # means waiting minutes to measure a case nobody can cut.
+        #
+        # Read the count from the header where that is possible, so an
+        # over-budget model is skipped without being parsed at all.
+        n = stl_triangles(f)
+        if n is not None and n > max_tris:
+            say(f"  skip {name}: {n} triangles, over the {max_tris} budget "
+                f"- decimate it first")
+            continue
+        tm = trimesh.load(str(f), force="mesh", process=True)
         if len(tm.faces) > max_tris:
             say(f"  skip {name}: {len(tm.faces)} triangles, over the "
                 f"{max_tris} budget - decimate it first")
@@ -93,7 +127,12 @@ def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
     widths = [inscribed_width(p.cut) for p in parts]
     necks = sum(narrow_necks(p.cut, max(3.0, 2.0 * mat.thickness)) for p in parts)
     seam_mm = sum(c.length for i in islands for c in i.cuts if c.seam >= 0)
-    area = sum(p.cut.area for p in parts)
+    # PLACED parts only. A part too big for the bed is parked rather than
+    # placed, and counting its area against the sheets it is not on reports
+    # utilisations above 100% - a 400 mm annulus read 125.4%, and a 400 mm box
+    # read 1190% on zero sheets, which is a model that cannot be cut at all
+    # announcing the best score in the table.
+    area = sum(p.cut.area for p in parts if p.sheet >= 0)
     bed_area = mat.usable_bed[0] * mat.usable_bed[1]
 
     # The pre-split positions are the only frame in which faces are comparable;
@@ -114,8 +153,14 @@ def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
         tiny=sum(1 for w in widths if w < mat.splinter_width / 3.0),
         min_width=round(min(widths), 1) if widths else 0.0,
         med_width=round(float(np.median(widths)), 1) if widths else 0.0,
-        necks=necks, sheets=sheets, oversize=len(over),
-        util=round(100.0 * area / max(sheets, 1) / bed_area, 1),
+        necks=necks, sheets=sheets,
+        # Parts no sheet can hold. Invisible in every other column - not in
+        # the area, not on a sheet, and counted as islands - so without a
+        # column of its own the table says nothing about a model the splitter
+        # cannot finish. Bed splitting only cuts along fold edges, so a single
+        # FACE bigger than the bed has no answer here at all (milestone 4).
+        oversize=len(over),
+        util=round(100.0 * area / sheets / bed_area, 1) if sheets else 0.0,
         seam_mm=round(seam_mm),
         extra_cuts=rep["extra_cuts"], size_splits=rep["size_splits"],
         mirrored=mirrored, unresolved=rep["unresolved"],
@@ -127,13 +172,14 @@ def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
 COLS = [("model", "%-11s"), ("faces", "%5d"), ("islands", "%7d"),
         ("splinters", "%9d"), ("tiny", "%4d"), ("min_width", "%9.1f"),
         ("necks", "%5d"),
-        ("sheets", "%6d"), ("util", "%5.1f"), ("seam_mm", "%7d"),
+        ("sheets", "%6d"), ("oversize", "%8d"), ("util", "%5.1f"),
+        ("seam_mm", "%7d"),
         ("extra_cuts", "%10d"), ("mirrored", "%8d"),
         ("t_unfold", "%8.2f"), ("t_pack", "%6.2f")]
 # Lower is better for all of these; util is the one that wants to go up.
 BETTER_UP = {"util"}
-WATCH = ["islands", "splinters", "tiny", "sheets", "util", "seam_mm",
-         "extra_cuts",
+WATCH = ["islands", "splinters", "tiny", "sheets", "oversize", "util",
+         "seam_mm", "extra_cuts",
          "mirrored"]
 
 

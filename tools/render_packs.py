@@ -5,6 +5,14 @@ half-empty sheet is obvious rather than something you have to measure. Drawn
 from the real Part outlines - the thing the laser follows, tabs and relief
 included - not from the island UVs, which are smaller and would flatter the
 packer.
+
+Every picture states the bed and the model height, because a packing can only
+be judged against them: the same net is a packing problem at 100 mm, where
+several parts share a sheet, and a SPLITTING problem at 400 mm, where bed
+splitting has already decided almost everything and each piece nearly fills a
+sheet on its own.
+
+    python tools/render_packs.py [outdir] [model substring] [height mm]
 """
 import sys, pathlib, time
 sys.path.insert(0, str(pathlib.Path("tools").resolve()))
@@ -22,7 +30,8 @@ U = importlib.import_module("cardboard_unfolder.unfold")
 
 OUT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "out/packs")
 OUT.mkdir(parents=True, exist_ok=True)
-ONLY = sys.argv[2] if len(sys.argv) > 2 else None
+ONLY = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "-" else None
+HEIGHT = float(sys.argv[3]) if len(sys.argv) > 3 else 200.0
 
 mat = Material.from_flute("B")
 mat.bed = (300.0, 300.0)
@@ -69,11 +78,21 @@ def draw(ax, parts, sheet):
     return area
 
 
-for name, tm in bench.corpus(200.0):
+def scale_bar(ax):
+    """100 mm against the sheet, so the parts have a size and not just a
+    shape. Drawn inside the margin, where nothing is ever placed."""
+    y = mat.sheet_margin * 0.45
+    ax.plot([m, m + 100.0], [y, y], color="#555555", lw=1.4,
+            solid_capstyle="butt", zorder=4)
+    ax.text(m + 50.0, y + 1.5, "100 mm", ha="center", va="bottom",
+            fontsize=6, color="#555555", zorder=4)
+
+
+for name, tm in bench.corpus(HEIGHT):
     if ONLY and ONLY not in name:
         continue
     for label, kw in (("plain", {}), ("optimise", dict(mat=mat, budget=10))):
-        pm = PolyMesh.from_trimesh(tm).scale_to_height(200.0)
+        pm = PolyMesh.from_trimesh(tm).scale_to_height(HEIGHT)
         t = time.perf_counter()
         isl, rep = U.unfold(pm, trials=60, seed=0, max_size=limit,
                             splinter_width=mat.splinter_width, **kw)
@@ -83,21 +102,35 @@ for name, tm in bench.corpus(200.0):
 
         cols = min(max(sheets, 1), 6)
         rows = int(np.ceil(max(sheets, 1) / cols))
-        fig, axes = plt.subplots(rows, cols, figsize=(2.5 * cols, 2.8 * rows),
+        # A one-sheet model still needs a figure wide enough for the caption,
+        # which is where the bed and the height live - a picture that crops
+        # them is a picture you cannot judge a packing from.
+        fig, axes = plt.subplots(rows, cols,
+                                 figsize=(max(2.5 * cols, 7.5),
+                                          2.8 * rows + 0.5),
                                  squeeze=False)
         total = 0.0
         for k in range(rows * cols):
             ax = axes[k // cols][k % cols]
             if k < sheets:
                 total += draw(ax, parts, k)
+                if k == 0:
+                    scale_bar(axes[0][0])
             else:
                 ax.axis("off")
+        ext = pm.extents.round(0)
         fig.suptitle(
-            f"{name} - {label} - {len(isl)} island(s), {sheets} sheet(s), "
+            f"{name} - {label} - model {HEIGHT:.0f} mm tall "
+            f"({ext[0]:.0f} x {ext[1]:.0f} x {ext[2]:.0f} mm)   |   "
+            f"bed {W:.0f} x {H:.0f} mm, {m:.0f} mm margin, "
+            f"{mat.part_gap:.0f} mm gap\n"
+            f"{len(isl)} island(s), {sheets} sheet(s), "
             f"{100 * total / max(sheets, 1) / BED_AREA:.1f}% mean fill "
-            f"({dt:.0f}s)", fontsize=11)
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
-        path = OUT / f"pack_{name}_{label}.png"
+            f"({dt:.0f}s)", fontsize=10)
+        fig.tight_layout(rect=(0, 0, 1, 1.0 - 0.5 / (2.8 * rows + 0.5)))
+        path = OUT / f"pack_{name}_{HEIGHT:.0f}mm_{label}.png"
         fig.savefig(path, dpi=110)
         plt.close(fig)
-        print(f"{path.name}: {len(isl)} islands, {sheets} sheets", flush=True)
+        print(f"{path.name}: {len(isl)} islands, {sheets} sheets, "
+              f"{100 * total / max(sheets, 1) / BED_AREA:.1f}% fill",
+              flush=True)
