@@ -401,6 +401,23 @@ def tighten(parts: list[Part], sheets: int, mat: Material) -> int:
     44.6 x 92.2 mm part alone on a second sheet that fitted the first at 270
     degrees. A whole sheet of cardboard for a part that had a home.
 
+    Three searches, cheapest first, and they answer different questions.
+    `find_spot` offers corner positions against the skyline - right for a
+    sheet being built, useless for one that is already full. `raster_spot`
+    offers EVERY position on a 2 mm grid from one transform per sheet, which
+    is what finds a pocket in the middle of a finished sheet. `find_pocket`
+    stays last because it works on exact geometry where the raster is
+    conservative by 0.71 of a cell, so it can still place a part that needs
+    the last millimetre - and it stays budgeted, because it is the expensive
+    one.
+
+    That order matters more than it sounds. Measured on a torus at 200 mm:
+    the last sheet held ONE part at 13% full while sheet 17 sat at 56%, and
+    the part fitted sheet 17 perfectly well. `find_pocket` never got to try:
+    POCKET_BUDGET is 16 deep searches, sheet 17 is the seventeenth target, and
+    the budget was spent before the search reached it. A budget that runs out
+    in sheet order is a budget that always fails on the same sheets.
+
     Nothing already placed is moved, so this can only tie or improve. Sheets
     left empty are renumbered away; returns the new sheet count.
     """
@@ -426,10 +443,12 @@ def tighten(parts: list[Part], sheets: int, mat: Material) -> int:
     # Latest sheet first: emptying it is what removes a sheet, and its parts
     # have the most earlier sheets to choose from.
     budget = POCKET_BUDGET
-    # The free region costs a union of everything on the sheet, and it only
-    # changes when something is actually put down there. Cache it per sheet;
-    # several strays usually fail against the same one.
+    # Both the free region and the occupancy transform cost a pass over
+    # everything on the sheet and only change when something is put down
+    # there. Cache them per sheet; several strays usually fail against the
+    # same one.
     pockets: dict[int, list] = {}
+    grids: dict[int, tuple] = {}
     for src in sorted(by, reverse=True):
         targets = sorted(k for k in by if k < src)
         for part in list(by[src]):
@@ -437,9 +456,14 @@ def tighten(parts: list[Part], sheets: int, mat: Material) -> int:
                 geo = [q.cut for q in by[dst]]
                 spot = find_spot(part, geo, [q.bounds for q in by[dst]],
                                  W, H, gap, m)
+                if spot is None:
+                    if dst not in grids:
+                        occ, shape = sheet_occupancy(parts, dst, mat)
+                        grids[dst] = (np.fft.rfft2(occ, s=shape), shape)
+                    spot = raster_spot(part, *grids[dst], mat)
                 if spot is None and budget > 0:
-                    # The cheap search only offers positions on the skyline,
-                    # which is not where a pocket inside a finished sheet is.
+                    # Exact geometry, where the raster is conservative by most
+                    # of a cell. Last because it is the expensive one.
                     budget -= 1
                     if dst not in pockets:
                         pockets[dst] = free_region(geo, W, H, gap, m)
@@ -448,6 +472,7 @@ def tighten(parts: list[Part], sheets: int, mat: Material) -> int:
                 if spot is None:
                     continue
                 pockets.pop(dst, None)          # the sheet just changed
+                grids.pop(dst, None)
                 _put(part, *spot)
                 part.sheet = dst
                 by[dst].append(part)
@@ -620,6 +645,63 @@ def free_offsets(F, shape, mask: np.ndarray) -> np.ndarray:
     corr = np.fft.irfft2(F * Mk, s=(gh, gw))
     # corr[y + h - 1, x + w - 1] is the overlap of the mask placed at (x, y)
     return corr[h - 1:gh, w - 1:gw] < 0.5
+
+
+def sheet_occupancy(parts, sheet: int, mat: Material, res: float = RASTER_RES):
+    """What is already on one sheet, as a grid, ready to be correlated.
+
+    Built from where the parts actually are rather than from a packing order,
+    so it works on a finished layout - which is what `tighten` has.
+    """
+    W, H = mat.usable_bed
+    gw, gh = int(math.ceil(W / res)), int(math.ceil(H / res))
+    occ = np.zeros((gh, gw), dtype=np.float64)
+    for q in parts:
+        if q.sheet != sheet:
+            continue
+        m, mx0, my0 = raster_mask(q.cut, res, mat.part_gap)
+        gx = int(round((mx0 - mat.sheet_margin) / res))
+        gy = int(round((my0 - mat.sheet_margin) / res))
+        sub = m[max(0, -gy):, max(0, -gx):]
+        x0, y0 = max(gx, 0), max(gy, 0)
+        sub = sub[:gh - y0, :gw - x0]
+        if sub.size:
+            occ[y0:y0 + sub.shape[0], x0:x0 + sub.shape[1]] += sub
+    return occ, (gh, gw)
+
+
+def raster_spot(part: Part, F, shape, mat: Material, res: float = RASTER_RES,
+                angles=RASTER_ANGLES):
+    """Bottom-left room for one part on an already-transformed sheet, as a
+    `_put` result - or None if there is none.
+
+    `F` is the sheet's occupancy transform, shared across every part tried
+    against that sheet, which is what makes asking twenty sheets about one
+    part affordable.
+    """
+    gh, gw = shape
+    pad = mat.part_gap / 2.0 + res * 0.7072
+    best = None
+    for ang in angles:
+        m, _mx0, _my0 = raster_mask(affinity.rotate(part.cut, ang,
+                                                    origin="centroid"),
+                                    res, mat.part_gap)
+        ok = free_offsets(F, shape, m)
+        if ok is None or not ok.any():
+            continue
+        ys, xs = np.nonzero(ok)
+        k = int(np.argmin(ys * gw + xs))
+        cand = (int(ys[k]), int(xs[k]), ang)
+        if best is None or cand[:2] < best[:2]:
+            best = cand
+    if best is None:
+        return None
+    gy, gx, ang = best
+    # _put matches the part's own min corner to this box's, and the mask's
+    # origin is the PADDED min corner, so the padding comes back off here.
+    x = mat.sheet_margin + gx * res + pad
+    y = mat.sheet_margin + gy * res + pad
+    return ang, box(x, y, x + 1.0, y + 1.0)
 
 
 def raster_pack(parts: list[Part], mat: Material, res: float = RASTER_RES,

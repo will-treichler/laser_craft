@@ -10,7 +10,7 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 285 core invariants (~110 s)
+python -m pytest tests -q               # 287 core invariants (~2 min)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
@@ -70,7 +70,7 @@ it, and what `--optimise` adds on top:
 | annulus | 35 -> 34 -> *36* | 0 | 0 | 32.9 | 13 -> 12 -> **11** | 16949 -> 16712 -> *17349* |
 | icosphere2 | 9 -> 9 -> **8** | 0 | 0 | 26.8 | 4 | 9976 -> 9976 -> 9880 |
 | capsule | 6 -> 6 -> *7* | 0 | 0 | 38.6 -> *18.0* | 2 | 5183 -> 5183 -> **5031** |
-| torus | 57 -> 53 -> 53 | 0 | 0 | 63.4 | 21 | 32858 -> 31906 -> *32695* |
+| torus | 57 -> 53 -> 53 | 0 | 0 | 63.4 | 21 -> 21 -> **20** | 32858 -> 31906 -> *32695* |
 
 Half of pikachu's islands could not be held, and **repair was where they came
 from**: 25 extra cuts against 0-1 from bed splitting. Phase 2's regret pass
@@ -474,6 +474,30 @@ the seating shift that follows drags it out of the bed. That is how this first
 appeared - `part 31 ended up outside sheet 0`. For the same reason the add-on's
 bed check runs after tightening and seating, never before.
 
+**A budget spent in sheet order always fails on the same sheets.** The torus
+packing ended with ONE part alone on a sheet at 13% full while sheet 17 sat at
+56% - and the part fitted sheet 17 perfectly well. `find_pocket` never got to
+try it: `POCKET_BUDGET` is 16 deep searches, `tighten` walks targets in sheet
+order, and sheet 17 is the seventeenth. Not a tuning problem - any fixed
+budget consumed in order is a budget that never reaches the late sheets, which
+are exactly the ones with room.
+
+So `tighten` now asks three searches in cost order, and they answer different
+questions. `find_spot` offers corner positions against the skyline: right for
+a sheet being built, useless for one already full. `raster_spot` offers EVERY
+position on a 2 mm grid from one transform per sheet, and is what finds a
+pocket in the middle of a finished sheet - it runs before the budget and is
+not gated by it. `find_pocket` stays last, still budgeted, because it works on
+exact geometry where the raster is conservative by 0.71 of a cell, so it can
+still place a part that needs the last millimetre.
+
+Worth **a whole sheet**: torus 21 -> 20 with the optimiser, utilisation 62.1
+-> 65.2. It was found by looking at a picture of the packing, not by any
+number in the table - 13% on one sheet is obvious to an eye and invisible in a
+mean. Regressions:
+`test_the_raster_search_finds_a_pocket_the_corner_search_cannot`,
+`test_tighten_reaches_past_its_expensive_search_budget`.
+
 **Corner candidates cannot see a pocket.** `_corner_candidates` offers the
 cross product of the placed parts' x and y edges, which is the right heuristic
 for building a packing against a skyline and the wrong one for slotting into a
@@ -491,12 +515,14 @@ can only cost a position, never place a part on top of another. The free
 region traces round every part outline, so it carries ~3400 vertices of
 crevice detail that no part can ever occupy.
 
-Cost, honestly: on this corpus `tighten` changes no sheet count in the core
-`pack()` path - the shelf and nest layouts strand parts that genuinely do not
-fit - and it adds ~1.2 s to a pikachu pack inside a ~6 s Unfold, all of it
-spent *proving* there is no room. It earns its keep in Nest Sheets, where it
-turns 2 sheets into 1. `POCKET_BUDGET` caps the deep searches per call and the
-free region is cached per sheet.
+Cost, honestly: `tighten` changes no sheet count in the plain `pack()` path on
+this corpus - the layouts there strand parts that genuinely do not fit, which
+the raster search confirms rather than fixes - and most of its time is spent
+*proving* there is no room. It earns its keep where a tail exists: 2 sheets to
+1 in Nest Sheets, and torus 21 to 20 under the optimiser. It roughly doubled
+`t_pack` on torus (16 s to 34 s) for that sheet. `POCKET_BUDGET` caps only the
+exact search; the free region and the occupancy transform are both cached per
+sheet and dropped the moment something lands there.
 
 **Overlap checks must be component-aware.** After splitting, separate islands
 sit on top of each other in raw coordinates — meaningless, they get packed onto

@@ -1846,6 +1846,94 @@ def test_pipeline_produces_parts_that_fit_the_bed(name, tm):
         assert x1 <= m.bed[0] + 1e-6 and y1 <= m.bed[1] + 1e-6
 
 
+def _boxes_part(iid, rects, sheet=0):
+    """A Part made of plain rectangles, for packing tests that are about the
+    search rather than about any real net."""
+    from cardboard_unfolder.layout import Part
+    from shapely.ops import unary_union
+    geom = unary_union([box(*r) for r in rects])
+    empty = MultiLineString([])
+    p = Part(island_id=iid, cut=geom, perf_m=empty, perf_v=empty,
+             engrave=empty)
+    p.sheet = sheet
+    return p
+
+
+def test_the_raster_search_finds_a_pocket_the_corner_search_cannot():
+    """The capability `tighten` was missing, in isolation.
+
+    `find_spot` offers the cross product of the placed parts' edges, which is
+    the right heuristic for building against a skyline and the wrong one for a
+    hole in the middle of a finished sheet - the pocket's corners are not on
+    any part's corner grid. The raster search offers every position, so it
+    does not care where the opening is.
+    """
+    from cardboard_unfolder.layout import (find_spot, raster_spot,
+                                           sheet_occupancy)
+    m = Material.from_flute("B")
+    m.bed = (300.0, 300.0)
+    m.part_gap = 1.0
+    W, H = m.usable_bed
+    mg = m.sheet_margin
+
+    # a frame with a clear window in the middle of it
+    lo, hi = mg, mg + W
+    mid0, mid1 = mg + W * 0.38, mg + W * 0.62
+    frame = _boxes_part(0, [(lo, lo, hi, mid0),            # below
+                            (lo, mid1, hi, mg + H),        # above
+                            (lo, mid0, mid0, mid1),        # left
+                            (mid1, mid0, hi, mid1)])       # right
+    side = W * 0.2                                          # fits the window
+    stray = _boxes_part(1, [(0.0, 0.0, side, side)], sheet=1)
+
+    corner = find_spot(stray, [frame.cut], [frame.cut.bounds], W, H,
+                       m.part_gap, mg)
+    assert corner is None, "the fixture is wrong - the skyline search found it"
+
+    occ, shape = sheet_occupancy([frame, stray], 0, m)
+    spot = raster_spot(stray, np.fft.rfft2(occ, s=shape), shape, m)
+    assert spot is not None, "the raster search missed a clear central pocket"
+
+
+def test_tighten_reaches_past_its_expensive_search_budget():
+    """Regression: a budget spent in sheet order always fails on late sheets.
+
+    Measured on a torus at 200 mm - the last sheet held ONE part at 13% full
+    while sheet 17 sat at 56%, and the part fitted sheet 17 perfectly well.
+    POCKET_BUDGET is 16 deep searches and sheet 17 is the seventeenth target,
+    so the exact search was never offered it. The raster search runs before
+    that budget and is not gated by it.
+    """
+    from cardboard_unfolder.layout import tighten, POCKET_BUDGET
+    m = Material.from_flute("B")
+    m.bed = (300.0, 300.0)
+    m.part_gap = 1.0
+    W, H = m.usable_bed
+    mg = m.sheet_margin
+    home = POCKET_BUDGET + 1            # one past where the budget runs out
+
+    parts = []
+    for k in range(home + 2):
+        if k == home:
+            mid0, mid1 = mg + W * 0.38, mg + W * 0.62
+            parts.append(_boxes_part(k, [(mg, mg, mg + W, mid0),
+                                         (mg, mid1, mg + W, mg + H),
+                                         (mg, mid0, mid0, mid1),
+                                         (mid1, mid0, mg + W, mid1)], sheet=k))
+        else:                           # solid: nothing will fit beside it
+            parts.append(_boxes_part(k, [(mg, mg, mg + W, mg + H)], sheet=k))
+    stray = _boxes_part(999, [(0.0, 0.0, W * 0.2, W * 0.2)],
+                        sheet=home + 2)
+    parts.append(stray)
+
+    before = home + 3
+    after = tighten(parts, before, m)
+    assert after == before - 1, (
+        f"the stray should have moved onto sheet {home} and emptied its own "
+        f"({before} sheets -> {after})")
+    assert stray.sheet == home
+
+
 def test_the_fft_collision_test_agrees_with_counting_the_overlap():
     """The one numerical claim the raster packer rests on.
 
