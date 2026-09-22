@@ -333,7 +333,15 @@ class CBU_PT_uv(bpy.types.Panel):
         s = s_cbu(context)
         mm = 1.0 / bridge.uv_scale(s.bed_x, s.bed_y)
         lay.label(text=f'UV layer "{bridge.UV_LAYER}" is the net')
-        lay.label(text=f"1 UV unit = {mm:.0f} mm  (bed {s.bed_x:.0f}x{s.bed_y:.0f})")
+        # Named for the SPACE it describes. The Size panel has "mm per scene
+        # unit" at 1000 and this said "1 UV unit = 512 mm", and two numbers
+        # both reading "mm per unit" in one add-on read as a contradiction.
+        # They are different spaces: the 3D scene, and the UV editor's unit
+        # square, which is sized by the bed (rounded up to a power of two, so
+        # the scaling is exact) and never by the model.
+        lay.label(text=f"UV editor scale: 1 UV unit = {mm:.0f} mm")
+        lay.label(text=f"   (fits one {s.bed_x:.0f} x {s.bed_y:.0f} mm sheet; "
+                       f"set by the bed, not the model)")
         # Stacked, not in a row. Four switches side by side truncate to
         # "Sho.." at any sane panel width, and the key that goes with the
         # marks belongs beside the buttons that make them, further down.

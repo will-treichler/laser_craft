@@ -1356,8 +1356,16 @@ changes with the bed.** A 300 mm bed gives 1/512, so 1 UV unit is 512 mm; a
 600 mm bed gives 1/1024. Reading a glyph as 0.0078 UV and multiplying by the
 1024 from this file's `uv_scale` example returns exactly 8.00 mm for 4 mm
 text - a clean factor of two, and a very easy thing to conclude is a bug in
-the text. The UV panel prints the live figure (`1 UV unit = N mm`); trust
-that over any remembered constant.
+the text. The UV panel prints the live figure (`UV editor scale: 1 UV unit
+= N mm`); trust that over any remembered constant.
+
+**Two scale factors, and each label has to name its space.** The Size panel's
+`mm per scene unit` (1000) says how big the MODEL is in the 3D viewport; the
+UV panel's figure (512 at a 300 mm bed) says how the NET is stored in the UV
+editor. They are unrelated, and when both read "mm per unit" the add-on looked
+like it contradicted itself - the user asked which one was right. Neither can
+be made to match the other: the UV factor must be a power of two (exact) that
+fits one sheet in 0-1, and it depends on the bed, never the model.
 
 **Island labels need a point and an angle, not just a point.** The centroid of
 an L-shaped or horseshoe island is frequently outside it and

@@ -146,8 +146,11 @@ class CBUSettings(bpy.types.PropertyGroup):
 
     # --- size ---
     mm_per_unit: FloatProperty(
-        name="mm per unit", default=1000.0, min=0.0001,
-        description="Blender units to millimetres. 1000 if 1 unit = 1 metre")
+        name="mm per scene unit", default=1000.0, min=0.0001,
+        description="How big the MODEL is: millimetres in one Blender unit of "
+                    "the 3D scene. 1000 if 1 unit = 1 metre. This is not the "
+                    "UV editor's scale, which is set by the bed and shown in "
+                    "the UV panel")
     target_height: FloatProperty(
         name="Target height", default=0.0, min=0.0,
         description="Scale the model to this height in mm. 0 = use the "
