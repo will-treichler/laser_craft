@@ -285,6 +285,11 @@ class CBUSettings(bpy.types.PropertyGroup):
     last_sheets: IntProperty(default=0)
     last_warnings: StringProperty(default="")
     last_timings: StringProperty(default="")
+    # How the last result was reached, so the panel can say "optimised in
+    # 42 s" rather than showing an optimised net exactly like a plain one.
+    last_optimised: BoolProperty(default=False)
+    last_elapsed: FloatProperty(default=0.0)
+    last_detail: StringProperty(default="")
 
     # --- debugging ---
     log_level: EnumProperty(

@@ -509,13 +509,22 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
         splinter_width = mat.splinter_width
     rng = np.random.default_rng(seed)
 
+    def report(done, total, note):
+        return progress is None or progress(done, total, note)
+
     cands, spent, used = [], 0, 0
     for i in range(trials):
         used = i + 1
         T, pos, bad = _trial(pm, G, rng)
+        if bad and spent >= budget:
+            # Out of mending budget, but the report still has to happen. This
+            # used to `continue` straight past it, so once the budget was
+            # spent the progress bar froze for every remaining trial - and
+            # ESC, which is read through the same call, went deaf with it.
+            if not report(i + 1, trials, f"searching trees {i + 1}/{trials}"):
+                break
+            continue
         if bad:
-            if spent >= budget:
-                continue        # out of mending budget; a clean tree still counts
             spent += 1
         T, pos, bad, extra, welds = mend(pm, G, T, pos, bad,
                                          splinter_width=splinter_width,
@@ -526,8 +535,7 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
         cands.append((q.total, i, T, pos, bad, extra, welds))
         if verbose:
             print(f"  trial {i + 1}: {len(isl)} island(s), quick {q.total:.1f}")
-        if progress is not None and not progress(
-                i + 1, trials, f"tree {i + 1}/{trials}"):
+        if not report(i + 1, trials, f"searching trees {i + 1}/{trials}"):
             break
 
     if not cands:
@@ -569,8 +577,9 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
                      terms=full.terms, trial=i + 1, sheets=sheets)
         if best is None or full.total < best[3]["cost"]:
             best = (T, pos, bad, stats)
-        if progress is not None and not progress(
-                rank + 1, min(deep, len(cands)), f"scoring {rank + 1}"):
+        n_fin = min(deep, len(cands))
+        if not report(rank + 1, n_fin,
+                      f"scoring finalists {rank + 1}/{n_fin}"):
             break
 
     T, pos, bad, stats = best
@@ -1419,7 +1428,7 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
     G_full = pm.dual_graph()
     G, notes = apply_constraints(G_full, forced_cuts, forced_folds)
 
-    cost = None
+    cost = candidates = mended = None
     if mat is not None:
         forest, pos, bad, st = optimise(
             pm, G, mat, trials=trials, seed=seed, max_size=max_size,
@@ -1429,6 +1438,7 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
         used, extra, welds = st["trials_used"], st["extra_cuts"], st["rewelds"]
         splits, oversize, bed = st["size_splits"], st["oversize"], st["bed"]
         cost = st["cost"]
+        candidates, mended = st["candidates"], st["mended"]
     else:
         forest, pos, bad, used = search(pm, G, trials=trials, seed=seed,
                                         verbose=verbose, max_size=max_size)
@@ -1451,7 +1461,7 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
     report = dict(cut_arcs=cut_arcs(G_full, forest), bed_cut_arcs=bed_arcs,
                   trials_used=used, extra_cuts=extra, rewelds=welds,
                   size_splits=splits,
-                  cost=cost,
+                  cost=cost, candidates=candidates, mended=mended,
                   islands=len(islands), unresolved=len(bad),
                   oversize_islands=oversize, notes=notes,
                   isometry_error=isometry_error(pm, pos))

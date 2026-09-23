@@ -1411,6 +1411,53 @@ check(len(_seen) <= 3, f"it stopped when told ({len(_seen)} candidates)")
 check(sum(len(i.faces) for i in _job.islands) == len(_pm.faces),
       "no face went missing when the search was cut short")
 
+# -------------------------------------------- progress, and saying it is done
+# Parts and packing are the slow half on a big model and they used to run in
+# apply, on the main thread, after the progress readout had gone - so the bar
+# reached the end and Blender froze at exactly the moment it looked finished.
+_run = ops.Solve.run.__code__.co_names
+_app = ops.CBU_OT_unfold.apply.__code__.co_names
+check("build_parts" in _run and "pack" in _run,
+      "the worker thread builds and packs the parts")
+check("build_parts" not in _app and "pack" not in _app,
+      f"apply does no packing on the main thread (names: {_app})")
+
+# With the bed limit prepare() would pass - without it nothing is bed-split,
+# and the whole net comes back as one part too big for any sheet.
+_pad = 2 * _mat.tab_depth + 2 * _mat.kerf
+_lim = (_mat.usable_bed[0] - _pad, _mat.usable_bed[1] - _pad)
+_job = ops.Solve(_U, _pm, dict(trials=6, seed=0, mat=_mat, budget=2,
+                               max_size=_lim),
+                 L=ops._core()[1], mat=_mat)
+_job.run()
+check(_job.error is None, f"a packing solve does not fail ({_job.error})")
+check(_job.parts and _job.sheets and _job.sheets >= 1,
+      "the job comes back with parts and a sheet count")
+check(_job.finished is not None and _job.elapsed > 0.0,
+      "and knows how long it took")
+check(0.0 <= _job.fraction <= 1.0, f"fraction stays in range ({_job.fraction})")
+
+# One solve at a time: a second click must not start another on top.
+_prev = ops.RUNNING
+ops.RUNNING = _job
+try:
+    check(not ops.CBU_OT_unfold.poll(bpy.context),
+          "Unfold is unavailable while a solve is running")
+finally:
+    ops.RUNNING = _prev
+check(ops.CBU_OT_unfold.poll(bpy.context),
+      "...and available again once it is done")
+
+# The bar goes where the user is looking, and is repainted as it moves.
+check("draw_progress" in ui.CBU_PT_main.draw.__code__.co_names,
+      "the main panel draws the progress bar")
+check("_redraw_panels" in ops.CBU_OT_unfold.modal.__code__.co_names,
+      "the modal loop repaints the panels")
+check("_announce" in ops.CBU_OT_unfold.modal.__code__.co_names,
+      "and says so when it has finished")
+for _name in ("last_optimised", "last_elapsed", "last_detail"):
+    check(hasattr(bpy.context.scene.cbu, _name), f"scene remembers {_name}")
+
 # ------------------------------------------------------- reload operator
 # reload_all() unregisters CBU_OT_reload itself, so the operator must not
 # touch `self` afterwards - that is a use-after-free on a freed RNA type.

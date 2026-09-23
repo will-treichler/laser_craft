@@ -757,6 +757,32 @@ def test_the_optimiser_can_see_sheets():
         w.sheet * on[3]["sheets"], rel=1e-9)
 
 
+def test_the_optimiser_reports_every_trial_even_past_its_budget():
+    """Regression: the progress bar froze once the mending budget was spent.
+
+    A trial that needs mending after the budget has gone is skipped - and the
+    skip used to `continue` straight past the progress call. So the readout
+    stopped moving for the rest of the search, which on a 60-trial run with a
+    budget of 10 is most of it, and ESC went deaf too, because stopping is
+    read through the same call. Every trial must report, used or not.
+    """
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=2))
+    G = pm.dual_graph()
+    mat = Material()
+    seen = []
+
+    def watch(done, total, note):
+        seen.append((done, total, note))
+        return True
+
+    trials = 12
+    optimise(pm, G, mat, trials=trials, seed=0, budget=1, finalists=1,
+             progress=watch)
+    searching = [d for d, t, n in seen if n.startswith("searching")]
+    assert searching == list(range(1, trials + 1)), (
+        f"trials that were skipped did not report: saw {searching}")
+
+
 def test_the_optimiser_stops_when_progress_says_to():
     """A minute of silence is indistinguishable from a hang, so the core
     reports - and a caller that reports can also refuse to continue."""

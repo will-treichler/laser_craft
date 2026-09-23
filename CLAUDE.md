@@ -10,16 +10,19 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 287 core invariants (~2 min)
+python -m pytest tests -q               # 288 core invariants (~3 min)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 266 checks, real Blender API
+python blender/test_addon.py            # 282 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
 python blender/test_dev.py              # 29 checks on the debug tooling
+blender --factory-startup --python blender/gui_check.py -- out/gui
+                                        # the one path no headless suite
+                                        # reaches: a real click, screenshotted
 
 python blender/dev_install.py           # symlink add-on into Blender
 
@@ -294,6 +297,44 @@ Three things that are easy to get wrong here:
 - **The mesh must not change under the solve.** `prepare` takes an
   `overlay.geometry_fingerprint` and `apply` checks it, because writing a net
   onto geometry that has moved is wrong even though the solve itself was safe.
+
+**Progress has to be shown where the user is looking, and "done" has to
+look different from "not started".** The first version reported progress to
+`wm.progress_update` - a number on the mouse cursor - and the status bar, and
+the request that followed was "we need to show progress for the optimizer",
+because both are small, at the edges, and easy to miss entirely. Four faults,
+all fixed together:
+
+- **The bar lives in the panel**, under Unfold, via `layout.progress`, with
+  the phase as `step N of 3` - each phase counts from zero, so an unlabelled
+  bar filling and restarting reads as the run starting over. The modal loop
+  has to `tag_redraw` the sidebar itself: a worker thread changing numbers is
+  not something Blender notices, and without it the bar draws once and sits.
+- **Packing moved into the worker thread.** `build_parts` and `pack` are core
+  calls and were running in `apply` on the main thread AFTER the readout had
+  gone - on a torus that is 30 s of frozen UI at exactly the moment it looked
+  finished. `Solve.run` now does both; `apply` only writes to Blender.
+- **The core stopped reporting once the mending budget was spent.** A skipped
+  trial `continue`d straight past the progress call, so the bar froze for the
+  rest of the search - and ESC went deaf too, since stopping is read through
+  the same call (`test_the_optimiser_reports_every_trial_even_past_its_budget`).
+- **Done is its own state.** A popup (`Optimise finished in 8 s`, with the
+  result and how many candidates were weighed) waits for you, because the
+  status-bar report has scrolled away by the time anyone looks after a long
+  run. The panel keeps `Optimised in N s` above the result, which is split
+  over lines because the single line truncated to "2 shee...repair".
+
+`Unfold` is unavailable while a solve is running (`ops.RUNNING`), so a second
+click cannot start a second solve on top of the first.
+
+None of the drawing is reachable headless - invoke needs a window, the bar a
+panel, the popup a screen - so `blender/gui_check.py` drives a real window
+through a real click and screenshots it. That is how the truncated report and
+the per-phase reset were found; neither shows up in any assertion. One harness
+quirk worth knowing: `Region.active_panel_category` is read-only from Python,
+so it moves the panels onto the tab already showing, for the screenshot only.
+It also has to skip `register()` when the installed add-on is enabled, or the
+second registration raises before anything runs.
 
 **Time columns are not comparable across sessions.** Chasing an apparent 2-4x
 slowdown after this work, the giveaway was `t_pack` tripling too - and nothing

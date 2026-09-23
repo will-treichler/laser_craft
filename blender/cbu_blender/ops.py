@@ -3,6 +3,7 @@ so it inherits loop select, shortest path, box/lasso and undo for free."""
 from __future__ import annotations
 
 import threading
+import time
 import traceback
 
 import bmesh
@@ -398,6 +399,12 @@ class CBU_OT_select_marked(bpy.types.Operator):
 
 # --------------------------------------------------------------- unfold
 
+# The job running in the background, if any. The panel reads it to draw a
+# progress bar, and Unfold's poll reads it so a second click cannot start a
+# second solve on top of the first.
+RUNNING = None
+
+
 class Solve:
     """The bpy-free half of an unfold, packaged so it can run off the main
     thread while the operator keeps taking events.
@@ -415,13 +422,25 @@ class Solve:
     already better than the old rule's answer.
     """
 
-    def __init__(self, U, pm, kwargs):
+    def __init__(self, U, pm, kwargs, L=None, mat=None, timings=None):
         self.U, self.pm, self.kwargs = U, pm, kwargs
+        self.L, self.mat, self.T = L, mat, timings
         self.islands = self.rep = self.error = None
+        self.parts = self.sheets = self.oversized = None
         self.done = self.total = 0
         self.note = ""
+        self.started = time.monotonic()
+        self.finished = None
         self._stop = False
         self.ui = None          # optional main-thread callback, set by the caller
+
+    @property
+    def fraction(self) -> float:
+        return min(1.0, self.done / self.total) if self.total else 0.0
+
+    @property
+    def elapsed(self) -> float:
+        return (self.finished or time.monotonic()) - self.started
 
     def stop(self):
         self._stop = True
@@ -442,14 +461,40 @@ class Solve:
     def run(self):
         """Runs on a worker thread. Must not raise out of it: an exception on
         a thread nobody joins disappears, and the operator would report
-        success for a net that was never built."""
+        success for a net that was never built.
+
+        Parts and packing happen HERE, not in `apply`. They are core calls and
+        bpy-free, and on a big model they are the slow half - a torus packs in
+        30 s - so leaving them on the main thread meant the progress bar
+        reached the end and Blender then froze for half a minute, at exactly
+        the moment it looked finished.
+        """
         try:
-            self.islands, self.rep = self.U.unfold(self.pm,
-                                                   progress=self.progress,
-                                                   **self.kwargs)
+            with _stage(self.T, "unfold"):
+                self.islands, self.rep = self.U.unfold(
+                    self.pm, progress=self.progress, **self.kwargs)
+            if self.L is not None and self.mat is not None:
+                # No per-part hook in the packer, so this phase has a label and
+                # an elapsed time rather than a moving bar - still better than
+                # a bar sitting at 100% while nothing appears to happen.
+                self.done, self.total, self.note = 0, 0, "packing sheets"
+                with _stage(self.T, "parts"):
+                    self.parts = self.L.build_parts(self.islands, self.mat)
+                with _stage(self.T, "pack"):
+                    self.sheets, self.oversized = self.L.pack(self.parts,
+                                                              self.mat)
         except Exception as exc:                        # noqa: BLE001
             traceback.print_exc()
             self.error = exc
+        finally:
+            self.finished = time.monotonic()
+
+
+def _stage(T, name):
+    """cbulog.stage when there is a Timings to fill, a no-op when there is
+    not - a Solve built by hand in a test has none."""
+    import contextlib
+    return cbulog.stage(T, name) if T is not None else contextlib.nullcontext()
 
 
 class CBU_OT_unfold(bpy.types.Operator):
@@ -461,7 +506,8 @@ class CBU_OT_unfold(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return (context.active_object is not None
+        return (RUNNING is None
+                and context.active_object is not None
                 and context.active_object.type == "MESH")
 
     def execute(self, context):
@@ -512,7 +558,8 @@ class CBU_OT_unfold(bpy.types.Operator):
         if job is None:
             return {"CANCELLED"}
 
-        self._job = job
+        global RUNNING
+        RUNNING = self._job = job
         self._thread = threading.Thread(target=job.run, daemon=True)
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.1, window=context.window)
@@ -539,17 +586,22 @@ class CBU_OT_unfold(bpy.types.Operator):
         job = self._job
         if self._thread.is_alive():
             try:
-                total = max(1, job.total)
-                wm.progress_update(int(100 * job.done / total))
+                wm.progress_update(int(100 * job.fraction))
                 context.workspace.status_text_set(
-                    f"Unfolding: {job.note or 'searching'}"
-                    + ("  (stopping)" if job.stopping else "  -  ESC to stop"))
+                    f"Optimising: {job.note or 'starting'}  "
+                    f"({job.elapsed:.0f} s)"
+                    + ("  - stopping..." if job.stopping else "  - ESC to stop"))
             except Exception:                           # noqa: BLE001
                 pass
+            _redraw_panels(context)
             return {"RUNNING_MODAL"}
 
         self._cleanup(context)
-        return self.apply(context, job)
+        result = self.apply(context, job)
+        if "FINISHED" in result:
+            _announce(context, job)
+        _redraw_panels(context)
+        return result
 
     def cancel(self, context):
         """Blender's own cancel - a file load or a quit, not the user's ESC."""
@@ -558,6 +610,8 @@ class CBU_OT_unfold(bpy.types.Operator):
         self._cleanup(context)
 
     def _cleanup(self, context):
+        global RUNNING
+        RUNNING = None
         wm = context.window_manager
         if getattr(self, "_timer", None) is not None:
             wm.event_timer_remove(self._timer)
@@ -639,7 +693,8 @@ class CBU_OT_unfold(bpy.types.Operator):
             trials=s.trials, seed=s.seed, max_size=limit,
             forced_cuts=cuts, forced_folds=folds,
             splinter_width=mat.splinter_width,
-            mat=mat if s.optimise else None, budget=s.budget))
+            mat=mat if s.optimise else None, budget=s.budget),
+            L=L, mat=mat, timings=T)
 
     def apply(self, context, job):
         """Everything that touches Blender data, after the solve."""
@@ -658,14 +713,13 @@ class CBU_OT_unfold(bpy.types.Operator):
                 raise RuntimeError(
                     "the mesh changed while unfolding - run Unfold again")
             pm, islands, rep = job.pm, job.islands, job.rep
+            if job.parts is None:
+                raise RuntimeError("the solve finished without packing - "
+                                   "this is a bug, not a setting")
+            parts, sheets, oversized = job.parts, job.sheets, job.oversized
             for isl in islands:
                 log.debug("island %d: %d face(s), %.0f x %.0f mm, %.0f mm2",
                           isl.id, len(isl.faces), *isl.size(), isl.area())
-
-            with cbulog.stage(T, "parts"):
-                parts = L.build_parts(islands, mat)
-            with cbulog.stage(T, "pack"):
-                sheets, oversized = L.pack(parts, mat)
             with cbulog.stage(T, "write mesh"):
                 bridge.write_islands(obj.data, pm, islands)
                 # rows one usable-sheet wide, so the preview lines up with the
@@ -700,6 +754,16 @@ class CBU_OT_unfold(bpy.types.Operator):
             for w in warns[:6]:
                 self.report({"WARNING"}, w)
 
+            s.last_optimised = bool(s.optimise)
+            s.last_elapsed = job.elapsed
+            if s.optimise:
+                n, m = rep.get("candidates"), rep.get("mended")
+                s.last_detail = (
+                    ("stopped early - " if job.stopping else "")
+                    + f"best of {n} candidate(s), {m} mended"
+                    if n is not None else "")
+            else:
+                s.last_detail = ""
             if job.stopping:
                 self.report({"INFO"}, "stopped early - " + s.last_report)
             else:
@@ -715,6 +779,43 @@ class CBU_OT_unfold(bpy.types.Operator):
             if self.was_edit:
                 bpy.ops.object.mode_set(mode="EDIT")
         return {"FINISHED"}
+
+
+def _redraw_panels(context) -> None:
+    """Panels only repaint when something asks them to, and a worker thread
+    changing numbers is not something Blender notices. Without this the
+    progress bar is drawn once and then sits still."""
+    try:
+        for win in context.window_manager.windows:
+            for area in win.screen.areas:
+                if area.type in {"VIEW_3D", "IMAGE_EDITOR"}:
+                    area.tag_redraw()
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
+def _announce(context, job) -> None:
+    """Say it is finished, in a way that cannot be missed.
+
+    The status-bar report is transient and sits at the bottom edge of the
+    screen; after a run long enough to walk away from, it has scrolled off
+    before anyone looks. A popup waits for you. Only on the modal path - a
+    script or a quick plain unfold has nobody waiting on it.
+    """
+    s = context.scene.cbu
+    lines = [s.last_report, s.last_detail]
+
+    def draw(menu, _context):
+        for text in lines:
+            if text:
+                menu.layout.label(text=text)
+
+    title = ("Optimise stopped" if job.stopping else "Optimise finished") \
+        + f" in {job.elapsed:.0f} s"
+    try:
+        context.window_manager.popup_menu(draw, title=title, icon="CHECKMARK")
+    except Exception:                                   # noqa: BLE001
+        pass
 
 
 class CBU_OT_edit_seam(bpy.types.Operator):

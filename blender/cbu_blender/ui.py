@@ -8,6 +8,61 @@ from . import bridge, deps, props, log as cbulog
 CAT = "Cardboard"
 
 
+def _running():
+    """The background solve, if one is in flight. Imported late: ops imports
+    this module's panels, so the dependency cannot go the other way at the
+    top of the file."""
+    from . import ops
+    return ops.RUNNING
+
+
+# The phases a run goes through, in order, as (label, note prefix). The
+# prefixes are the notes the core and Solve.run report with.
+PHASES = (("search", "searching trees"),
+          ("score", "scoring finalists"),
+          ("pack", "packing sheets"))
+
+
+def report_lines(report: str) -> list:
+    """The one-line result split so it fits a sidebar. At any normal panel
+    width the single line truncated to "2 shee...repair", which hides the
+    number you ran it for."""
+    parts = [p for p in report.split(" - ") if p]
+    if len(parts) <= 2:
+        return [", ".join(parts)] if parts else []
+    return [", ".join(parts[:2])] + parts[2:]
+
+
+def draw_progress(lay, job) -> None:
+    """A real progress bar, where you are looking.
+
+    It used to go only to the mouse-cursor readout and the status bar, which
+    are small, at the edges, and easy to miss entirely - the user asked for
+    progress while it was already being reported. `layout.progress` is
+    Blender 4.0+; older builds get the same numbers as text.
+    """
+    box = lay.box()
+    # Each phase counts from zero, so without a step number the bar filling
+    # and then starting again reads as the run having restarted.
+    step = next((i for i, (_k, key) in enumerate(PHASES)
+                 if (job.note or "").startswith(key)), None)
+    head = "Stopping..." if job.stopping else "Optimising..."
+    if step is not None:
+        head += f"  step {step + 1} of {len(PHASES)}"
+    box.label(text=head, icon="TIME")
+    note = job.note or "starting"
+    if job.total:
+        text = f"{note}  ({100 * job.fraction:.0f}%)"
+        if hasattr(box, "progress"):
+            box.progress(factor=job.fraction, type="BAR", text=text)
+        else:
+            box.label(text=text)
+    else:
+        box.label(text=note)        # a phase with no count, e.g. packing
+    box.label(text=f"{job.elapsed:.0f} s elapsed"
+                   + ("" if job.stopping else "  -  ESC to stop"))
+
+
 class _Base:
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -46,16 +101,33 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         # you cannot see from Unfold is a mode nobody runs. Same mistake as
         # show_overlay, which lived in that panel and hid the seam marks.
         lay.prop(s, "optimise", toggle=True, icon="MOD_ARRAY")
-        if s.optimise:
+        job = _running()
+        if job is not None:
+            draw_progress(lay, job)
+        elif s.optimise:
             lay.label(text="Unfold is slower; ESC stops it", icon="INFO")
         # A bent face has no flat image, so it has to be triangulated in the
         # mesh - the core cannot paper over it. Offered next to Unfold because
         # that is where the warning about it appears.
         lay.operator("cbu.split_nonplanar", icon="MOD_TRIANGULATE")
 
-        if s.last_report:
+        if s.last_report and _running() is None:
             box = lay.box()
-            box.label(text=s.last_report, icon="CHECKMARK")
+            if s.last_optimised:
+                # Its own header, because an optimised net and a plain one
+                # otherwise look identical - there was no way to tell a run
+                # had finished, or that it had been optimised at all.
+                box.label(text=f"Optimised in {s.last_elapsed:.0f} s",
+                          icon="CHECKMARK")
+                if s.last_detail:
+                    box.label(text=s.last_detail)
+                for line in report_lines(s.last_report):
+                    box.label(text=line)
+            else:
+                lines = report_lines(s.last_report)
+                box.label(text=lines[0] if lines else "", icon="CHECKMARK")
+                for line in lines[1:]:
+                    box.label(text=line)
             if s.last_warnings:
                 for w in s.last_warnings.split(" | "):
                     if w:
