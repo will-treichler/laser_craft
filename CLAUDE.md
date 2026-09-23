@@ -15,7 +15,7 @@ python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 282 checks, real Blender API
+python blender/test_addon.py            # 291 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -277,10 +277,11 @@ and touches nothing Blender owns, which is asserted on the code object
 (`Solve.run touches no Blender data`) rather than trusted.
 
 `execute` runs all three in order, so **a script never takes the modal path** -
-`bpy.ops.cbu.unfold()` from Python is EXEC_DEFAULT - and every headless check
-stays independent of a window existing. `invoke` starts the thread and a
-0.1 s timer only when the optimiser is on; the plain search is a second or two
-and a modal loop around it would be pure machinery.
+`bpy.ops.cbu.unfold()` and `bpy.ops.cbu.optimise()` from Python are
+EXEC_DEFAULT - and every headless check stays independent of a window
+existing. `invoke` starts the thread and a 0.1 s timer only for Optimise; the
+plain search is a second or two and a modal loop around it would be pure
+machinery.
 
 Three things that are easy to get wrong here:
 
@@ -715,15 +716,28 @@ in the UV panel is `cbu.edit_seam`, which calls `cbu.mark`, so it writes
 exactly the same red and blue as the Seams panel. Putting the legend at the
 top of the UV panel, several boxes away from those buttons, is not a key.
 
-**A mode you cannot see from the button it modifies is a mode nobody runs.**
-The optimiser is not an operator - there is no Optimize button, it is a switch
-that changes what Unfold does - and it went into the Solver sub-panel, which
-is `DEFAULT_CLOSED`, next to the output directory. The only feedback it got was
-"how do I run the optimiser? I only see the repack and nest buttons". So the
-toggle sits under Unfold on the main panel, and `budget`, which only matters
-once it is on, stays in Solver. Exactly the mistake `show_overlay` made in
-that same panel; twice is a pattern, and the rule is that a switch belongs
-beside what it switches.
+**Two actions are two buttons, never one button and a switch.** The
+optimiser went through two wrong shapes before `cbu.optimise` existed:
+
+- a switch in the Solver sub-panel, which is `DEFAULT_CLOSED` - the feedback
+  was "how do I run the optimiser? I only see the repack and nest buttons".
+  The same mistake `show_overlay` made in that same panel.
+- a toggle under Unfold, which could be seen - and was a **scene property**,
+  so it was saved with the file. Switch it on once and every Unfold after
+  that, in that session and in the saved .blend, quietly ran the slow path:
+  "hitting unfold seems to run the optimizer". The fast button stopped being
+  fast and nothing on screen said why.
+
+Now `Unfold` is always the plain, quick solve and `Optimise` is its own
+button. They are two thin operators over one plain mixin, `ops._Unfold`, with
+`optimising` as a class attribute - not a scene setting (saved with the file)
+and not an operator property (Blender remembers those between calls unless
+told `SKIP_SAVE`). And **not** `class CBU_OT_optimise(CBU_OT_unfold)`: once a
+registered operator class is subclassed and the subclass registered too,
+`bpy.ops.cbu.unfold.poll()` fails with "context is incorrect" on a context
+that plainly satisfies it. Mixin plus two `bpy.types.Operator` subclasses is
+the shape Blender supports. Regression:
+`Unfold after Optimise is a plain unfold, not a second optimise`.
 
 **Four switches in a row truncate to nothing.** Blender gives each item in
 an aligned row an equal share of the panel width, so `Show bed / Show cut /

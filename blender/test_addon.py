@@ -48,7 +48,8 @@ cbu_blender.register()
 check(hasattr(bpy.types.Scene, "cbu"), "settings registered on Scene")
 for idname in ("cbu.unfold", "cbu.mark", "cbu.export", "cbu.pack_uv",
                "cbu.clear_marks", "cbu.select_marked",
-               "cbu.lock", "cbu.clear_locks", "cbu.select_locked"):
+               "cbu.lock", "cbu.clear_locks", "cbu.select_locked",
+               "cbu.optimise"):
     mod, fn = idname.split(".")
     check(hasattr(getattr(bpy.ops, mod), fn), f"operator {idname} registered")
 
@@ -1457,6 +1458,39 @@ check("_announce" in ops.CBU_OT_unfold.modal.__code__.co_names,
       "and says so when it has finished")
 for _name in ("last_optimised", "last_elapsed", "last_detail"):
     check(hasattr(bpy.context.scene.cbu, _name), f"scene remembers {_name}")
+
+# ------------------------------------------------ Unfold stays the fast one
+# Optimise used to be a scene toggle that changed what Unfold did. A scene
+# property is saved with the file, so switching it on once made every later
+# Unfold - in that session and in the saved .blend - run the slow path.
+check(not hasattr(bpy.context.scene.cbu, "optimise"),
+      "there is no stored optimise switch to leave on by accident")
+check(ops.CBU_OT_unfold.optimising is False
+      and ops.CBU_OT_optimise.optimising is True,
+      "Unfold is plain and Optimise is the optimiser, by class")
+
+obj = fresh("TwoButtons", "ico_sphere", subdivisions=1)
+obj.scale = (0.12,) * 3
+bpy.ops.object.transform_apply(scale=True)
+if bpy.context.mode == "EDIT_MESH":
+    bpy.ops.object.mode_set(mode="OBJECT")
+_sc = bpy.context.scene.cbu
+_sc.trials = 8
+_sc.budget = 2
+
+check(bpy.ops.cbu.optimise() == {"FINISHED"}, "Optimise runs")
+check(_sc.last_optimised and "candidate" in _sc.last_detail,
+      f"...and says it optimised ({_sc.last_detail!r})")
+_opt = ops._LAST[obj.name][4]
+check(_opt.get("candidates") is not None, "the report carries the search")
+
+# The point of the whole change: after an Optimise, Unfold is still plain.
+check(bpy.ops.cbu.unfold() == {"FINISHED"}, "Unfold runs after an Optimise")
+_plain = ops._LAST[obj.name][4]
+check(not _sc.last_optimised and not _sc.last_detail,
+      "Unfold after Optimise is a plain unfold, not a second optimise")
+check(_plain.get("candidates") is None and _plain.get("cost") is None,
+      "...and its report has no search in it")
 
 # ------------------------------------------------------- reload operator
 # reload_all() unregisters CBU_OT_reload itself, so the operator must not

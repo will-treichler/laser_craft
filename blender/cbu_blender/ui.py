@@ -95,17 +95,14 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         col = lay.column(align=True)
         col.scale_y = 1.4
         col.operator("cbu.unfold", icon="MOD_UVPROJECT")
-        # Beside the button it modifies, not in the closed Solver sub-panel
-        # next to the output directory. It went there first and the only
-        # feedback was "how do I run the optimiser?" - a mode for Unfold that
-        # you cannot see from Unfold is a mode nobody runs. Same mistake as
-        # show_overlay, which lived in that panel and hid the seam marks.
-        lay.prop(s, "optimise", toggle=True, icon="MOD_ARRAY")
+        # Two actions, two buttons. Optimise was first a switch in the closed
+        # Solver panel (nobody could find it), then a toggle under Unfold -
+        # which was saved with the scene, so once it had been switched on
+        # every Unfold ran the slow path. Unfold is always the quick one.
+        lay.operator("cbu.optimise", icon="MOD_ARRAY")
         job = _running()
         if job is not None:
             draw_progress(lay, job)
-        elif s.optimise:
-            lay.label(text="Unfold is slower; ESC stops it", icon="INFO")
         # A bent face has no flat image, so it has to be triangulated in the
         # mesh - the core cannot paper over it. Offered next to Unfold because
         # that is where the warning about it appears.
@@ -324,11 +321,8 @@ class CBU_PT_solver(_Base, bpy.types.Panel):
         sub.prop(s, "merge_tol")
         lay.prop(s, "trials")
         lay.prop(s, "seed")
-        # The switch itself is on the main panel, beside Unfold; this is the
-        # knob that only matters once it is on.
-        sub = lay.column()
-        sub.enabled = s.optimise
-        sub.prop(s, "budget")
+        # Only Optimise reads this; the button itself is on the main panel.
+        lay.prop(s, "budget")
         lay.prop(s, "limit_to_bed")
         lay.separator()
         lay.prop(s, "out_dir")

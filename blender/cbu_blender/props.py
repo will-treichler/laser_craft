@@ -169,14 +169,13 @@ class CBUSettings(bpy.types.PropertyGroup):
         description="Randomised restarts before falling back to splitting")
     seed: IntProperty(name="Seed", default=0, min=0,
                       description="Change this if a net comes out badly pinched")
-    optimise: BoolProperty(
-        name="Optimise", default=False,
-        description="Choose the tree by what the finished net costs instead of "
-                    "by how many faces overlap to begin with - measurably the "
-                    "wrong way round. Slower: it has to mend each candidate "
-                    "before it can score one")
+    # There is deliberately no "optimise" switch here. It was one, and a
+    # scene property is saved with the file: switch it on once and every
+    # Unfold afterwards - in that session and in the saved .blend - quietly
+    # ran the slow path, so the fast button was no longer fast. Optimise is
+    # its own operator (cbu.optimise) and Unfold is always the quick one.
     budget: IntProperty(
-        name="Candidates", default=10, min=1, max=100,
+        name="Optimise candidates", default=10, min=1, max=100,
         description="How many candidates the optimiser may mend and score. "
                     "Trees that need no mending are nearly free and do not "
                     "count against this")

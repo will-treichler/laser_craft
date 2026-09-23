@@ -497,12 +497,22 @@ def _stage(T, name):
     return cbulog.stage(T, name) if T is not None else contextlib.nullcontext()
 
 
-class CBU_OT_unfold(bpy.types.Operator):
-    bl_idname = "cbu.unfold"
-    bl_label = "Unfold"
-    bl_description = ("Flatten the mesh into non-overlapping islands, write "
-                      "the net to a UV layer, and colour the islands in the viewport")
+class _Unfold:
+    """Everything Unfold and Optimise share. A plain mixin, NOT an Operator.
+
+    The obvious shape - `class CBU_OT_optimise(CBU_OT_unfold)` - breaks the
+    parent: once a registered operator class is subclassed and the subclass
+    registered too, `bpy.ops.cbu.unfold.poll()` fails with "context is
+    incorrect" on a context that satisfies it. Two thin classes over a mixin
+    is the pattern Blender supports.
+    """
     bl_options = {"REGISTER", "UNDO"}
+
+    # Which path this is. A class attribute rather than a scene setting or an
+    # operator property: a scene setting is saved with the file and made the
+    # fast button slow the moment it was switched on once, and an operator
+    # property is remembered between calls by Blender unless told not to be.
+    optimising = False
 
     @classmethod
     def poll(cls, context):
@@ -551,8 +561,7 @@ class CBU_OT_unfold(bpy.types.Operator):
         score one, so it runs for tens of seconds and the user needs both a
         readout and a way out.
         """
-        s = context.scene.cbu
-        if not s.optimise:
+        if not self.optimising:
             return self.execute(context)
         job = self.prepare(context)
         if job is None:
@@ -693,7 +702,7 @@ class CBU_OT_unfold(bpy.types.Operator):
             trials=s.trials, seed=s.seed, max_size=limit,
             forced_cuts=cuts, forced_folds=folds,
             splinter_width=mat.splinter_width,
-            mat=mat if s.optimise else None, budget=s.budget),
+            mat=mat if self.optimising else None, budget=s.budget),
             L=L, mat=mat, timings=T)
 
     def apply(self, context, job):
@@ -754,9 +763,9 @@ class CBU_OT_unfold(bpy.types.Operator):
             for w in warns[:6]:
                 self.report({"WARNING"}, w)
 
-            s.last_optimised = bool(s.optimise)
+            s.last_optimised = self.optimising
             s.last_elapsed = job.elapsed
-            if s.optimise:
+            if self.optimising:
                 n, m = rep.get("candidates"), rep.get("mended")
                 s.last_detail = (
                     ("stopped early - " if job.stopping else "")
@@ -816,6 +825,25 @@ def _announce(context, job) -> None:
         context.window_manager.popup_menu(draw, title=title, icon="CHECKMARK")
     except Exception:                                   # noqa: BLE001
         pass
+
+
+class CBU_OT_unfold(_Unfold, bpy.types.Operator):
+    bl_idname = "cbu.unfold"
+    bl_label = "Unfold"
+    bl_description = ("Flatten the mesh into non-overlapping islands, write "
+                      "the net to a UV layer, and colour the islands in the "
+                      "viewport. The quick one - see Optimise for a better net")
+    optimising = False
+
+
+class CBU_OT_optimise(_Unfold, bpy.types.Operator):
+    bl_idname = "cbu.optimise"
+    bl_label = "Optimise"
+    bl_description = ("Unfold, but search for a better net: fewer small "
+                      "pieces and fewer sheets. Slower - it mends and scores "
+                      "many candidates, and packs the best of them. Shows "
+                      "progress, and ESC stops it with the best net so far")
+    optimising = True
 
 
 class CBU_OT_edit_seam(bpy.types.Operator):
@@ -1321,7 +1349,8 @@ PLANAR_TOL = 1e-3      # same gate PolyMesh.check uses
 classes = (CBU_OT_mark, CBU_OT_clear_marks, CBU_OT_select_marked,
            CBU_OT_lock, CBU_OT_clear_locks, CBU_OT_select_locked,
            CBU_OT_select_all_faces,
-           CBU_OT_split_nonplanar, CBU_OT_unfold, CBU_OT_edit_seam,
+           CBU_OT_split_nonplanar, CBU_OT_unfold, CBU_OT_optimise,
+           CBU_OT_edit_seam,
            CBU_OT_repack, CBU_OT_export, CBU_OT_pack_uv)
 
 

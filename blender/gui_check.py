@@ -38,7 +38,6 @@ obj = bpy.context.active_object
 obj.scale = (0.1,) * 3
 bpy.ops.object.transform_apply(scale=True)
 s = bpy.context.scene.cbu
-s.optimise = True
 s.trials = 30
 s.budget = 6
 
@@ -81,7 +80,7 @@ def tick():
             bpy.utils.register_class(c)
         state["log"].append(f"moved {len(panels)} panel(s) to Item")
         with bpy.context.temp_override(window=win, area=area, region=region):
-            res = bpy.ops.cbu.unfold("INVOKE_DEFAULT")
+            res = bpy.ops.cbu.optimise("INVOKE_DEFAULT")
         state["log"].append(f"invoke -> {res}")
         state["started"] = True
         return 0.25
