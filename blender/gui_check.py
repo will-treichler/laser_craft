@@ -18,8 +18,11 @@ import pathlib
 import bpy
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
+# Absolute, always. pathlib resolves a relative path against the working
+# directory but bpy.ops.screen.screenshot resolves it against the .blend, so
+# a relative OUT wrote the log where asked and the screenshots somewhere else.
 OUT = (pathlib.Path(sys.argv[sys.argv.index("--") + 1])
-       if "--" in sys.argv else REPO / "out" / "gui")
+       if "--" in sys.argv else REPO / "out" / "gui").resolve()
 OUT.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(REPO / "blender"))
 import cbu_blender                                      # noqa: E402
