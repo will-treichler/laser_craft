@@ -1146,8 +1146,30 @@ negative - a repack onto a bed too small produced a net spanning
 x[-136.3, 226.8]. Everything downstream reads positions from the parts, so one
 oversized part drags the whole 2D view into negative space and every margin
 check on the *view* fails for a layout the packer never claimed to have made.
-`pack()` now parks them on the margin, still flagged by `sheet < 0`.
-Regression: `test_oversized_parts_are_parked_not_left_at_random_coordinates`.
+`pack()` now parks them on the margin, still flagged by `sheet < 0`, side by
+side rather than all on the one corner - piled there, parts that do not fit
+also read as parts that overlap each other.
+Regressions: `test_oversized_parts_are_parked_not_left_at_random_coordinates`,
+`test_oversized_parts_are_parked_side_by_side`.
+
+**A portrait bed is not a landscape bed turned round - to shelf_pack it was.**
+`orient_min_bbox` lays every part long side on x, which is right for a 600 x
+400 bed, and `shelf_pack` never tried standing one up: on a 400 x 900 bed a
+615 x 292 helmet part failed the 384 mm width and was called oversized. `nest`
+and `raster_pack` try both orientations and placed it - and then LOST, because
+`pack()` ranked strategies by sheets first. Sheets count only placed parts, so
+shelf packing dropped four of seven parts, reported one sheet, and beat three
+sheets with everything on. The 2D view then showed exactly what the user
+reported: four parts piled on one spot above sheet 0, overlapping by up to
+35,000 mm2 and reaching x = 624 mm past a 400 mm bed, which also stretched the
+drawn sheet grid to two columns. `Weights.oversize` already guards the cost
+function against this incentive; `pack()` had the same hole and nothing guarding
+it. It now ranks by parts left unplaced - counted off the sheets, not taken
+from each strategy's own list, since `nest` and `raster_pack` can also leave a
+part that fits no empty sheet without listing it - and only then by sheets.
+Every square-bed test and the whole 300 x 300 bench corpus were blind to it.
+Regressions: `test_every_packer_stands_a_part_up_on_a_portrait_bed`,
+`test_pack_never_drops_a_part_to_save_a_sheet`.
 
 **Measure a net against `pm.vertices`, not against a recomputed world
 transform.** Chasing that apparent corruption, a diagnostic that rebuilt world

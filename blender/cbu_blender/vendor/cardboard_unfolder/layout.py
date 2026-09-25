@@ -564,7 +564,11 @@ def shelf_pack(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
     for p in parts:
         orient_min_bbox(p)
         w, h = p.size
-        if w < h and h <= W and w <= H:      # lay it down if that helps it fit
+        # orient_min_bbox always lays the long side on x, which is right for a
+        # landscape bed and wrong for a portrait one: a 615 x 292 part on a
+        # 384 x 884 bed only fits standing up, and this used to call it
+        # oversized.
+        if not (w <= W and h <= H) and (h <= W and w <= H):
             p.rotate(90, origin=tuple(p.cut.centroid.coords)[0])
 
     oversized = [p for p in parts if p.size[0] > W or p.size[1] > H]
@@ -836,15 +840,24 @@ No strategy dominates. True-shape nesting is far better when parts are small
         restore(start_state)
         for p in parts:
             p.xform = np.eye(3)
-        sheets, over = fn(parts, mat)
+        sheets, _over = fn(parts, mat)
         # Tighten before comparing, not after choosing. Both strategies leave
         # room on an earlier sheet that a later part fits, and they leave
         # different amounts, so the winner before tightening is not
         # necessarily the winner after it.
         sheets = tighten(parts, sheets, mat)
-        trials.append((sheets, len(over), snap()))
+        # Count what is actually off the sheets, not what the strategy owned up
+        # to: nest and raster_pack also leave a part unplaced when it passes
+        # the size test and still fits no empty sheet, without listing it.
+        trials.append((sheets, sum(1 for p in parts if p.sheet < 0), snap()))
 
-    trials.sort(key=lambda t: (t[0], t[1]))
+    # Parts left off FIRST, sheets second. The other way round, a strategy
+    # that gives up on a part reports fewer sheets and wins for it - shelf
+    # packing on a 400 x 900 bed dropped four helmet parts it could not stand
+    # up, called it one sheet, and beat three sheets with everything on.
+    # Sheets only count PLACED parts, so a dropped part is not a saving, it is
+    # a part that cannot be cut.
+    trials.sort(key=lambda t: (t[1], t[0]))
     sheets, _, winner = trials[0]
     restore(winner)
 
@@ -855,8 +868,14 @@ No strategy dominates. True-shape nesting is far better when parts are small
     # space and every margin check on the *view* then fails for a layout the
     # packer never claimed to have made. Park it on the margin instead, still
     # flagged by sheet < 0.
+    #
+    # Side by side, not all on the same corner: stacked there, every oversized
+    # part is drawn on top of every other one, and a view of parts that do not
+    # fit then also reads as parts that overlap.
     over = [p for p in parts if p.sheet < 0]
+    x = mat.sheet_margin
     for p in over:
-        x0, y0, _x1, _y1 = p.bounds
-        p.translate(mat.sheet_margin - x0, mat.sheet_margin - y0)
+        x0, y0, x1, _y1 = p.bounds
+        p.translate(x - x0, mat.sheet_margin - y0)
+        x += (x1 - x0) + mat.part_gap
     return sheets, over

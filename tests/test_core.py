@@ -2145,11 +2145,70 @@ def test_oversized_parts_are_parked_not_left_at_random_coordinates():
     parts = build_parts(islands, m)
     _sheets, over = pack(parts, m)
     assert over, "this bed is too small for anything - expected oversized parts"
+    assert over[0].bounds[0] == pytest.approx(m.sheet_margin, abs=1e-6)
     for p in over:
         x0, y0, _x1, _y1 = p.bounds
-        assert x0 == pytest.approx(m.sheet_margin, abs=1e-6),             f"island {p.island_id} parked at x={x0:.1f}, not the margin"
+        assert x0 >= m.sheet_margin - 1e-6, f"island {p.island_id} parked at x={x0:.1f}"
         assert y0 == pytest.approx(m.sheet_margin, abs=1e-6)
         assert p.sheet < 0, "and it must still be flagged as not placed"
+
+
+def test_oversized_parts_are_parked_side_by_side():
+    """Not all on the one corner: piled there, parts that do not fit also
+    read as parts that overlap - 35,000 mm2 of apparent overlap on a helmet
+    whose only real problem was a packer that would not stand parts up."""
+    m = Material.from_flute("B")
+    parts = [_blank(box(0, 0, 700 + 10 * k, 450), -1) for k in range(3)]
+    _sheets, over = pack(parts, m)
+    assert len(over) == 3
+    for q in over:
+        assert q.bounds[1] == pytest.approx(m.sheet_margin, abs=1e-6)
+    for i, a in enumerate(over):
+        for b in over[i + 1:]:
+            assert a.cut.distance(b.cut) >= m.part_gap - 1e-6
+
+
+def _long_part():
+    """615 x 200 mm: fits a 400 x 900 bed only standing up."""
+    return _blank(box(0, 0, 615, 200), -1)
+
+
+@pytest.mark.parametrize("strategy", ["shelf_pack", "nest", "raster_pack"])
+def test_every_packer_stands_a_part_up_on_a_portrait_bed(strategy):
+    """orient_min_bbox lays every part long side on x, which is right for a
+    landscape bed. shelf_pack never tried the other way, so on a 400 x 900 bed
+    a 615 x 292 helmet part was called oversized."""
+    from cardboard_unfolder import layout
+    m = Material.from_flute("B")
+    m.bed = (400.0, 900.0)
+    part = _long_part()
+    sheets, over = getattr(layout, strategy)([part], m)
+    assert not over and sheets == 1 and part.sheet == 0
+    x0, y0, x1, y1 = part.bounds
+    W, H = m.bed
+    assert x0 >= m.sheet_margin - 1e-6 and x1 <= W - m.sheet_margin + 1e-6
+    assert y0 >= m.sheet_margin - 1e-6 and y1 <= H - m.sheet_margin + 1e-6
+
+
+def test_pack_never_drops_a_part_to_save_a_sheet(monkeypatch):
+    """Sheets count PLACED parts only, so a strategy that gives up on a part
+    reports fewer of them. pack() ranked by sheets first and took that: four
+    helmet parts left off, "1 sheet", beating three sheets with everything
+    on. A part that is not placed is not a saving - it cannot be cut."""
+    from cardboard_unfolder import layout
+
+    def gives_up(parts, mat):
+        for q in parts:
+            q.sheet = -1
+        return 0, list(parts)
+
+    monkeypatch.setattr(layout, "shelf_pack", gives_up)
+    m = Material.from_flute("B")
+    m.bed = (400.0, 900.0)
+    parts = [_long_part(), _blank(box(0, 0, 50, 50), -1)]
+    sheets, over = pack(parts, m)
+    assert not over, "a strategy that placed everything was available"
+    assert sheets >= 1 and all(q.sheet >= 0 for q in parts)
 
 
 def test_packed_parts_sit_inside_the_margins():
