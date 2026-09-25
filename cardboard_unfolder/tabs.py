@@ -65,9 +65,13 @@ def _trapezoid(a: np.ndarray, b: np.ndarray, out: np.ndarray,
 
 
 def place_tabs(islands: list[Island], mat: Material,
-               grid: float = 1e-9) -> tuple[dict[int, list[Tab]], list[int]]:
+               grid: float = 1e-9, skip=(), extra=None
+               ) -> tuple[dict[int, list[Tab]], list[int]]:
     """One tab per seam, on whichever side it fits. Returns (tabs by island,
-    seams that got no tab)."""
+    seams that got no tab).
+
+    `skip` names seams that are already joined some other way (fingers), and
+    `extra` is geometry per island a tab must not land on."""
     # group cut records by seam so we can choose a side
     seams: dict[int, list[tuple[int, Cut]]] = {}
     for isl in islands:
@@ -79,9 +83,15 @@ def place_tabs(islands: list[Island], mat: Material,
     outlines = {i.id: shapely.set_precision(i.outline(), grid) for i in islands}
     placed: dict[int, list[Tab]] = {i.id: [] for i in islands}
     occupied = {i.id: outlines[i.id] for i in islands}
+    for iid, geoms in (extra or {}).items():
+        if geoms and iid in occupied:
+            occupied[iid] = unary_union([occupied[iid]] + [
+                shapely.set_precision(g, grid) for g in geoms])
     skipped = []
 
     for seam in sorted(seams):
+        if seam in skip:
+            continue
         sides = seams[seam]
         got = False
         # prefer the longer edge, then the lower island id, for determinism

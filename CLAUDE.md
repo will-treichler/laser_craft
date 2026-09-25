@@ -52,6 +52,7 @@ numbers → kerf → split to bed → pack → layered SVG/DXF.
 | `unfold.py` | Rigid unfold, overlap detection, randomised search, set-cover repair, bed splitting |
 | `folds.py` | Relief width from thickness and angle, perforation, kerf |
 | `tabs.py` | Glue tabs with collision rejection, seam numbering |
+| `fingers.py` | Interlocking box-joint fingers along cut seams |
 | `layout.py` | Parts, narrow-neck detection, shelf packing |
 | `export.py` | Layered SVG + DXF + manifest |
 | `strokefont.py` | Single-stroke font for engraved labels |
@@ -1465,6 +1466,80 @@ any area or bounds check. Regressions:
 backing strip, and the flaps cost about 22% of the sheet in area - measured on
 a real design, part area 39857 mm2 without them against 50233 with.
 
+## Interlocking fingers
+
+`use_fingers` cuts a box joint along every seam that can take one: split the
+seam into segments of about `finger_width` (15 mm), and on each segment one
+half grows a finger outward while the other has the same rectangle cut in as
+a notch, alternating. Assembled, the fingers drop into the notches and the
+panels cannot slide while the tape goes on. Depth is `finger_depth_used` -
+the board thickness, because a finger has to pass through the board it mates
+with, unless `finger_depth_override` is set. Off by default, like tabs: it
+changes every part outline, so it is a choice.
+
+**Complementary by construction, not by matching.** `build_islands` writes
+`Cut.a` / `Cut.b` in the SAME vertex order on both halves of a seam (v0 then
+v1 of the dual arc), so a parameter t along a -> b is the same physical point
+on each. Nothing is paired up geometrically afterwards. And a segment is
+jointed on BOTH halves or on neither: a finger with no notch opposite it is
+a part that will not close. Regression:
+`test_both_halves_of_a_fingered_seam_mate_exactly` - bring both halves onto
+their shared edge and the finger half fills the slot one board deep either
+side of the line while the notched half is empty there.
+
+That test must look only at the notched half's **own side** of the edge. A
+cut inside one island (a V-slit in the net) can leave the other half of the
+V lying in the flat sheet just past the notch: separate board, somewhere
+else once folded. Looking at both sides reported a 0.12 mm2 "sliver in the
+notch" on icosphere1 that is not there.
+
+**The clearance round a notch is a DISTANCE, so the probe is a round
+buffer.** A notch needs a board's thickness of material between it and any
+other edge of its face (a fold, another seam, a relief slot) or the web tears
+when the finger is pushed home. The first version tested an upright box of
+clearance, and at a 60 degree triangle corner the box's own corner pokes out
+of a face the notch itself clears easily: **0 of 117** icosphere2 seams
+jointed. `_probe` buffers instead, and each end of the seam is inset by
+`corner_inset` - from `t sin(a) - d cos(a) >= wall`, the notch's inner corner
+held `wall` off the face's next edge, and never less than the depth, because
+the corner cube where three panels meet belongs to none of them. The
+interior angle comes from the ring order, as does `inward`: the centroid of a
+concave face can sit across its own edge
+(`test_inward_is_read_from_the_ring_not_the_centroid`).
+
+**A finger's base lies ON the body's edge, and that is a trap.** After
+snapping to the 1e-9 grid the two can sit a fraction of a nanometre apart,
+and the union then keeps the finger as a separate polygon - a loose rectangle
+that falls out of the sheet. icosphere1 went 7 pieces to 11, icosphere2 9 to
+17. `apply_fingers` grows each rectangle by `BITE` (0.1 micron) before the
+boolean so it overlaps the edge rather than meeting it. Area stays conserved
+to 1e-9 because every finger has a notch of the same size; a piece count is
+what sees the bug (`test_fingers_never_break_a_part_and_conserve_area`).
+
+**Fingers before tabs.** A seam that interlocks needs no flap, and a flap
+along a fingered edge buries the fingers. `place_tabs` takes `skip` (the
+fingered seams) and `extra` (the finger rectangles, as occupied space), so
+tabs go only where fingers could not and never on top of one.
+
+**Coverage is decided by edge length, and that is the model, not the code.**
+At 200 mm with a 300 mm bed: box, cone, cylinder, icosphere1 and annulus joint
+**every** seam; capsule 19 of 106; icosphere2 121 of 169, the rest refused
+because a finger in a V-slit would touch the other half of the V; pikachu
+**9 of 207**, of which 195 are simply too short - two fingers at half width
+need `2 * depth + finger_width` = 21 mm and pikachu's median seam is 10.5 mm.
+Scale the model up or the finger width down before concluding the feature is
+broken on a detailed model. `place_fingers(..., why={})` counts the refusals
+by reason.
+
+Cost: placing is 0.7 s on pikachu, and nothing at all when the switch is
+off. **Do not snap the body before the booleans.** `set_precision` puts GEOS
+in fixed-precision overlay, and a body with its relief slots is tens of
+thousands of vertices (an icosahedron net: 75k, 1159 holes) - 10.9 s against
+2.8 s floating, for a result 1e-9 mm2 different. Snap once, at the end;
+`BITE` is what makes the floating overlay safe. The bed-split
+allowance (`2 * tab_depth + 2 * kerf`) already covers any finger depth up to
+the tab depth.
+
 `docs/spec.html` has the full derivation, the research behind it, and the
 calibration procedure.
 
@@ -1488,6 +1563,8 @@ Not done, roughly in value order:
    edges, so one face bigger than the bed still fails. Needs an in-plane cut
    plus a splice — for cardboard, a glued backing strip, not an interlock.
 5. **Tab side assignment as 2-SAT** (currently greedy; skipped seams get taped).
+   The same pass could choose which half of a seam takes the first finger -
+   today it is simply the lower island id.
 6. **Flute-direction constraint.** Deliberately off (`Material.lock_grain`);
    costume tolerance doesn't need it. Turn on if a part visibly racks.
 

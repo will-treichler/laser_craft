@@ -90,6 +90,16 @@ class Material:
     tab_inset_deg: float = 35.0     # trapezoid side angle
     tab_min_edge: float = 14.0      # don't tab an edge shorter than this
 
+    # Interlocking fingers along every cut seam: a box joint, so two panels
+    # drop together and cannot slide while the tape or glue goes on. Width is
+    # a judgement about handling (EMPIRICAL); depth is the board thickness,
+    # because a finger has to pass through the board it mates with - so it
+    # follows `thickness` unless finger_depth_override says otherwise.
+    use_fingers: bool = False
+    finger_width: float = 15.0      # mm per finger, stretched to fill the edge
+    finger_depth_override: bool = False
+    finger_depth: float = 3.0       # mm, used only when overridden
+
     # --- machine ---
     bed: tuple = (600.0, 400.0)     # mm
     sheet_margin: float = 8.0       # mm from bed edge
@@ -140,6 +150,11 @@ class Material:
         g = FLUTES[grade.upper()]
         return cls(thickness=g["thickness"], pitch=g["pitch"],
                    liner=g["liner"], **overrides)
+
+    @property
+    def finger_depth_used(self) -> float:
+        """How far a finger stands proud of its edge, and a notch cuts in."""
+        return self.finger_depth if self.finger_depth_override else self.thickness
 
     @property
     def pivot_depth(self) -> float:

@@ -30,6 +30,16 @@ def main(argv=None) -> int:
                    help="crush factor 0.6-1.0; lower removes less at folds")
     g.add_argument("--tab-depth", type=float, help="glue tab depth, mm")
 
+    g = ap.add_argument_group("interlocking fingers")
+    g.add_argument("--fingers", action="store_true",
+                   help="cut a box joint along every seam that can take one, "
+                        "so the panels lock together during assembly")
+    g.add_argument("--finger-width", type=float, default=None,
+                   help="mm per finger (default 15)")
+    g.add_argument("--finger-depth", type=float, default=None,
+                   help="mm; overrides the default, which is the board "
+                        "thickness")
+
     g = ap.add_argument_group("annotation")
     g.add_argument("--id", dest="model_id", default=None,
                    help="model identifier engraved on every island; "
@@ -83,6 +93,12 @@ def main(argv=None) -> int:
         mat.label_min_height = a.text_min
     if a.no_fold_marks:
         mat.label_folds = False
+    mat.use_fingers = a.fingers
+    if a.finger_width is not None:
+        mat.finger_width = a.finger_width
+    if a.finger_depth is not None:
+        mat.finger_depth_override = True
+        mat.finger_depth = a.finger_depth
 
     if a.height is None and a.scale is None:
         print("note: no --height given, using the mesh's own units as mm",

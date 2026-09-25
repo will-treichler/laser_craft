@@ -23,6 +23,7 @@ from .unfold import Island, min_area_rect
 from .folds import (plan_folds, apply_relief, offset_cut,
                     corner_relief)
 from .tabs import place_tabs, island_labels
+from .fingers import place_fingers, apply_fingers, fingered_seams
 
 
 @dataclass
@@ -153,17 +154,28 @@ def _mls(segs) -> MultiLineString:
 
 
 def build_parts(islands: list[Island], mat: Material) -> list[Part]:
-    """Island -> Part: relief slots subtracted, tabs unioned on, kerf applied."""
+    """Island -> Part: relief slots subtracted, fingers and tabs on, kerf applied."""
+    plans_by = {isl.id: plan_folds(isl, mat) for isl in islands}
+    bodies = {isl.id: apply_relief(isl.outline(), plans_by[isl.id])
+              for isl in islands}
+    # Fingers first: a seam that interlocks needs no flap, and a flap laid
+    # along a fingered edge would bury the fingers. Tabs then go on the seams
+    # that could not take a finger, clear of the fingers that did.
+    joints = place_fingers(islands, mat, bodies) if mat.use_fingers else {}
     # Tabs are optional: most cardboard is taped or gets a glued backing strip,
     # and the flaps cost about a fifth of the sheet in area.
-    tabs, skipped = place_tabs(islands, mat) if mat.use_tabs else ({}, set())
+    tabs, skipped = (place_tabs(
+        islands, mat, skip=fingered_seams(joints),
+        extra={i: [j.poly for j in js if j.kind == "finger"]
+               for i, js in joints.items()})
+        if mat.use_tabs else ({}, set()))
 
     parts = []
     for isl in islands:
-        plans = plan_folds(isl, mat)
+        plans = plans_by[isl.id]
         warns = [p.warn for p in plans if p.warn]
 
-        body = apply_relief(isl.outline(), plans)
+        body = apply_fingers(bodies[isl.id], joints.get(isl.id, []))
         tab_polys = [t.poly for t in tabs.get(isl.id, [])]
         if tab_polys:
             body = unary_union([shapely.set_precision(body, 1e-9)] +

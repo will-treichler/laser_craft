@@ -230,6 +230,19 @@ class CBU_PT_material(_Base, bpy.types.Panel):
         sub.enabled = s.use_tabs
         sub.prop(s, "tab_depth")
         lay.separator()
+        lay.prop(s, "use_fingers")
+        sub = lay.column()
+        sub.enabled = s.use_fingers
+        sub.prop(s, "finger_width")
+        sub.prop(s, "finger_depth_override")
+        row = sub.row()
+        row.enabled = s.use_fingers and s.finger_depth_override
+        if s.finger_depth_override:
+            row.prop(s, "finger_depth")
+        else:
+            # Show the number actually used, not a field that does nothing.
+            row.label(text=f"Depth {s.thickness:.1f} mm (board thickness)")
+        lay.separator()
         lay.label(text="Every value here is empirical.", icon="INFO")
         lay.label(text="Cut a calibration set before trusting it.")
 

@@ -44,6 +44,9 @@ from cardboard_unfolder.layout import (build_parts, pack, narrow_necks,
                                        find_pocket, free_region,
                                        seat_sheets)
 from cardboard_unfolder import strokefont
+from cardboard_unfolder.fingers import (place_fingers, segments, inward,
+                                        corner_inset, MIN_FRAC)
+from cardboard_unfolder.unfold import Island, Cut
 
 
 def meshes():
@@ -2237,6 +2240,234 @@ def test_svg_layer_order_puts_cuts_last(tmp_path):
              for g in root.iter("{http://www.w3.org/2000/svg}g")]
     assert order[-1] == "CUT"
     assert order.index("ENGRAVE") < order.index("CUT")
+
+
+# ---------------------------------------------------------------- fingers
+
+_FINGERED = {}
+
+
+def _fingered(tm, **kw):
+    """A net with fingers on, built once per mesh: several invariants read
+    the same one, and unfolding it again for each is most of their time."""
+    key = (id(tm), tuple(sorted(kw.items())))
+    if key not in _FINGERED:
+        islands, _ = unfold(PolyMesh.from_trimesh(tm), trials=40, seed=0)
+        mat = Material.from_flute("B", use_fingers=True, **kw)
+        bodies = {i.id: apply_relief(i.outline(), plan_folds(i, mat))
+                  for i in islands}
+        _FINGERED[key] = (islands, mat, place_fingers(islands, mat, bodies))
+    return _FINGERED[key]
+
+
+_FPARTS = {}
+
+
+def _fingered_parts(tm):
+    """(parts with fingers, the same net's parts without)."""
+    if id(tm) not in _FPARTS:
+        islands, mat, _ = _fingered(tm)
+        _FPARTS[id(tm)] = (build_parts(islands, mat),
+                           build_parts(islands, Material.from_flute("B")))
+    return _FPARTS[id(tm)]
+
+
+def _in_cut_frame(cut, isl, t0, t1, s0, s1):
+    """A rectangle given in the cut's own frame - t along a->b, s into the
+    face - placed in the island's coordinates. Built there rather than moving
+    the part: a part with its relief slots is tens of thousands of vertices."""
+    u = (cut.b - cut.a) / cut.length
+    v = inward(isl, cut)
+    a = cut.a
+    return Polygon([a + u * t0 + v * s0, a + u * t1 + v * s0,
+                    a + u * t1 + v * s1, a + u * t0 + v * s1])
+
+
+def _pieces(g):
+    return len(getattr(g, "geoms", [g]))
+
+
+def test_finger_defaults():
+    """15 mm wide, as deep as the board, and off until asked for - like glue
+    tabs, it changes every part outline, so it is a choice, not a default."""
+    m = Material.from_flute("B")
+    assert m.use_fingers is False
+    assert m.finger_width == 15.0
+    assert m.finger_depth_used == m.thickness == 3.0
+    assert Material.from_flute("C").finger_depth_used == 4.0
+    m.finger_depth = 5.5
+    assert m.finger_depth_used == 3.0, "the value is ignored until overridden"
+    m.finger_depth_override = True
+    assert m.finger_depth_used == 5.5
+
+
+def test_fingers_off_change_nothing():
+    """The switch is a real switch: off is the part outline exactly."""
+    islands, _ = unfold(PolyMesh.from_trimesh(ALL[0][1]), trials=40, seed=0)
+    plain = build_parts(islands, Material.from_flute("B"))
+    off = build_parts(islands, Material.from_flute("B", use_fingers=False,
+                                                   finger_width=9.0))
+    assert [p.cut.wkb for p in plain] == [p.cut.wkb for p in off]
+
+
+def test_finger_segments_are_about_the_width_and_never_alone():
+    mat = Material.from_flute("B")
+    w, d = mat.finger_width, mat.finger_depth_used
+    for L in np.arange(5.0, 200.0, 0.7):
+        segs = segments(L, mat)
+        if L - 2 * d < 2 * MIN_FRAC * w:
+            assert segs == [], L
+            continue
+        assert len(segs) >= 2, "one finger alone does not interlock"
+        assert segs[0][0] == pytest.approx(d) and segs[-1][1] == pytest.approx(L - d)
+        for (a0, a1), (b0, b1) in zip(segs, segs[1:]):
+            assert a1 == pytest.approx(b0)
+        for t0, t1 in segs:
+            assert MIN_FRAC * w - 1e-9 <= t1 - t0 <= 1.25 * w + 1e-9
+
+
+def test_a_corner_inset_keeps_the_wall_to_the_next_edge():
+    """At the inset, the notch's inner corner is exactly `wall` from the
+    face's other edge - checked against the geometry, not the formula."""
+    d, wall = 3.0, 3.0
+    for deg in (20, 45, 60, 90, 120, 150):
+        a = math.radians(deg)
+        t = corner_inset(a, d, wall)
+        other = LineString([(0, 0), (100 * math.cos(a), 100 * math.sin(a))])
+        gap = Point(t, d).distance(other)
+        assert t >= d
+        assert gap >= wall - 1e-9, (deg, gap)
+    assert corner_inset(math.radians(200), d, wall) == d, "reflex: no limit"
+
+
+def test_inward_is_read_from_the_ring_not_the_centroid():
+    """A C-shaped face whose centroid sits on the far side of its inner edge.
+    A centroid test points that notch out of the part."""
+    ring = np.array([(0, 0), (20, 0), (20, 2), (2, 2), (2, 18), (20, 18),
+                     (20, 20), (0, 20)], dtype=float)
+    assert Polygon(ring).centroid.x > 2.0, "the fixture must defeat a centroid test"
+    for r in (ring, ring[::-1]):
+        isl = Island(id=0, faces={0: r})
+        cut = Cut(a=np.array([2.0, 2.0]), b=np.array([2.0, 18.0]), face=0, seam=0)
+        assert np.allclose(inward(isl, cut), (-1.0, 0.0))
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_both_halves_of_a_fingered_seam_mate_exactly(name, tm):
+    """Bring both halves onto their shared edge. On every jointed segment the
+    finger half fills the whole slot one board deep either side of the line,
+    and the notched half is empty there - no gap, no overlap."""
+    islands, mat, J = _fingered(tm)
+    d = mat.finger_depth_used
+    parts = {p.island_id: p for p in _fingered_parts(tm)[0]}
+    by = {i.id: i for i in islands}
+    cuts = {}
+    for isl in islands:
+        for c in isl.cuts:
+            if c.seam >= 0:
+                cuts[(isl.id, c.seam, c.face)] = c
+    n = 0
+    for iid, js in J.items():
+        for j in js:
+            if j.kind != "finger":
+                continue
+            mine = cuts[(iid, j.seam, j.face)]
+            other_key = next(k for k in cuts if k[1] == j.seam
+                             and (k[0], k[2]) != (iid, j.face))
+            theirs = cuts[other_key]
+            t0, t1 = j.t
+            e = 1e-3
+            slot = _in_cut_frame(mine, by[iid], t0 + e, t1 - e, -d + e, d - e)
+            A = parts[iid].cut.intersection(slot)
+            assert A.area == pytest.approx(slot.area, rel=1e-6), (j.seam, j.t)
+            # Only the notched half's OWN side of the edge: across it, a slit
+            # inside one island can have the other half of the V lying in the
+            # flat sheet - separate board, somewhere else once folded.
+            hole = _in_cut_frame(theirs, by[other_key[0]], t0 + e, t1 - e,
+                                 e, d - e)
+            B = parts[other_key[0]].cut.intersection(hole)
+            assert B.area < 1e-6, (j.seam, j.t)
+            n += 1
+    assert n > 0, "nothing was jointed, so nothing was tested"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_fingers_never_break_a_part_and_conserve_area(name, tm):
+    """Every finger has a notch of the same size, so the net's area cannot
+    change - and a finger meeting its body a nanometre short used to fall
+    out as a loose rectangle, which a piece count sees."""
+    islands, mat, J = _fingered(tm)
+    on, off = _fingered_parts(tm)
+    assert [_pieces(p.cut) for p in on] == [_pieces(p.cut) for p in off]
+    assert sum(p.cut.area for p in on) == pytest.approx(
+        sum(p.cut.area for p in off), rel=1e-9)
+    kinds = [(j.seam, j.t) for js in J.values() for j in js]
+    fingers = sorted((j.seam, j.t) for js in J.values() for j in js
+                     if j.kind == "finger")
+    notches = sorted((j.seam, j.t) for js in J.values() for j in js
+                     if j.kind == "notch")
+    assert fingers == notches and len(kinds) == 2 * len(fingers)
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_a_notch_keeps_a_wall_of_its_own_face(name, tm):
+    """Inside its own face, and a board's thickness from every other edge of
+    it - a fold, another seam, a relief slot - and from every other notch."""
+    islands, mat, J = _fingered(tm)
+    wall = mat.thickness
+    by = {i.id: i for i in islands}
+    for iid, js in J.items():
+        notches = [j for j in js if j.kind == "notch"]
+        for j in notches:
+            ring = by[iid].faces[j.face]
+            face = Polygon(ring)
+            assert face.buffer(1e-6).contains(j.poly)
+            own = [c for c in by[iid].cuts if c.seam == j.seam and c.face == j.face][0]
+            n = len(ring)
+            for k in range(n):
+                p0, p1 = ring[k], ring[(k + 1) % n]
+                on_cut = all(min(np.linalg.norm(q - own.a),
+                                 np.linalg.norm(q - own.b)) < 1e-9
+                             for q in (p0, p1))
+                if on_cut:
+                    continue
+                assert LineString([p0, p1]).distance(j.poly) >= wall - 1e-6
+            for o in notches:
+                if o.seam != j.seam:
+                    assert o.poly.distance(j.poly) >= wall - 1e-6
+
+
+def test_a_fingered_seam_gets_no_glue_tab():
+    """Both on: a seam that interlocks needs no flap, and a flap along a
+    fingered edge would bury the fingers - so tabs go only where fingers
+    could not, and never on top of one."""
+    tm = [t for n, t in ALL if n == "capsule"][0]
+    islands, mat, J = _fingered(tm, use_tabs=True)
+    fingered = {j.seam for js in J.values() for j in js}
+    from cardboard_unfolder.fingers import fingered_seams
+    tabs, _ = place_tabs(islands, mat, skip=fingered_seams(J),
+                         extra={i: [j.poly for j in js if j.kind == "finger"]
+                                for i, js in J.items()})
+    tabbed = {t.seam for ts in tabs.values() for t in ts}
+    assert fingered and tabbed, "the fixture must exercise both"
+    assert not fingered & tabbed
+    for iid, ts in tabs.items():
+        for t in ts:
+            for j in J.get(iid, []):
+                if j.kind == "finger":
+                    assert t.poly.intersection(j.poly).area < 1e-6
+
+
+def test_a_deeper_override_makes_deeper_fingers():
+    tm = ALL[0][1]
+    for kw, want in (({}, 3.0),
+                     (dict(finger_depth_override=True, finger_depth=5.0), 5.0)):
+        _, mat, J = _fingered(tm, **kw)
+        js = [j for v in J.values() for j in v]
+        assert js
+        for j in js:
+            t0, t1 = j.t
+            assert j.poly.area == pytest.approx((t1 - t0) * want, rel=1e-6)
 
 
 # ------------------------------------------------------------------- font

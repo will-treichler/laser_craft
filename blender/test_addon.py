@@ -434,6 +434,32 @@ _m3.use_tabs = True
 check(sum(p.cut.area for p in _L.build_parts(_islx, _m3)) > _flush,
       "glue tabs still reach past the islands")
 
+# Interlocking fingers: the panel settings reach the core, depth follows the
+# board until overridden, and a fingered net trades area rather than adding it.
+_sfc = bpy.context.scene.cbu
+check(_sfc.use_fingers is False and _sfc.finger_width == 15.0,
+      "fingers are off by default, 15 mm wide")
+_sfc.use_fingers = True
+_m4 = props.material_from(_sfc)
+check(_m4.use_fingers and _m4.finger_width == 15.0
+      and abs(_m4.finger_depth_used - _sfc.thickness) < 1e-6,
+      "the finger switch reaches the core, depth = board thickness")
+_sfc.finger_depth_override = True
+_sfc.finger_depth = 4.5
+check(abs(props.material_from(_sfc).finger_depth_used - 4.5) < 1e-6,
+      "...until the depth is overridden")
+_sfc.finger_depth_override = False
+_partsf = _L.build_parts(_islx, _m4)
+_rects = [p.cut for p in _partsf if p.cut.wkb != _partsx[_partsf.index(p)].cut.wkb]
+check(bool(_rects), "fingers change the cut outline")
+check(abs(sum(p.cut.area for p in _partsf) - _flush) < 1e-6 * _flush,
+      "every finger has a notch the same size, so the net's area is conserved")
+check(all(len(getattr(p.cut, "geoms", [p.cut]))
+          == len(getattr(q.cut, "geoms", [q.cut]))
+          for p, q in zip(_partsf, _partsx)),
+      "fingers never break a part into pieces")
+_sfc.use_fingers = False
+
 # vec3 or Blender dies on the draw, and this cannot be caught at draw time
 _v, _c = overlay.cut_segments(_rings, _sc)
 check(_v and all(len(q) == 3 for q in _v), "cut vertices are vec3")

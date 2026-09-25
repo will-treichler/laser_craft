@@ -88,6 +88,27 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "together - the flaps cost about a fifth of the sheet"))
     tab_depth: FloatProperty(name="Tab depth", default=12.0, min=0.0, max=60.0)
 
+    # --- interlocking fingers ---
+    use_fingers: BoolProperty(
+        name="Interlocking fingers", default=False,
+        description=("Cut a box joint along every seam that can take one: "
+                     "fingers on one half drop into notches on the other, so "
+                     "the panels lock in place while the tape or glue goes on. "
+                     "A seam with fingers gets no glue tab"))
+    finger_width: FloatProperty(
+        name="Finger width", default=15.0, min=3.0, max=100.0,
+        description=("mm per finger. Stretched a little so a whole number of "
+                     "them fills each edge; an edge too short for two fingers "
+                     "of at least half this width is left plain"))
+    finger_depth_override: BoolProperty(
+        name="Override depth", default=False,
+        description=("Depth follows the board thickness - a finger has to "
+                     "pass through the board it mates with. Tick to set it "
+                     "yourself, e.g. for a sharp dihedral angle"))
+    finger_depth: FloatProperty(
+        name="Finger depth", default=3.0, min=0.5, max=30.0,
+        description="mm, used only when the depth is overridden")
+
     # --- fold relief ---
     relief_adaptive: BoolProperty(
         name="Adaptive cut width", default=True,
@@ -337,6 +358,10 @@ def material_from(s: CBUSettings, obj=None):
     m.crush = s.crush
     m.tab_depth = s.tab_depth
     m.use_tabs = s.use_tabs
+    m.use_fingers = s.use_fingers
+    m.finger_width = s.finger_width
+    m.finger_depth_override = s.finger_depth_override
+    m.finger_depth = s.finger_depth
     m.relief_adaptive = s.relief_adaptive
     m.relief_fixed = s.relief_fixed
     m.perf_cut = s.perf_cut
