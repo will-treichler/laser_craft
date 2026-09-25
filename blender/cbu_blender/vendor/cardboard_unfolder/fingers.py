@@ -28,11 +28,16 @@ parameter t along a -> b names the same physical point on each half. Nothing
 has to be matched up geometrically after the fact.
 
 Depth defaults to the board thickness: the notch must clear the board that
-fills it, which at a right angle is exactly one thickness. At a dihedral
-angle phi between the panels the two boards overlap along t / sin(phi) of
-each other's outer face - 3.5 mm at 60 or 120 degrees, 6 mm at 150 - so a
-shallow seam wants more; costume tolerance and crushable board mostly do not
-care, and the override is there for when they do.
+fills it, which at a right angle is exactly one thickness. At other angles it
+is NOT one thickness. With both ends cut square to their own faces, the depth
+one board reaches into the other at interior angle phi is t*sin(phi) for an
+obtuse corner - 2.6 mm at 120 degrees, 1.5 at 150, 0.26 at 175 on 3 mm board
+- and t*cot(phi/2) for an acute one - 5.2 mm at 60, 7.2 at 45. So a shallow
+seam needs LESS than a thickness, not more, and a concave seam (an inside
+corner) needs none at all: the boards only touch at the edge. Measured by
+intersecting the two board cross-sections, not derived by hand - the first
+version of this paragraph claimed t / sin(phi), which is the wrong geometry
+and says 6 mm at 150 degrees where the boards overlap by 1.5.
 
 A segment is jointed only if the notch fits in its half (inside its own face,
 a board's thickness clear of any other edge, relief slot or notch) and the

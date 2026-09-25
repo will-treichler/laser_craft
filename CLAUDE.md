@@ -1577,9 +1577,19 @@ user caught it from the numbers; the mating test had passed, because it
 tested the two halves against each other and never against the board.
 `test_a_finger_never_stands_proud_of_the_model` is the invariant that was
 missing: a fingered part never reaches past its unfingered outline, and the
-area it loses is exactly its notches. At a dihedral angle phi the boards
-overlap along t / sin(phi) rather than t - 3.5 mm at 120 degrees, 6 mm at
-150 - which is what the depth override is for.
+area it loses is exactly its notches.
+
+**The depth is one thickness only at a right angle, and shallow seams need
+LESS.** With both board ends cut square to their faces, the depth one board
+reaches into the other at interior angle phi is t*sin(phi) for an obtuse
+corner and t*cot(phi/2) for an acute one - on 3 mm board, 7.2 mm at 45
+degrees, 5.2 at 60, 3.0 at 90, 2.6 at 120, 1.5 at 150, 0.26 at 175 - and
+nothing at all at a concave seam, where the boards meet only at the edge.
+Measured by intersecting the two cross-sections in shapely. An earlier note
+here said t / sin(phi), "6 mm at 150", which is the wrong geometry by a factor
+of four at that angle; the user asked what supported it, and nothing did.
+Every seam still gets the one depth today, which is too deep on a shallow
+helmet seam (the notch leaves a gap) and too shallow on a sharp one.
 
 **Complementary by construction, not by matching.** `build_islands` writes
 `Cut.a` / `Cut.b` in the SAME vertex order on both halves of a seam (v0 then
