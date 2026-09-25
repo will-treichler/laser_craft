@@ -734,8 +734,17 @@ exact comparison with the constant never matches.
 
 The key belongs *beside the buttons that make the marks* - the Cut/Weld pair
 in the UV panel is `cbu.edit_seam`, which calls `cbu.mark`, so it writes
-exactly the same red and blue as the Seams panel. Putting the legend at the
+exactly the same red and blue as the Edge Constraints panel. Putting the legend at the
 top of the UV panel, several boxes away from those buttons, is not a key.
+
+**Name a panel for what is in it.** "Seams" was the panel of cut / fold
+marks and optimiser locks - which say where the solver may cut, not what
+happens at a cut - while glue tabs and interlocking fingers, the things that
+actually join a seam, sat in Material. Now the marks are **Edge
+Constraints** (`CBU_PT_constraints`) and **Seams** (`CBU_PT_seams`, right
+after Material, whose thickness sets the finger depth) holds tabs and
+fingers. `lay.prop(s, "name")` puts the name in `co_consts`, not
+`co_names`, so a check of what a panel draws reads both.
 
 **Two actions are two buttons, never one button and a switch.** The
 optimiser went through two wrong shapes before `cbu.optimise` existed:
@@ -988,13 +997,30 @@ not, because two corners 0.056 mm apart still land either side of a 0.1 mm
 grid line better than half the time.
 
 **The net UV layout is the packing, not a separate layout.** `write_net_uv`
-takes the `Part`s and places each island exactly where `pack()` put it, with
-sheets stacked upward - so the bed reference drawn underneath is the truth.
+takes the `Part`s and places each island exactly where `pack()` put it, on
+the sheet `bridge.sheet_origin` gives it - so the bed reference drawn
+underneath is the truth.
 Before this the rows were laid out independently of the sheets and islands
 straddled the divisions and sat in margins that `pack()` had kept clear.
 `Part.xform` tracks the packing transform for this;
 `test_part_xform_reproduces_the_packing` asserts it still equals the geometry,
 because a transform that drifts makes the 2D view lie about what will be cut.
+
+**Sheets are laid out as squarely as they will go, a gutter apart.** They
+used to stack upward whatever the bed, so three 400 x 900 sheets were a
+400 x 2700 strip the UV editor had to shrink to a sliver to frame.
+`bridge.sheet_columns` picks the column count whose whole arrangement has the
+aspect ratio closest to 1 (on a log scale, so 2:1 and 1:2 are equally bad;
+ties to fewer empty slots, then fewer columns), and `sheet_origin` spaces
+the sheets by `sheet_gutter` - max(40 mm, 12% of the bed) - because the ruler
+lives outside each sheet and side-by-side sheets otherwise leave it nowhere.
+Everything that places or draws a sheet goes through `sheet_origin`: the UV
+writer, the bed overlay (which now draws exactly the sheets used, not every
+slot of the grid - `set_net_bounds(..., sheets=n)`), and the parking row for
+parts no sheet can hold, which sits above the whole grid. A bed change can
+therefore move whole sheets; what must not move is any island's size, which
+is what `the net keeps its millimetres when the bed changes` now checks (per
+island, at 1e-3 mm, since the UVs are float32).
 
 **`uv_layers[...].data` is empty in Edit Mode.** The live data is in the
 BMesh, so reading or writing the mesh datablock there silently does nothing -
@@ -1439,15 +1465,37 @@ the draw buffer 4.665 max against a 4.665 ceiling with 0 of 1378 over, and
 the SVG the same. Regression:
 `test_no_engraved_stroke_is_bigger_than_the_text_it_claims`.
 
-**The bed layer carries a labelled mm ruler** (`overlay.axis_segments`,
-toggled by `show_bed_ruler`) for exactly the reason below: the unit is drawn
-rather than remembered. Ticks run along the bottom and left edges with a
-1/2/5 step from `nice_step`, numbered every major tick, and "MM" once at the
-corner. They sit **outside** the sheet - below and left of the origin - so
-nothing is ever drawn over the parts, which is asserted
-(`nothing is drawn inside the sheet area`). The numbers are stroke-font text
-like the engraving, so the ruler scales with the bed rather than the zoom: the
-same 300 mm span emits the same ticks at 1/512 and 1/1024.
+**Every sheet carries its own labelled mm ruler and a mm grid**
+(`overlay.axis_segments`, `overlay.sheet_grid_segments`, toggled by
+`show_bed_ruler` and `show_bed_grid`) for exactly the reason below: the unit
+is drawn rather than remembered. The ruler reads from 0 at each sheet's own
+corner - the laser bed's origin - with a caption naming the sheet and its
+size ("SHEET 1  400X900 MM"), which is the quickest scale check there is. It
+sits **outside** the sheet, in the gutter, so nothing is ever drawn over the
+parts (`nothing is drawn inside any sheet`); the grid is the one thing inside,
+faint and drawn first and thinnest so the outline and the cut stay on top.
+
+**The add-on draws its own grid because Blender's cannot land on round
+millimetres.** The UV unit is a power of two in mm (the next section says
+why), so the UV editor's grid lines - fixed or dynamic - fall at 512/N mm:
+64, 32, 16, never 10 or 50. A ruler in round numbers therefore disagreed with
+the grid under it, which is what was asked about. Three ways out were
+weighed: match Blender's grid (labels 0, 64, 128...), change the UV unit to
+500 or 1000 mm (Blender's grid lands on 10 mm, but the net stops being
+bit-exact), or draw an mm grid and hide Blender's - which is what the user
+chose. `hide_blender_grid` (on by default, `props.apply_blender_grid`, also
+applied after each Unfold) sets `SpaceImageOverlay.show_grid_background` on
+every UV editor, and unticking it gives Blender's grid back.
+
+The grid and ruler adapt to zoom the way Blender's grid does, from the draw
+handler's own `region.view2d`: `grid_steps` takes the finest 1 / 2 / 5 step
+whose lines are at least `GRID_MIN_PX` apart, major every 5 (every 2 after a
+5), so 10 / 50 mm at a normal zoom and 2 / 10 mm zoomed onto a corner; the
+batch cache is keyed on the step. The ruler's ticks are on exactly the grid
+lines (`every grid line on sheet 1 has a ruler tick on it`), numbers are
+thinned when they would collide, and all sizes are fractions of the gutter so
+they fit it on any bed. Stroke-font text in mm, so the same 300 mm reads the
+same at 1/512 and 1/1024.
 
 **The UV unit square is the bed rounded UP to a power of two, and that
 changes with the bed.** A 300 mm bed gives 1/512, so 1 UV unit is 512 mm; a
@@ -1512,22 +1560,37 @@ a real design, part area 39857 mm2 without them against 50233 with.
 
 `use_fingers` cuts a box joint along every seam that can take one: split the
 seam into segments of about `finger_width` (15 mm), and on each segment one
-half grows a finger outward while the other has the same rectangle cut in as
-a notch, alternating. Assembled, the fingers drop into the notches and the
-panels cannot slide while the tape goes on. Depth is `finger_depth_used` -
-the board thickness, because a finger has to pass through the board it mates
-with, unless `finger_depth_override` is set. Off by default, like tabs: it
-changes every part outline, so it is a choice.
+half is kept to the edge - the finger - while the other is cut back by the
+depth - the notch - alternating. Assembled, the fingers fill the notches and
+the panels cannot slide while the tape goes on. Depth is `finger_depth_used`
+- the board thickness, unless `finger_depth_override` is set. Off by default,
+like tabs: it changes every part outline, so it is a choice.
+
+**A finger adds nothing - the edge swings by ONE thickness.** The mesh edge
+is the outer corner, and each board lies inward of its own face, so at a
+right angle a panel cut to the edge already reaches the far face of the
+other panel: its end IS the finger, and the other panel, cut back one
+thickness, stops against its inner face. The first version also grew each
+finger outward by the depth, so the edge swung +/-3 mm - a 6 mm finger on
+3 mm board, standing a board's thickness proud of the assembled model. The
+user caught it from the numbers; the mating test had passed, because it
+tested the two halves against each other and never against the board.
+`test_a_finger_never_stands_proud_of_the_model` is the invariant that was
+missing: a fingered part never reaches past its unfingered outline, and the
+area it loses is exactly its notches. At a dihedral angle phi the boards
+overlap along t / sin(phi) rather than t - 3.5 mm at 120 degrees, 6 mm at
+150 - which is what the depth override is for.
 
 **Complementary by construction, not by matching.** `build_islands` writes
 `Cut.a` / `Cut.b` in the SAME vertex order on both halves of a seam (v0 then
 v1 of the dual arc), so a parameter t along a -> b is the same physical point
 on each. Nothing is paired up geometrically afterwards. And a segment is
-jointed on BOTH halves or on neither: a finger with no notch opposite it is
-a part that will not close. Regression:
+jointed only if the notch fits its half AND the finger's board is really
+there in the other (not a relief slot, not a notch from another edge);
+otherwise it is left plain on both. Regression:
 `test_both_halves_of_a_fingered_seam_mate_exactly` - bring both halves onto
-their shared edge and the finger half fills the slot one board deep either
-side of the line while the notched half is empty there.
+their shared edge and, one depth in from it, the finger half is solid board
+while the notched half is empty.
 
 That test must look only at the notched half's **own side** of the edge. A
 cut inside one island (a V-slit in the net) can leave the other half of the
@@ -1549,25 +1612,29 @@ interior angle comes from the ring order, as does `inward`: the centroid of a
 concave face can sit across its own edge
 (`test_inward_is_read_from_the_ring_not_the_centroid`).
 
-**A finger's base lies ON the body's edge, and that is a trap.** After
-snapping to the 1e-9 grid the two can sit a fraction of a nanometre apart,
-and the union then keeps the finger as a separate polygon - a loose rectangle
-that falls out of the sheet. icosphere1 went 7 pieces to 11, icosphere2 9 to
-17. `apply_fingers` grows each rectangle by `BITE` (0.1 micron) before the
-boolean so it overlaps the edge rather than meeting it. Area stays conserved
-to 1e-9 because every finger has a notch of the same size; a piece count is
-what sees the bug (`test_fingers_never_break_a_part_and_conserve_area`).
+**Everything a joint touches lies ON the body's edge, and that is a trap -
+twice.** After snapping to the 1e-9 grid the edge and the rectangle can sit
+a fraction of a nanometre apart. For the boolean, a notch that meets the edge
+exactly leaves a hairline (when fingers still grew outward, the union kept
+them as loose rectangles: icosphere1 went 7 pieces to 11), so each notch
+carries a `tool` that reaches `BITE` (0.1 micron) PAST the edge - outward
+only, since growing it on every side shaved the fingers beside it by
+0.17 mm2 on a cone. And for the test of whether a finger has board behind
+it, a strict `contains` of a rectangle whose side is the boundary fails on
+float noise: 240 of icosphere2's fingers refused, a third of the cone's. It
+tests a copy 1e-6 mm in from the edge, the way the notch probe always had
+(`test_a_finger_is_not_refused_over_float_noise_on_its_own_edge`).
 
 **Fingers before tabs.** A seam that interlocks needs no flap, and a flap
 along a fingered edge buries the fingers. `place_tabs` takes `skip` (the
-fingered seams) and `extra` (the finger rectangles, as occupied space), so
-tabs go only where fingers could not and never on top of one.
+fingered seams), so tabs go only where fingers could not. Fingers no longer
+reach outside the part, so there is nothing for a tab to collide with.
 
 **Coverage is decided by edge length, and that is the model, not the code.**
-At 200 mm with a 300 mm bed: box, cone, cylinder, icosphere1 and annulus joint
-**every** seam; capsule 19 of 106; icosphere2 121 of 169, the rest refused
-because a finger in a V-slit would touch the other half of the V; pikachu
-**9 of 207**, of which 195 are simply too short - two fingers at half width
+At 200 mm with a 300 mm bed: box, cone, cylinder, icosphere1, annulus and
+icosphere2 joint **every** seam (icosphere2 was 121 of 169 while fingers
+still stuck out and could hit the other half of a V-slit); capsule 26 of 106;
+pikachu **11 of 207**, of which 195 are simply too short - two fingers at half width
 need `2 * depth + finger_width` = 21 mm and pikachu's median seam is 10.5 mm.
 Scale the model up or the finger width down before concluding the feature is
 broken on a detailed model. `place_fingers(..., why={})` counts the refusals

@@ -738,9 +738,15 @@ class _Unfold:
                 bridge.write_net_uv(obj.data, pm, islands,
                                     scale=bridge.uv_scale(*mat.bed),
                                     placement={p.island_id: p for p in parts},
-                                    sheet_height=mat.bed[1])
-                overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+                                    sheet_size=mat.bed)
+                overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
+                                       sheets=sheets)
                 publish_cuts(obj, parts, mat, pm, islands)
+                try:
+                    from .props import apply_blender_grid
+                    apply_blender_grid(s, context)
+                except Exception:                       # noqa: BLE001
+                    pass            # a view setting must never fail an unfold
 
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             with cbulog.stage(T, "overlay"):
@@ -950,10 +956,11 @@ class CBU_OT_edit_seam(bpy.types.Operator):
             bridge.write_net_uv(obj.data, pm, islands,
                                 scale=bridge.uv_scale(*mat.bed),
                                 placement={p.island_id: p for p in parts},
-                                sheet_height=mat.bed[1])
+                                sheet_size=mat.bed)
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             overlay.rebuild(obj, pm, islands, s.overlay_alpha)
-            overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+            overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
+                                   sheets=sheets)
             publish_cuts(obj, parts, mat, pm, islands)
         except Exception as exc:                        # noqa: BLE001
             traceback.print_exc()
@@ -1002,9 +1009,10 @@ class CBU_OT_repack(bpy.types.Operator):
             bridge.write_net_uv(obj.data, pm, islands,
                                 scale=bridge.uv_scale(*mat.bed),
                                 placement={p.island_id: p for p in parts},
-                                sheet_height=mat.bed[1])
+                                sheet_size=mat.bed)
             _LAST[obj.name] = (pm, islands, parts, sheets, rep)
-            overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+            overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
+                                   sheets=sheets)
             publish_cuts(obj, parts, mat, pm, islands)
         except Exception as exc:                       # noqa: BLE001
             traceback.print_exc()
@@ -1099,9 +1107,10 @@ class CBU_OT_pack_uv(bpy.types.Operator):
 
         bridge.write_net_uv(obj.data, pm, islands, scale=sc,
                             placement={p.island_id: p for p in parts},
-                            sheet_height=mat.bed[1])
+                            sheet_size=mat.bed)
         _LAST[obj.name] = (pm, islands, parts, sheets, rep)
-        overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+        overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
+                               sheets=sheets)
         publish_cuts(obj, parts, mat, pm, islands)
         s.last_sheets = sheets
         if prev == "EDIT_MESH":

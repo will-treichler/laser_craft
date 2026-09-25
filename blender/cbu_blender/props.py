@@ -51,15 +51,16 @@ def rewrite_net(self, context):
         cached = ops._LAST.get(obj.name)
         if not cached:
             return
-        pm, islands, parts, _sheets, _rep = cached
+        pm, islands, parts, sheets, _rep = cached
         if obj.mode != "OBJECT":
             return                      # uv_layers data is empty in Edit Mode
         mat = material_from(self)
         bridge.write_net_uv(obj.data, pm, islands,
                             scale=bridge.uv_scale(*mat.bed),
                             placement={p.island_id: p for p in parts},
-                            sheet_height=mat.bed[1])
-        overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data))
+                            sheet_size=mat.bed)
+        overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
+                               sheets=sheets)
         overlay.refresh_live_cuts()
     except Exception:                                   # noqa: BLE001
         pass                    # a settings tweak must never break the session
@@ -267,11 +268,26 @@ class CBUSettings(bpy.types.PropertyGroup):
 
     show_bed_ruler: BoolProperty(
         name="Ruler", default=True,
-        description=("Draw a labelled millimetre ruler down the bed's bottom "
-                     "and left edges. The UV editor measures in UV units and "
-                     "the factor changes with the bed - 512 mm per unit at a "
-                     "300 mm bed, 1024 at 600 - so a length read off the "
-                     "editor against the wrong constant is out by exactly two"))
+        description=("Draw a labelled millimetre ruler under and left of every "
+                     "sheet, reading from 0 at the sheet's corner, with its "
+                     "size. The UV editor measures in UV units and the factor "
+                     "changes with the bed - 512 mm per unit at a 300 mm bed, "
+                     "1024 at 600 - so a length read off the editor against "
+                     "the wrong constant is out by exactly two"))
+    show_bed_grid: BoolProperty(
+        name="Grid", default=True,
+        description=("Draw a faint millimetre grid inside every sheet that "
+                     "lines up with the ruler - 10 mm with 50 mm majors, finer "
+                     "or coarser as you zoom. Blender's own UV grid cannot land "
+                     "on round millimetres, because its unit is a power of two "
+                     "in mm"))
+    hide_blender_grid: BoolProperty(
+        name="Hide Blender's grid", default=True,
+        update=lambda self, context: apply_blender_grid(self, context),
+        description=("Hide the UV editor's own grid, which cannot line up with "
+                     "the millimetre ruler - its lines fall at 64, 32, 16 mm "
+                     "on a 300 mm bed - so there is one grid to read, not "
+                     "two. Untick to get it back"))
 
     show_net_labels: BoolProperty(
         name="Show annotation", default=True,
@@ -348,6 +364,27 @@ def model_id_for(s: CBUSettings, obj=None) -> str:
     import bpy
     stem = bpy.path.basename(bpy.data.filepath)
     return short_id(stem.rsplit(".", 1)[0]) if stem else ""
+
+
+def apply_blender_grid(s, context=None) -> int:
+    """Show or hide Blender's own grid in every UV editor, per the setting.
+
+    Returns how many editors it touched. `show_grid_background` is the UV
+    editor's grid and tile border; the bed layer draws the sheets instead.
+    """
+    import bpy
+    wm = getattr(bpy.context, "window_manager", None)
+    n = 0
+    for win in (wm.windows if wm else []):
+        for area in win.screen.areas:
+            if area.type != "IMAGE_EDITOR":
+                continue
+            for space in area.spaces:
+                if space.type == "IMAGE_EDITOR":
+                    space.overlay.show_grid_background = not s.hide_blender_grid
+                    n += 1
+            area.tag_redraw()
+    return n
 
 
 def material_from(s: CBUSettings, obj=None):

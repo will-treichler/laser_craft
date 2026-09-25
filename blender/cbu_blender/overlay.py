@@ -21,6 +21,7 @@ _handle = None
 _uv_handle = None
 _batches = {}          # object name -> dict of batches
 _net_bounds = {}       # object name -> (x0, y0, x1, y1) of the net, in mm
+_net_sheets = {}       # object name -> how many sheets the packing used
 _net_cuts = {}         # object name -> per-island outlines, island space
 _live_rings = {}       # object name -> resolved rings, sampled off the draw
 _live_labels = {}      # object name -> resolved engraving, same treatment
@@ -519,12 +520,16 @@ def live_label_strokes(obj, scale: float):
     return _resolve(obj, scale, "labels")
 
 
-def set_net_bounds(name: str, bounds) -> None:
-    """Remember the net's extent so the bed reference knows how far to tile."""
+def set_net_bounds(name: str, bounds, sheets: int | None = None) -> None:
+    """Remember the net's extent, and how many sheets it is packed onto, so
+    the bed reference draws exactly those sheets where the net put them."""
     if bounds is None:
         _net_bounds.pop(name, None)
+        _net_sheets.pop(name, None)
     else:
         _net_bounds[name] = tuple(bounds)
+        if sheets is not None:
+            _net_sheets[name] = int(sheets)
     _bed_cache.clear()
     _tag_redraw()
 
@@ -533,6 +538,7 @@ def clear(name: str | None = None) -> None:
     if name is None:
         _batches.clear()
         _net_bounds.clear()
+        _net_sheets.clear()
         _net_cuts.clear()
         _live_rings.clear()
         _live_labels.clear()
@@ -541,6 +547,7 @@ def clear(name: str | None = None) -> None:
     else:
         _batches.pop(name, None)
         _net_bounds.pop(name, None)
+        _net_sheets.pop(name, None)
         _net_cuts.pop(name, None)
         _live_rings.pop(name, None)
         _live_labels.pop(name, None)
@@ -603,6 +610,11 @@ SHEET_RGBA = (0.95, 0.62, 0.15, 0.85)      # sheet outline
 CUT_RGBA = (0.20, 0.85, 0.45, 0.95)        # what the laser actually follows
 LABEL_RGBA = (0.55, 0.78, 1.00, 0.95)      # engraved seam / fold / part marks
 AXIS_RGBA = (0.95, 0.62, 0.15, 0.70)       # the mm ruler down the bed edges
+GRID_MINOR_RGBA = (0.80, 0.80, 0.80, 0.10)  # the mm grid inside each sheet
+GRID_MAJOR_RGBA = (0.85, 0.85, 0.85, 0.24)
+GRID_MIN_PX = 8.0                          # minor lines never closer than this
+GRID_STEPS = (1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
+MAX_GRID_LINES = 6000
 CUT_MARK_RGBA = (0.85, 0.18, 0.10, 1.0)    # forced cut
 FOLD_MARK_RGBA = (0.12, 0.45, 0.95, 1.0)   # forced fold
 MAX_TICKS = 400                            # a runaway must not stall drawing
@@ -623,8 +635,13 @@ def bed_grid(bounds, bed_w: float, bed_h: float):
     return (0.0, 0.0, max(bounds[2], bed_w), max(bounds[3], bed_h))
 
 
-def bed_segments(bounds, bed_w, bed_h, margin):
-    """Line segments for a grid of sheets covering the net: (verts, colours).
+def bed_segments(bounds, bed_w, bed_h, margin, origins=None):
+    """Line segments for the sheets under the net: (verts, colours).
+
+    `origins` are the sheets the packing actually used, where the net put
+    them (bridge.sheet_layout, in the same units as bed_w). Without them the
+    sheets are tiled over the net's bounds - which draws an outline for every
+    empty slot in a grid, so it is only the fallback.
 
     The net UV layer is written in millimetres, so a sheet is drawn at its
     true size and the islands can be read against it directly - that is the
@@ -634,10 +651,15 @@ def bed_segments(bounds, bed_w, bed_h, margin):
     if bed_w <= 0.0 or bed_h <= 0.0:
         return [], []
     x0, y0, x1, y1 = bounds
-    cols = max(1, min(MAX_TILES, int(np.ceil((x1 - x0) / bed_w))))
-    rows = max(1, min(MAX_TILES, int(np.ceil((y1 - y0) / bed_h))))
-    if cols * rows > MAX_TILES:
-        rows = max(1, MAX_TILES // cols)
+    if origins:
+        tiles = [(float(ox), float(oy)) for ox, oy in origins[:MAX_TILES]]
+    else:
+        cols = max(1, min(MAX_TILES, int(np.ceil((x1 - x0) / bed_w))))
+        rows = max(1, min(MAX_TILES, int(np.ceil((y1 - y0) / bed_h))))
+        if cols * rows > MAX_TILES:
+            rows = max(1, MAX_TILES // cols)
+        tiles = [(x0 + c * bed_w, y0 + r * bed_h)
+                 for r in range(rows) for c in range(cols)]
 
     verts, cols_rgba = [], []
 
@@ -653,13 +675,11 @@ def bed_segments(bounds, bed_w, bed_h, margin):
             cols_rgba.append(rgba)
             cols_rgba.append(rgba)
 
-    for r in range(rows):
-        for c in range(cols):
-            ox, oy = x0 + c * bed_w, y0 + r * bed_h
-            rect(ox, oy, ox + bed_w, oy + bed_h, SHEET_RGBA)
-            if margin > 0.0 and bed_w > 2 * margin and bed_h > 2 * margin:
-                rect(ox + margin, oy + margin,
-                     ox + bed_w - margin, oy + bed_h - margin, USABLE_RGBA)
+    for ox, oy in tiles:
+        rect(ox, oy, ox + bed_w, oy + bed_h, SHEET_RGBA)
+        if margin > 0.0 and bed_w > 2 * margin and bed_h > 2 * margin:
+            rect(ox + margin, oy + margin,
+                 ox + bed_w - margin, oy + bed_h - margin, USABLE_RGBA)
 
     return verts, cols_rgba
 
@@ -772,6 +792,95 @@ def _cut_batch(obj, scale: float):
     return hit
 
 
+def fallback_origins(grid, bed_w, bed_h, scale):
+    """The tiles bed_segments draws when it has no sheet list, in mm."""
+    x0, y0, x1, y1 = grid
+    cols = max(1, min(MAX_TILES, int(np.ceil((x1 - x0) / (bed_w * scale)))))
+    rows = max(1, min(MAX_TILES, int(np.ceil((y1 - y0) / (bed_h * scale)))))
+    if cols * rows > MAX_TILES:
+        rows = max(1, MAX_TILES // cols)
+    return [(x0 / scale + c * bed_w, y0 / scale + r * bed_h)
+            for r in range(rows) for c in range(cols)]
+
+
+def _px_per_mm(ctx, scale):
+    """Screen pixels per millimetre in this UV editor, or None if unknown.
+
+    Read off the region's own view transform - one UV unit is a few hundred
+    pixels at any usable zoom, so the integer rounding of view_to_region is
+    far below what choosing a grid step can see.
+    """
+    region = getattr(ctx, "region", None)
+    v2d = getattr(region, "view2d", None)
+    if v2d is None or not scale:
+        return None
+    try:
+        a = v2d.view_to_region(0.0, 0.0, clip=False)
+        b = v2d.view_to_region(1.0, 0.0, clip=False)
+    except Exception:                                   # noqa: BLE001
+        return None
+    px_per_uv = abs(b[0] - a[0])
+    return px_per_uv * scale if px_per_uv > 0 else None
+
+
+def grid_steps(px_per_mm: float | None = None):
+    """(minor, major) mm for the sheet grid and its ruler, at this zoom.
+
+    The UV editor's own grid cannot land on round millimetres - its unit is a
+    power of two in mm (512 at a 300 mm bed), so its lines fall at 64, 32,
+    16... - which is why the add-on draws its own and hides Blender's. This one
+    adapts to zoom the same way: the finest 1 / 2 / 5 step whose lines are at
+    least GRID_MIN_PX apart, major every 5 (every 2 after a 5), so the pair
+    reads 1/5, 2/10, 5/10, 10/50, 20/100... Without a zoom - headless, or no
+    region - it is 10 / 50 mm.
+    """
+    if not px_per_mm or px_per_mm <= 0:
+        minor = 10.0
+    else:
+        minor = next((st for st in GRID_STEPS if st * px_per_mm >= GRID_MIN_PX),
+                     GRID_STEPS[-1])
+    lead = int(f"{minor:.0e}"[0])
+    return minor, minor * (2.0 if lead == 5 else 5.0)
+
+
+def _multiples(step: float, span: float):
+    """0, step, 2*step ... up to span, each an exact integer times step."""
+    n = int(math.floor(span / step + 1e-9))
+    return [k * step for k in range(n + 1)]
+
+
+def sheet_grid_segments(origins, bed_w, bed_h, minor, major, scale):
+    """A faint millimetre grid inside every sheet: (verts, colours).
+
+    `origins` and the bed are in mm, the output in UV units. Measured from
+    each sheet's own corner, which is the laser bed's origin, so a reading
+    off the grid is a position on the machine. The outline itself is the
+    bed layer's; this draws only the lines strictly inside it.
+    """
+    verts, cols = [], []
+    if not origins or minor <= 0 or bed_w <= 0 or bed_h <= 0:
+        return verts, cols
+    if (bed_w + bed_h) / minor * len(origins) > MAX_GRID_LINES:
+        minor = major                   # too dense to be worth drawing
+    for ox, oy in origins:
+        for axis, span, other in ((0, bed_w, bed_h), (1, bed_h, bed_w)):
+            for mm in _multiples(minor, span):
+                if mm <= 1e-9 or mm >= span - 1e-9:
+                    continue
+                k = mm / major
+                rgba = (GRID_MAJOR_RGBA if abs(k - round(k)) < 1e-9
+                        else GRID_MINOR_RGBA)
+                if axis == 0:
+                    a, b = (ox + mm, oy), (ox + mm, oy + other)
+                else:
+                    a, b = (ox, oy + mm), (ox + other, oy + mm)
+                verts.append((a[0] * scale, a[1] * scale, 0.0))
+                verts.append((b[0] * scale, b[1] * scale, 0.0))
+                cols.append(rgba)
+                cols.append(rgba)
+    return verts, cols
+
+
 def nice_step(span_mm: float, target: int = 6) -> float:
     """A 1 / 2 / 5 x 10^k step giving roughly `target` labelled ticks.
 
@@ -788,8 +897,9 @@ def nice_step(span_mm: float, target: int = 6) -> float:
     return 10.0 * mag
 
 
-def axis_segments(grid, scale: float, label_mm: float = 6.0):
-    """A millimetre ruler along the bottom and left edges. (verts, colours).
+def axis_segments(origins, bed_w, bed_h, scale: float, minor: float = 10.0,
+                  major: float = 50.0, gutter: float = 40.0):
+    """A millimetre ruler under and left of EVERY sheet. (verts, colours).
 
     The UV editor measures in UV units, and the factor is the bed rounded UP to
     a power of two - 512 mm for a 300 mm bed, 1024 for a 600 mm one. A length
@@ -797,68 +907,84 @@ def axis_segments(grid, scale: float, label_mm: float = 6.0):
     by exactly two, and that reads as a bug in whatever was measured rather
     than in the measuring. A ruler drawn in the view needs no remembering.
 
-    Ticks sit OUTSIDE the sheet, below and left of the origin, so nothing is
-    ever drawn over the parts.
+    One per sheet, each reading from 0 at its own corner, with ticks on
+    exactly the lines of the sheet grid (`sheet_grid_segments`, same minor and
+    major) so the two read against each other - and a caption naming the
+    sheet and its size, the quickest scale check there is: the parts either
+    look right against 400 x 900 or they do not.
+
+    `origins`, the bed and the gutter are in mm; the output is in UV units.
+    Everything sits OUTSIDE its sheet, in the gutter below and to the left,
+    so nothing is ever drawn over the parts. Sizes are fractions of the
+    gutter, so they fit it whatever the bed.
     """
     from .vendor.cardboard_unfolder import strokefont
 
-    x0, y0, x1, y1 = grid
-    w_mm, h_mm = (x1 - x0) / scale, (y1 - y0) / scale
-    if w_mm <= 0 or h_mm <= 0:
+    if not origins or bed_w <= 0 or bed_h <= 0 or minor <= 0:
         return [], []
-    step = nice_step(max(w_mm, h_mm))
-    minor = step / 5.0
-    major_len, minor_len = 5.0 * scale, 2.5 * scale
-    gap = 2.0 * scale
+    major_len, minor_len = 0.14 * gutter, 0.07 * gutter
+    gap = 0.04 * gutter
+    # Numbers never taller than a fifth of the gutter nor than half a major
+    # step, and thinned out if they would still collide.
+    label_h = min(0.18 * gutter, 0.5 * major)
+    widest = strokefont.text_width(str(int(round(max(bed_w, bed_h)))), label_h)
+    every = next((k for k in (1, 2, 5, 10, 20, 50) if k * major >= 1.3 * widest),
+                 100)
+    cap_h = 0.16 * gutter
     verts, cols = [], []
 
-    def seg(ax, ay, bx, by):
-        verts.append((float(ax), float(ay), 0.0))
-        verts.append((float(bx), float(by), 0.0))
+    def seg(ax, ay, bx, by):            # in mm
+        verts.append((float(ax) * scale, float(ay) * scale, 0.0))
+        verts.append((float(bx) * scale, float(by) * scale, 0.0))
         cols.append(AXIS_RGBA)
         cols.append(AXIS_RGBA)
 
-    def text(s, at):
-        for st in strokefont.text_strokes(s, label_mm * scale, at,
-                                          anchor="center"):
+    def text(s, at, h, anchor="center"):
+        for st in strokefont.text_strokes(s, h, at, anchor=anchor):
             for i in range(len(st) - 1):
                 seg(st[i][0], st[i][1], st[i + 1][0], st[i + 1][1])
 
-    for axis in (0, 1):
-        span = w_mm if axis == 0 else h_mm
-        n = int(round(span / minor)) + 1
-        if n > MAX_TICKS:
-            continue
-        for i in range(n):
-            mm = i * minor
-            big = abs(mm / step - round(mm / step)) < 1e-9
-            ln = major_len if big else minor_len
-            if axis == 0:
-                u = x0 + mm * scale
-                seg(u, y0, u, y0 - ln)
-                if big:
-                    text(str(int(round(mm))),
-                         (u, y0 - ln - gap - label_mm * scale / 2.0))
-            else:
-                u = y0 + mm * scale
-                seg(x0, u, x0 - ln, u)
-                if big:
-                    text(str(int(round(mm))),
-                         (x0 - ln - gap - label_mm * scale * 1.6, u))
+    def name(mm):
+        return str(int(round(mm))) if abs(mm - round(mm)) < 1e-9 else f"{mm:g}"
 
-    # Say the unit once, at the corner, so nobody has to infer it.
-    text("MM", (x0 - major_len - gap - label_mm * scale * 1.6,
-                y0 - major_len - gap - label_mm * scale / 2.0))
+    ticks_x, ticks_y = _multiples(minor, bed_w), _multiples(minor, bed_h)
+    if (len(ticks_x) + len(ticks_y)) * len(origins) > MAX_TICKS * 10:
+        minor = major                   # a runaway must not stall drawing
+        ticks_x, ticks_y = _multiples(minor, bed_w), _multiples(minor, bed_h)
+    for n, (ox, oy) in enumerate(origins):
+        for mm in ticks_x:
+            k = mm / major
+            big = abs(k - round(k)) < 1e-9
+            seg(ox + mm, oy, ox + mm, oy - (major_len if big else minor_len))
+            if big and int(round(k)) % every == 0:
+                text(name(mm), (ox + mm, oy - major_len - gap - label_h / 2.0),
+                     label_h)
+        for mm in ticks_y:
+            k = mm / major
+            big = abs(k - round(k)) < 1e-9
+            seg(ox, oy + mm, ox - (major_len if big else minor_len), oy + mm)
+            if big and int(round(k)) % every == 0:
+                w = strokefont.text_width(name(mm), label_h)
+                text(name(mm), (ox - major_len - gap - w / 2.0, oy + mm),
+                     label_h)
+        # Name the sheet and its size under the numbers - the unit is said
+        # here once rather than on every tick.
+        text(f"SHEET {n + 1}  {bed_w:g}X{bed_h:g} MM",
+             (ox, oy - major_len - 2 * gap - label_h - cap_h), cap_h,
+             anchor="start")
     return verts, cols
 
 
-def _bed_batch(bounds, bed_w, bed_h, margin, scale=None):
+def _bed_batch(bounds, bed_w, bed_h, margin, scale=None, origins=None,
+               ruler=None):
+    """Sheet outlines, plus the ruler when `ruler` = (origins_mm, bed_w_mm,
+    bed_h_mm, uv scale, minor, major, gutter) is given."""
     line_s = _shaders()[1]
     if line_s is None:
         return None
-    verts, cols_rgba = bed_segments(bounds, bed_w, bed_h, margin)
-    if scale:
-        av, ac = axis_segments(bounds, scale)
+    verts, cols_rgba = bed_segments(bounds, bed_w, bed_h, margin, origins)
+    if ruler:
+        av, ac = axis_segments(*ruler)
         verts = verts + av
         cols_rgba = cols_rgba + ac
     if not verts:
@@ -895,10 +1021,24 @@ def _draw_bed():
     from . import bridge
     sc = bridge.uv_scale(s.bed_x, s.bed_y)
     batch = None
+    grid_batch = None
     if s.show_bed:
         grid = bed_grid(bounds, s.bed_x * sc, s.bed_y * sc)
+        n = _net_sheets.get(obj.name)
+        if n:
+            mm_origins = bridge.sheet_layout(n, s.bed_x, s.bed_y)
+            origins = [(ox * sc, oy * sc) for ox, oy in mm_origins]
+        else:
+            # Sheet count unknown (a net written before it was recorded):
+            # tile over the net as before, and put the grid on those tiles.
+            origins = None
+            mm_origins = fallback_origins(grid, s.bed_x, s.bed_y, sc)
+        minor, major = grid_steps(_px_per_mm(ctx, sc))
+        gutter = bridge.sheet_gutter(s.bed_x, s.bed_y)
+        ruler = ((mm_origins, s.bed_x, s.bed_y, sc, minor, major, gutter)
+                 if s.show_bed_ruler else None)
         key = (obj.name, grid, s.bed_x, s.bed_y, s.margin, sc,
-               s.show_bed_ruler)
+               s.show_bed_ruler, n, minor)
         if key not in _bed_cache:
             # Keep the cut and label batches: they are keyed by their own
             # tag and rebuilding them on every bed change is wasted work.
@@ -907,9 +1047,16 @@ def _draw_bed():
                               and k[0] in ("cuts", "labels"))]:
                 del _bed_cache[k]
             _bed_cache[key] = _bed_batch(grid, s.bed_x * sc, s.bed_y * sc,
-                                         s.margin * sc,
-                                         sc if s.show_bed_ruler else None)
+                                         s.margin * sc, sc, origins, ruler)
+            gv, gc = (sheet_grid_segments(mm_origins, s.bed_x, s.bed_y,
+                                          minor, major, sc)
+                      if s.show_bed_grid else ([], []))
+            _bed_cache[("grid",) + key] = (
+                batch_for_shader(_shaders()[1], "LINES",
+                                 {"pos": gv, "color": gc})
+                if gv and _shaders()[1] is not None else None)
         batch = _bed_cache[key]
+        grid_batch = _bed_cache.get(("grid",) + key)
 
     line_s = _shaders()[1]
     if line_s is None:
@@ -922,6 +1069,18 @@ def _draw_bed():
             line_s.uniform_float("lineWidth", 1.5)
         except Exception:                               # noqa: BLE001
             pass                                        # plain FLAT_COLOR fallback
+        # The mm grid first and thinnest, so the sheet outline and the cut
+        # are never lost under it.
+        if s.show_bed and grid_batch is not None:
+            try:
+                line_s.uniform_float("lineWidth", 1.0)
+            except Exception:                           # noqa: BLE001
+                pass
+            grid_batch.draw(line_s)
+            try:
+                line_s.uniform_float("lineWidth", 1.5)
+            except Exception:                           # noqa: BLE001
+                pass
         if batch is not None:
             batch.draw(line_s)
 

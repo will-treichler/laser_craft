@@ -160,15 +160,12 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
               for isl in islands}
     # Fingers first: a seam that interlocks needs no flap, and a flap laid
     # along a fingered edge would bury the fingers. Tabs then go on the seams
-    # that could not take a finger, clear of the fingers that did.
+    # that could not take a finger.
     joints = place_fingers(islands, mat, bodies) if mat.use_fingers else {}
     # Tabs are optional: most cardboard is taped or gets a glued backing strip,
     # and the flaps cost about a fifth of the sheet in area.
-    tabs, skipped = (place_tabs(
-        islands, mat, skip=fingered_seams(joints),
-        extra={i: [j.poly for j in js if j.kind == "finger"]
-               for i, js in joints.items()})
-        if mat.use_tabs else ({}, set()))
+    tabs, skipped = (place_tabs(islands, mat, skip=fingered_seams(joints))
+                     if mat.use_tabs else ({}, set()))
 
     parts = []
     for isl in islands:

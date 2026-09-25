@@ -2467,8 +2467,9 @@ def test_inward_is_read_from_the_ring_not_the_centroid():
 @pytest.mark.parametrize("name,tm", ALL, ids=IDS)
 def test_both_halves_of_a_fingered_seam_mate_exactly(name, tm):
     """Bring both halves onto their shared edge. On every jointed segment the
-    finger half fills the whole slot one board deep either side of the line,
-    and the notched half is empty there - no gap, no overlap."""
+    finger half is solid board for one depth in from the edge and the notched
+    half is empty there - so the finger fills the notch, with no gap and no
+    overlap. Nothing crosses the edge on either side: that is the next test."""
     islands, mat, J = _fingered(tm)
     d = mat.finger_depth_used
     parts = {p.island_id: p for p in _fingered_parts(tm)[0]}
@@ -2489,7 +2490,7 @@ def test_both_halves_of_a_fingered_seam_mate_exactly(name, tm):
             theirs = cuts[other_key]
             t0, t1 = j.t
             e = 1e-3
-            slot = _in_cut_frame(mine, by[iid], t0 + e, t1 - e, -d + e, d - e)
+            slot = _in_cut_frame(mine, by[iid], t0 + e, t1 - e, e, d - e)
             A = parts[iid].cut.intersection(slot)
             assert A.area == pytest.approx(slot.area, rel=1e-6), (j.seam, j.t)
             # Only the notched half's OWN side of the edge: across it, a slit
@@ -2504,15 +2505,47 @@ def test_both_halves_of_a_fingered_seam_mate_exactly(name, tm):
 
 
 @pytest.mark.parametrize("name,tm", ALL, ids=IDS)
-def test_fingers_never_break_a_part_and_conserve_area(name, tm):
-    """Every finger has a notch of the same size, so the net's area cannot
-    change - and a finger meeting its body a nanometre short used to fall
-    out as a loose rectangle, which a piece count sees."""
+def test_a_finger_never_stands_proud_of_the_model(name, tm):
+    """The mesh edge is the OUTER corner and each board lies inward of its
+    face, so the half kept to the edge already reaches the far face of the
+    other panel. A finger that also grew outward - the first version, +/-3 mm
+    on 3 mm board - stood a board's thickness proud of the assembled model.
+    So a fingered part never reaches past its own unfingered outline, and
+    the edge swings by exactly one depth: every notch takes its whole
+    rectangle and nothing else."""
+    islands, mat, J = _fingered(tm)
+    on, off = _fingered_parts(tm)
+    for p, q in zip(on, off):
+        assert p.cut.difference(q.cut).area < 1e-6, f"part {p.island_id} grew"
+    removed = sum(q.cut.area - p.cut.area for p, q in zip(on, off))
+    notched = sum(j.poly.area for js in J.values() for j in js
+                  if j.kind == "notch")
+    assert notched > 0
+    assert removed == pytest.approx(notched, rel=1e-6)
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_a_finger_is_not_refused_over_float_noise_on_its_own_edge(name, tm):
+    """The finger's rectangle lies ON the body's edge, so a strict `contains`
+    against the unbuffered body failed on 1e-12 mm of noise and called the
+    board missing - 240 of icosphere2's fingers refused, and a third of the
+    cone's. On these plain nets there is always board behind a finger."""
+    islands, _ = unfold(PolyMesh.from_trimesh(tm), trials=40, seed=0)
+    mat = Material.from_flute("B", use_fingers=True)
+    bodies = {i.id: apply_relief(i.outline(), plan_folds(i, mat)) for i in islands}
+    why = {}
+    place_fingers(islands, mat, bodies, why)
+    assert why.get("finger has no board behind it", 0) == 0, why
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_fingers_never_break_a_part(name, tm):
+    """A notch whose outer side met the edge a nanometre short used to leave a
+    hairline of board, which the laser traces as a separate piece - so count
+    the pieces. And every notch has exactly one finger opposite it."""
     islands, mat, J = _fingered(tm)
     on, off = _fingered_parts(tm)
     assert [_pieces(p.cut) for p in on] == [_pieces(p.cut) for p in off]
-    assert sum(p.cut.area for p in on) == pytest.approx(
-        sum(p.cut.area for p in off), rel=1e-9)
     kinds = [(j.seam, j.t) for js in J.values() for j in js]
     fingers = sorted((j.seam, j.t) for js in J.values() for j in js
                      if j.kind == "finger")
@@ -2547,19 +2580,21 @@ def test_a_notch_keeps_a_wall_of_its_own_face(name, tm):
             for o in notches:
                 if o.seam != j.seam:
                     assert o.poly.distance(j.poly) >= wall - 1e-6
+            # and never into a finger kept for another seam
+            for f in js:
+                if f.kind == "finger" and f.seam != j.seam:
+                    assert f.poly.intersection(j.poly).area < 1e-6
 
 
 def test_a_fingered_seam_gets_no_glue_tab():
     """Both on: a seam that interlocks needs no flap, and a flap along a
     fingered edge would bury the fingers - so tabs go only where fingers
-    could not, and never on top of one."""
+    could not."""
     tm = [t for n, t in ALL if n == "capsule"][0]
     islands, mat, J = _fingered(tm, use_tabs=True)
     fingered = {j.seam for js in J.values() for j in js}
     from cardboard_unfolder.fingers import fingered_seams
-    tabs, _ = place_tabs(islands, mat, skip=fingered_seams(J),
-                         extra={i: [j.poly for j in js if j.kind == "finger"]
-                                for i, js in J.items()})
+    tabs, _ = place_tabs(islands, mat, skip=fingered_seams(J))
     tabbed = {t.seam for ts in tabs.values() for t in ts}
     assert fingered and tabbed, "the fixture must exercise both"
     assert not fingered & tabbed

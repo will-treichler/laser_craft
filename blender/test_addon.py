@@ -4,6 +4,7 @@ Uses the `bpy` PyPI module, so this exercises the real Blender API - operator
 registration, bmesh round trips, attributes, UV layers and pack_islands - not
 a mock.
 """
+import math
 import sys
 from pathlib import Path
 
@@ -249,9 +250,15 @@ _d = _np.zeros(len(obj.data.loops) * 2)
 obj.data.uv_layers[bridge.UV_LAYER].data.foreach_get("uv", _d)
 _d = _d.reshape(-1, 2)
 _w, _h = (_d.max(0) - _d.min(0)) / uv_mm_scale()        # back to mm
-_row = bpy.context.scene.cbu.bed_x - 2 * bpy.context.scene.cbu.margin
-check(_w <= _row + 1e-6,
-      f"net is no wider than one usable sheet ({_w:.0f} <= {_row:.0f} mm)")
+_sc_ = bpy.context.scene.cbu
+_nsh = ops._LAST[obj.name][3]
+_cols = bridge.sheet_columns(_nsh, _sc_.bed_x, _sc_.bed_y)
+_rows = -(-_nsh // _cols)
+_g_ = bridge.sheet_gutter(_sc_.bed_x, _sc_.bed_y)
+check(_w <= _cols * _sc_.bed_x + (_cols - 1) * _g_ - 2 * _sc_.margin + 1e-6
+      and _h <= _rows * _sc_.bed_y + (_rows - 1) * _g_ - 2 * _sc_.margin + 1e-6,
+      f"the net fits the {_cols} x {_rows} grid of its {_nsh} sheet(s) "
+      f"({_w:.0f} x {_h:.0f} mm)")
 check(max(_w, _h) / max(min(_w, _h), 1e-9) < 8.0,
       f"net is a block, not a strip (aspect {max(_w,_h)/max(min(_w,_h),1e-9):.1f})")
 
@@ -296,6 +303,50 @@ check(overlay.bed_segments((0, 0, 100, 100), 0.0, 400.0, 8.0) == ([], []),
 _v2, _ = overlay.bed_segments((0.0, 0.0, 1e9, 1e9), 600.0, 400.0, 8.0)
 check(len(_v2) // 16 <= overlay.MAX_TILES,
       f"a runaway net is capped at {overlay.MAX_TILES} tiles")
+
+# ------------------------------------------------ sheets laid out squarely
+# Sheets used to stack upward whatever the bed: three 400 x 900 sheets made a
+# 400 x 2700 strip. The layout picks the column count whose bounding box is
+# closest to square, and the overlay draws exactly the sheets it placed.
+check(bridge.sheet_columns(3, 400.0, 900.0) == 3,
+      "three tall sheets sit side by side, not stacked 2700 mm high")
+check(bridge.sheet_columns(3, 600.0, 400.0) == 2,
+      "three wide sheets go two to a row")
+check(bridge.sheet_columns(1, 400.0, 900.0) == 1, "one sheet is one sheet")
+
+
+def _aspect_err(n, c, w, h):
+    # sheets a gutter apart, so the arrangement is measured with the gutters
+    r = -(-n // c)
+    g = bridge.sheet_gutter(w, h)
+    return abs(math.log((c * (w + g)) / (r * (h + g))))
+
+
+_bad_layout = []
+for _n in range(1, 25):
+    for _w, _h in ((400.0, 900.0), (600.0, 400.0), (300.0, 300.0), (900.0, 200.0)):
+        _c = bridge.sheet_columns(_n, _w, _h)
+        _best = min(_aspect_err(_n, c, _w, _h) for c in range(1, _n + 1))
+        if _aspect_err(_n, _c, _w, _h) > _best + 1e-9:
+            _bad_layout.append((_n, _w, _h, _c))
+check(not _bad_layout, f"no column count is squarer than the one chosen {_bad_layout[:3]}")
+_orig = bridge.sheet_layout(5, 400.0, 900.0)
+_gut = bridge.sheet_gutter(400.0, 900.0)
+check(len(set(_orig)) == 5
+      and all(abs(ox % (400.0 + _gut)) < 1e-6 and abs(oy % (900.0 + _gut)) < 1e-6
+              for ox, oy in _orig),
+      "each sheet gets its own slot, a gutter apart")
+_touch = [(a, b) for i, a in enumerate(_orig) for b in _orig[i + 1:]
+          if abs(a[0] - b[0]) < 400.0 + _gut - 1e-6
+          and abs(a[1] - b[1]) < 900.0 + _gut - 1e-6]
+check(not _touch, "no two sheets touch - the ruler lives in the gutter between them")
+_park = bridge.sheet_origin(-1, 5, 400.0, 900.0)
+check(_park[1] >= max(oy for _ox, oy in _orig) + 900.0,
+      "a part no sheet can hold parks above the whole grid, never on a sheet")
+_vs, _ = overlay.bed_segments((0.0, 0.0, 1200.0, 1800.0), 400.0, 900.0, 8.0,
+                              origins=_orig)
+check(len(_vs) == 5 * 16,
+      f"the overlay draws the 5 sheets used, not the 6 slots of the grid ({len(_vs)//16})")
 
 # ------------------------------------------------ face selection survives
 # With UV Sync Selection off the UV editor only draws the UVs of SELECTED
@@ -376,12 +427,24 @@ def _net_mm():
     return bridge.read_net(obj.data, bridge.uv_scale(*_m.bed))
 
 
+def _island_sizes(net):
+    _pm, _isl = ops._LAST[obj.name][0], ops._LAST[obj.name][1]
+    _loops = bridge.island_loops(obj.data, _isl, _pm)
+    return {k: net[v].max(0) - net[v].min(0) for k, v in _loops.items()}
+
+
 _before = _net_mm()
 _s.bed_x, _s.bed_y = 600.0, 400.0
 _after = _net_mm()
-check(abs(_after[:, 0].max() - _before[:, 0].max()) < 1e-3,
-      f"the net keeps its millimetres when the bed changes "
-      f"({_before[:, 0].max():.1f} -> {_after[:, 0].max():.1f})")
+# Per island, not the net's overall extent: the sheets are laid out in the
+# squarest grid for the bed, so a new bed can legitimately move whole sheets.
+# What must not change is the size of anything - the stored millimetres.
+# 1e-3 mm, not exact: the UV layer is float32 (~9e-5 mm at these sizes), and
+# an island moved to a different slot rounds differently.
+_sb, _sa = _island_sizes(_before), _island_sizes(_after)
+_moved = [k for k in _sb if k not in _sa or np.abs(_sb[k] - _sa[k]).max() > 1e-3]
+check(not _moved and _sb.keys() == _sa.keys(),
+      f"the net keeps its millimetres when the bed changes (islands {_moved[:4]})")
 check(_after[:, 0].min() >= _s.margin - 1e-3,
       "and still starts on the margin")
 
@@ -450,10 +513,15 @@ check(abs(props.material_from(_sfc).finger_depth_used - 4.5) < 1e-6,
       "...until the depth is overridden")
 _sfc.finger_depth_override = False
 _partsf = _L.build_parts(_islx, _m4)
+_m4.use_fingers = False
+_partsu = _L.build_parts(_islx, _m4)       # same frame: unpacked, no fingers
+_m4.use_fingers = True
 _rects = [p.cut for p in _partsf if p.cut.wkb != _partsx[_partsf.index(p)].cut.wkb]
 check(bool(_rects), "fingers change the cut outline")
-check(abs(sum(p.cut.area for p in _partsf) - _flush) < 1e-6 * _flush,
-      "every finger has a notch the same size, so the net's area is conserved")
+check(all(p.cut.difference(q.cut).area < 1e-6 for p, q in zip(_partsf, _partsu)),
+      "a finger never stands proud of the part: fingers add nothing, notches cut in")
+check(sum(p.cut.area for p in _partsf) < _flush,
+      "...so a fingered net is smaller, by exactly its notches")
 check(all(len(getattr(p.cut, "geoms", [p.cut]))
           == len(getattr(q.cut, "geoms", [q.cut]))
           for p, q in zip(_partsf, _partsx)),
@@ -496,6 +564,30 @@ _ui_src = (ROOT / "cbu_blender" / "ui.py").read_bytes().decode()
 _used = sorted(set(_re.findall(r'icon="([A-Z0-9_]+)"', _ui_src)))
 _bad = [i for i in _used if i not in _valid]
 check(not _bad, f"every icon in ui.py exists ({len(_used)} used, bad: {_bad})")
+
+# "Seams" is what happens at a cut - tabs, fingers. The marks that tell the
+# solver where to cut are Edge Constraints. Read off the draw code objects,
+# which needs no UI region.
+from cbu_blender import ui as _ui                        # noqa: E402
+check(_ui.CBU_PT_constraints.bl_label == "Edge Constraints"
+      and _ui.CBU_PT_seams.bl_label == "Seams",
+      "the mark panel is Edge Constraints, the joinery panel is Seams")
+# lay.prop(s, "name") stores the name as a constant, s.name as a name, so
+# a panel's settings are the union of the two.
+_seam_names = (_ui.CBU_PT_seams.draw.__code__.co_names
+               + _ui.CBU_PT_seams.draw.__code__.co_consts)
+_mat_names = (_ui.CBU_PT_material.draw.__code__.co_names
+              + _ui.CBU_PT_material.draw.__code__.co_consts)
+check({"use_tabs", "use_fingers", "finger_width", "tab_depth"} <= set(_seam_names),
+      "glue tabs and fingers live in the Seams panel")
+check(not {"use_tabs", "use_fingers"} & set(_mat_names),
+      "...and not in Material any more")
+check("mark" not in _ui.CBU_PT_seams.draw.__code__.co_consts
+      and "cbu.mark" in _ui.CBU_PT_constraints.draw.__code__.co_consts,
+      "the cut / fold marks are Edge Constraints")
+_order = [c.__name__ for c in _ui.classes]
+check(_order.index("CBU_PT_seams") == _order.index("CBU_PT_material") + 1,
+      "Seams sits right after Material, whose thickness sets the finger depth")
 
 # The swatch is the colour key: red is a forced cut, blue a forced fold, and
 # they are the colours the mark is actually drawn in.
@@ -596,29 +688,77 @@ for _span, _want in ((300.0, 50.0), (600.0, 100.0), (1200.0, 200.0),
           f"nice_step({_span:g}) is a round {_want:g}, got {_got:g}")
 check(overlay.nice_step(0.0) > 0, "a zero span does not divide by zero")
 
-_sc3 = 1.0 / 512.0
-_grid3 = (0.0, 0.0, 300.0 * _sc3, 600.0 * _sc3)
-_av, _ac = overlay.axis_segments(_grid3, _sc3)
+# The grid and ruler read in round millimetres and adapt to zoom the way
+# Blender's own grid does - lines never closer than GRID_MIN_PX.
+for _ppm, _want in ((None, (10.0, 50.0)), (1.0, (10.0, 50.0)),
+                    (0.5, (20.0, 100.0)), (2.0, (5.0, 10.0)),
+                    (10.0, (1.0, 5.0)), (0.02, (500.0, 1000.0))):
+    check(overlay.grid_steps(_ppm) == _want,
+          f"grid_steps({_ppm}) is {_want}, got {overlay.grid_steps(_ppm)}")
+for _ppm in (0.03, 0.3, 1.7, 4.0, 25.0):
+    _mi, _ma = overlay.grid_steps(_ppm)
+    check(_mi * _ppm >= overlay.GRID_MIN_PX or _mi == overlay.GRID_STEPS[-1],
+          f"at {_ppm} px/mm the minor lines are at least "
+          f"{overlay.GRID_MIN_PX:g} px apart ({_mi * _ppm:.1f})")
+
+_sc3 = 1.0 / 1024.0
+_W3, _H3 = 400.0, 900.0
+_org3 = bridge.sheet_layout(3, _W3, _H3)
+_gut3 = bridge.sheet_gutter(_W3, _H3)
+_gv, _gc = overlay.sheet_grid_segments(_org3, _W3, _H3, 10.0, 50.0, _sc3)
+check(_gv and len(_gv) == len(_gc) and all(len(q) == 3 for q in _gv),
+      "the sheet grid emits vec3 segments with a colour each")
+
+
+check(all(any(ox - 1e-6 <= q[0] / _sc3 <= ox + _W3 + 1e-6
+              and oy - 1e-6 <= q[1] / _sc3 <= oy + _H3 + 1e-6 for ox, oy in _org3)
+          for q in _gv),
+      "every grid line lies on a sheet")
+# 400 / 10 - 1 inner verticals and 900 / 10 - 1 inner horizontals per sheet
+check(len(_gv) // 2 == 3 * (39 + 89),
+      f"10 mm lines strictly inside each of 3 sheets ({len(_gv) // 2})")
+check(sum(1 for c in _gc if c == overlay.GRID_MAJOR_RGBA) // 2 == 3 * (7 + 17),
+      "every fifth line is a major")
+
+_av, _ac = overlay.axis_segments(_org3, _W3, _H3, _sc3, 10.0, 50.0, _gut3)
 check(len(_av) > 0 and len(_av) == len(_ac), "the ruler emits segments")
 check(all(len(q) == 3 for q in _av), "ruler vertices are vec3")
 check(all(c == overlay.AXIS_RGBA for c in _ac),
       "and are drawn in the ruler's own colour")
 
-# Nothing may be drawn over the sheet - the ruler lives outside the origin
-# corner, or it would sit on top of the parts it is measuring.
-_xs = [q[0] for q in _av]
-_ys = [q[1] for q in _av]
-check(min(_xs) < 0.0 and min(_ys) < 0.0, "ticks hang outside the sheet")
-_inside = [q for q in _av if q[0] > 1e-9 and q[1] > 1e-9]
+# Nothing may be drawn over a sheet - the ruler lives in the gutter, or it
+# would sit on top of the parts it is measuring.
+_inside = [q for q in _av
+           if any(ox + 1e-6 < q[0] / _sc3 < ox + _W3 - 1e-6
+                  and oy + 1e-6 < q[1] / _sc3 < oy + _H3 - 1e-6
+                  for ox, oy in _org3)]
 check(not _inside,
-      f"nothing is drawn inside the sheet area ({len(_inside)} vert(s))")
+      f"nothing is drawn inside any sheet ({len(_inside)} vert(s))")
+
+# The ticks are ON the grid lines: every grid x-position along a sheet's
+# bottom edge has a tick leaving that edge, so the two read against each other.
+_tick_x = {round(a[0] / _sc3, 6) for a, b in zip(_av[0::2], _av[1::2])
+           if abs(a[0] - b[0]) < 1e-12 and abs(a[1] / _sc3 - _org3[0][1]) < 1e-6}
+_grid_x = {round(a[0] / _sc3, 6) for a, b in zip(_gv[0::2], _gv[1::2])
+           if abs(a[0] - b[0]) < 1e-12 and _org3[0][0] <= a[0] / _sc3 <= _org3[0][0] + _W3}
+check(_grid_x and _grid_x <= _tick_x,
+      f"every grid line on sheet 1 has a ruler tick on it "
+      f"({len(_grid_x & _tick_x)} of {len(_grid_x)})")
 
 # It must scale with the bed, not with the numbers: the same physical span at
-# a different uv_scale gives the same tick count.
-_a1, _ = overlay.axis_segments((0.0, 0.0, 300.0 / 512, 300.0 / 512), 1 / 512.0)
-_a2, _ = overlay.axis_segments((0.0, 0.0, 300.0 / 1024, 300.0 / 1024), 1 / 1024.0)
+# a different uv_scale gives the same ruler.
+_a1, _ = overlay.axis_segments([(0.0, 0.0)], 300.0, 300.0, 1 / 512.0)
+_a2, _ = overlay.axis_segments([(0.0, 0.0)], 300.0, 300.0, 1 / 1024.0)
 check(len(_a1) == len(_a2),
       f"the same 300 mm reads the same at either scale ({len(_a1)} vs {len(_a2)})")
+check(overlay.axis_segments([], 300.0, 300.0, 1 / 512.0) == ([], []),
+      "no sheets, no ruler")
+
+check(props.apply_blender_grid(bpy.context.scene.cbu) >= 0,
+      "hiding Blender's grid survives having no UV editor open")
+check(bpy.context.scene.cbu.show_bed_grid is True
+      and bpy.context.scene.cbu.hide_blender_grid is True,
+      "the mm grid is on, and Blender's is hidden, by default")
 
 _cbu3 = bpy.context.scene.cbu
 check(_cbu3.show_bed_ruler is True, "the ruler is on by default")

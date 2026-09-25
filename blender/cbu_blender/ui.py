@@ -171,15 +171,19 @@ def mark_key(lay, s, cells: int = 2):
         row.label(text="")         # button when there are more than two
 
 
-class CBU_PT_seams(_Base, bpy.types.Panel):
-    bl_label = "Seams"
+class CBU_PT_constraints(_Base, bpy.types.Panel):
+    # "Edge Constraints", not "Seams": these marks tell the SOLVER where it
+    # must and must not cut. What happens at a cut once it is made - glue
+    # tabs, interlocking fingers - is the Seams panel. Both used to share the
+    # one word, and the panel called Seams had nothing about seams in it.
+    bl_label = "Edge Constraints"
     bl_parent_id = "CBU_PT_main"
 
     def draw(self, context):
         lay = self.layout
         s = context.scene.cbu
         if context.mode != "EDIT_MESH":
-            lay.label(text="Enter Edit Mode to mark seams", icon="INFO")
+            lay.label(text="Enter Edit Mode to mark edges", icon="INFO")
             lay.label(text="Alt-click selects an edge loop")
         else:
             # The swatch IS the key: these are the colours the mark is drawn
@@ -225,11 +229,20 @@ class CBU_PT_material(_Base, bpy.types.Panel):
         lay.prop(s, "kerf")
         lay.prop(s, "crush")
         lay.separator()
-        lay.prop(s, "use_tabs")
-        sub = lay.column()
-        sub.enabled = s.use_tabs
-        sub.prop(s, "tab_depth")
-        lay.separator()
+        lay.label(text="Every value here is empirical.", icon="INFO")
+        lay.label(text="Cut a calibration set before trusting it.")
+
+
+class CBU_PT_seams(_Base, bpy.types.Panel):
+    """How two halves of a cut go back together: glue tabs, fingers."""
+    bl_label = "Seams"
+    bl_parent_id = "CBU_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        s = context.scene.cbu
+        lay = self.layout
+        lay.use_property_split = True
         lay.prop(s, "use_fingers")
         sub = lay.column()
         sub.enabled = s.use_fingers
@@ -243,8 +256,12 @@ class CBU_PT_material(_Base, bpy.types.Panel):
             # Show the number actually used, not a field that does nothing.
             row.label(text=f"Depth {s.thickness:.1f} mm (board thickness)")
         lay.separator()
-        lay.label(text="Every value here is empirical.", icon="INFO")
-        lay.label(text="Cut a calibration set before trusting it.")
+        lay.prop(s, "use_tabs")
+        sub = lay.column()
+        sub.enabled = s.use_tabs
+        sub.prop(s, "tab_depth")
+        if s.use_fingers and s.use_tabs:
+            lay.label(text="Tabs go only where fingers could not", icon="INFO")
 
 
 class CBU_PT_folds(_Base, bpy.types.Panel):
@@ -419,8 +436,9 @@ class CBU_PT_uv(bpy.types.Panel):
         # square, which is sized by the bed (rounded up to a power of two, so
         # the scaling is exact) and never by the model.
         lay.label(text=f"UV editor scale: 1 UV unit = {mm:.0f} mm")
-        lay.label(text=f"   (fits one {s.bed_x:.0f} x {s.bed_y:.0f} mm sheet; "
-                       f"set by the bed, not the model)")
+        # Short: the longer "(fits one 400 x 900 mm sheet; set by the bed...)"
+        # truncated to "900... bed" at a normal sidebar width.
+        lay.label(text="   (set by the bed, not the model)")
         # Stacked, not in a row. Four switches side by side truncate to
         # "Sho.." at any sane panel width, and the key that goes with the
         # marks belongs beside the buttons that make them, further down.
@@ -429,6 +447,8 @@ class CBU_PT_uv(bpy.types.Panel):
         sub = col.column(align=True)
         sub.enabled = s.show_bed
         sub.prop(s, "show_bed_ruler")
+        sub.prop(s, "show_bed_grid")
+        sub.prop(s, "hide_blender_grid")
         col.prop(s, "show_cut")
         col.prop(s, "show_net_labels", text="Annotation")
         col.prop(s, "show_net_marks")
@@ -483,7 +503,7 @@ class CBU_PT_uv(bpy.types.Panel):
         if context.mode != "EDIT_MESH":
             box.label(text="Enter Edit Mode to pick edges", icon="INFO")
         else:
-            # Same swatches as the Seams panel, because these write the same
+            # Same swatches as the Edge Constraints panel: these write the same
             # marks: cbu.edit_seam calls cbu.mark, so Cut is the red forced
             # cut and Weld the blue forced fold.
             row = box.row(align=True)
@@ -513,7 +533,8 @@ class CBU_PT_uv(bpy.types.Panel):
         box.label(text="isometry and parts stop mating.")
 
 
-classes = (CBU_PT_main, CBU_PT_seams, CBU_PT_material, CBU_PT_folds,
+classes = (CBU_PT_main, CBU_PT_constraints, CBU_PT_material, CBU_PT_seams,
+           CBU_PT_folds,
            CBU_PT_labels, CBU_PT_machine, CBU_PT_solver,
            CBU_PT_debug, CBU_PT_uv)
 

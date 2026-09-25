@@ -1,11 +1,25 @@
 """Interlocking fingers along cut seams - a box joint for cardboard.
 
 Every cut seam has two halves, one on each island. Split the seam into
-segments of about `finger_width` and alternate: on segment k one half grows a
-finger OUTWARD by the depth and the other half has the same rectangle cut
-INWARD as a notch; on segment k+1 they swap. Assembled, each finger drops
-into its partner's notch and the two panels cannot slide along the seam - they
-lock while the tape or glue goes on.
+segments of about `finger_width` and alternate: on segment k one half keeps
+its full length to the edge - that is the finger - and the other half is cut
+back by the depth - that is the notch; on segment k+1 they swap. Assembled,
+each finger fills its partner's notch and the two panels cannot slide along
+the seam - they lock while the tape or glue goes on.
+
+**A finger adds nothing.** The mesh edge is the OUTER corner where the two
+panels meet, and each panel's board lies inward of its own face. So at a
+right-angle corner, a panel cut to the edge already reaches the far face of
+the other panel - its end is the finger - and the other panel, cut back by one
+board thickness, stops against its inner face. The edge alternates between
+the outline and one thickness in: a swing of ONE board thickness, peak to
+trough, which is what a box joint is.
+
+The first version grew each finger OUTWARD by the depth as well as cutting the
+notch in, so the edge swung by two thicknesses - +/-3 mm, a 6 mm finger on
+3 mm board - and every finger stood a board's thickness proud of the outside
+of the model once assembled. Its mating test passed, because it tested the
+two halves against each other and not against the board.
 
 Complementary by construction, which is the whole requirement. The two halves
 of a seam are the same 3D edge, and `build_islands` stores `Cut.a` / `Cut.b`
@@ -13,15 +27,18 @@ in the SAME vertex order on both sides (v0 then v1 of the dual arc), so a
 parameter t along a -> b names the same physical point on each half. Nothing
 has to be matched up geometrically after the fact.
 
-Depth defaults to the board thickness: a finger has to pass through the
-thickness of the board it mates with, which is what a box joint is. At other
-dihedral angles the exact figure differs; costume tolerance does not care,
-and the override is there for when it does.
+Depth defaults to the board thickness: the notch must clear the board that
+fills it, which at a right angle is exactly one thickness. At a dihedral
+angle phi between the panels the two boards overlap along t / sin(phi) of
+each other's outer face - 3.5 mm at 60 or 120 degrees, 6 mm at 150 - so a
+shallow seam wants more; costume tolerance and crushable board mostly do not
+care, and the override is there for when they do.
 
-A segment is only jointed if BOTH halves can take it. A finger that would hit
-its own island, or a notch that would cut into a neighbouring face, a relief
-slot or another notch, leaves that segment plain on both sides - never on one
-side only, which would be a finger with nowhere to go.
+A segment is jointed only if the notch fits in its half (inside its own face,
+a board's thickness clear of any other edge, relief slot or notch) and the
+finger's material is really there in the other half (not already taken by a
+relief slot or by a notch cut from another edge). Otherwise that segment is
+left plain on both sides - which is simply a seam without a joint.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -48,9 +65,10 @@ class Joint:
     poly: Polygon
     seam: int
     island: int
-    kind: str             # "finger" (added) | "notch" (removed)
+    kind: str             # "finger" (kept to the edge) | "notch" (cut back)
     t: tuple              # (t0, t1) along the seam from Cut.a, mm
     face: int = -1        # the face whose edge it sits on
+    tool: Polygon | None = None   # what a notch actually cuts: see BITE
 
 
 def _ring_ccw(ring: np.ndarray) -> bool:
@@ -176,19 +194,20 @@ def place_fingers(islands: list[Island], mat: Material,
                 seams.setdefault(c.seam, []).append((isl.id, c))
 
     d = mat.finger_depth_used
-    # Material left between a notch and anything else, and room kept round a
-    # finger. One board thickness: less than that and the web tears off the
-    # moment the finger is pushed home. Derived, not tuned.
+    # Material left between a notch and anything else. One board thickness:
+    # less than that and the web tears off the moment the finger is pushed
+    # home. Derived, not tuned.
     wall = max(mat.thickness, 1.0)
 
-    outline = {i.id: shapely.set_precision(i.outline(), GRID) for i in islands}
     base = {}
     for i in islands:
-        b = (bodies or {}).get(i.id, outline[i.id])
+        b = (bodies or {}).get(i.id)
+        if b is None:
+            b = i.outline()
         base[i.id] = prep(shapely.set_precision(b, GRID))
     faces = {}
-    occupied = dict(outline)          # outline plus every finger accepted
     notches: dict[int, list[tuple[int, Polygon]]] = {i.id: [] for i in islands}
+    kept: dict[int, list[tuple[int, Polygon]]] = {i.id: [] for i in islands}
     out: dict[int, list[Joint]] = {i.id: [] for i in islands}
 
     for seam in sorted(seams):
@@ -217,17 +236,28 @@ def place_fingers(islands: list[Island], mat: Material,
         for k, (t0, t1) in enumerate(segs):
             f_isl, f_cut, fu, fv = frames[k % 2]
             n_isl, n_cut, nu, nv = frames[1 - k % 2]
-            finger = _rect(f_cut.a, fu, fv, t0, t1, 0.0, -d)
+            # Both are the same rectangle INSIDE their own half: the notch is
+            # what is cut away, the finger what is kept to fill it.
+            finger = _rect(f_cut.a, fu, fv, t0, t1, 0.0, d)
             notch = _rect(n_cut.a, nu, nv, t0, t1, 0.0, d)
 
-            # The finger must not touch its own island anywhere but its base.
-            probe = _probe(finger, f_cut.a, fu, fv, -1.0, wall)
-            if probe.intersection(occupied[f_isl]).area > 1e-9:
-                refuse("finger hits its island")
+            # The finger's board must really be there: in its own face, not a
+            # relief slot, and not already cut away by a notch from another
+            # edge of the same island. Tested a hair in from the edge: the
+            # rectangle's outer side lies ON the body's boundary, and a strict
+            # `contains` against the unbuffered body then fails on float noise
+            # - it refused 240 of icosphere2's fingers before this.
+            held = _rect(f_cut.a, fu, fv, t0, t1, 1e-6, d)
+            if not (faces[(f_isl, f_cut.face)].contains(held)
+                    and base[f_isl].contains(held)):
+                refuse("finger has no board behind it")
+                continue
+            if any(finger.intersection(q).area > 1e-9 for _c, q in notches[f_isl]):
+                refuse("finger meets a notch")
                 continue
             # The notch, and a wall round it, must be solid board of its own
             # face: not a neighbouring face, not a relief slot, not a notch
-            # cut from another edge.
+            # cut from another edge - and not another seam's finger.
             nprobe = _probe(notch, n_cut.a, nu, nv, 1.0, wall)
             if not faces[(n_isl, n_cut.face)].contains(nprobe):
                 refuse("notch leaves its face")
@@ -235,47 +265,48 @@ def place_fingers(islands: list[Island], mat: Material,
             if not base[n_isl].contains(nprobe):
                 refuse("notch meets a relief slot")
                 continue
-            if any(c is not n_cut and nprobe.intersects(p)
-                   for c, p in notches[n_isl]):
+            if any(c is not n_cut and nprobe.intersects(q)
+                   for c, q in notches[n_isl]):
                 refuse("notch meets another notch")
                 continue
+            if any(c is not n_cut and notch.intersection(q).area > 1e-9
+                   for c, q in kept[n_isl]):
+                refuse("notch meets a finger")
+                continue
 
-            occupied[f_isl] = unary_union([occupied[f_isl], finger])
+            kept[f_isl].append((f_cut, finger))
             notches[n_isl].append((n_cut, notch))
             out[f_isl].append(Joint(finger, seam, f_isl, "finger", (t0, t1),
                                     f_cut.face))
             out[n_isl].append(Joint(notch, seam, n_isl, "notch", (t0, t1),
-                                    n_cut.face))
+                                    n_cut.face,
+                                    _rect(n_cut.a, nu, nv, t0, t1, -BITE, d)))
     return out
 
 
-# How far a finger or notch is grown before the boolean, mm. A finger's base
-# lies ON the body's edge, and after snapping to GRID the two can sit a
-# fraction of a nanometre apart - the union then keeps the finger as a
-# separate piece, a loose rectangle that falls out of the sheet. Growing it
-# by a tenth of a micron makes it bite across the edge instead of meeting it.
+# How far a notch reaches PAST the edge, mm. Its outer side lies ON the
+# body's edge, and after snapping to GRID the two can sit a fraction of a
+# nanometre apart - the difference then leaves a hairline of board along the
+# edge, a sliver the laser traces as a separate piece. Extending the notch a
+# tenth of a micron outward makes it bite across the edge instead of meeting
+# it. Outward only: growing it on every side shaved the fingers beside it,
+# 0.17 mm2 over a cone net, which is small and is also not what was asked for.
 BITE = 1e-4
 
 
 def apply_fingers(body, joints: list[Joint]):
-    """Grow the fingers onto a part and cut the notches out of it."""
-    if not joints:
-        return body
-    add = [j.poly.buffer(BITE, join_style="mitre")
-           for j in joints if j.kind == "finger"]
-    cut = [j.poly.buffer(BITE, join_style="mitre")
+    """Cut the notches out of a part. Fingers are what is left: they add
+    nothing, so a fingered part never reaches past its own outline."""
+    cut = [j.tool if j.tool is not None else j.poly
            for j in joints if j.kind == "notch"]
+    if not cut:
+        return body
     # Floating overlay, snapped once at the end. Snapping the body FIRST puts
-    # GEOS in fixed-precision mode for both booleans, and a body with its
-    # relief slots is tens of thousands of vertices: 10.9 s against 2.8 s on
-    # an icosahedron net, for a result that differs by 1e-9 mm2. BITE is what
-    # makes the floating overlay safe - nothing here meets exactly on a line.
-    g = body
-    if add:
-        g = g.union(unary_union(add))
-    if cut:
-        g = g.difference(unary_union(cut))
-    return shapely.set_precision(g, GRID)
+    # GEOS in fixed-precision mode, and a body with its relief slots is tens
+    # of thousands of vertices: 10.9 s against 2.8 s on an icosahedron net,
+    # for a result that differs by 1e-9 mm2. BITE is what makes the floating
+    # overlay safe - nothing here meets exactly on a line.
+    return shapely.set_precision(body.difference(unary_union(cut)), GRID)
 
 
 def fingered_seams(joints: dict[int, list[Joint]]) -> set[int]:

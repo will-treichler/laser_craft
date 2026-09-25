@@ -402,10 +402,63 @@ def net_transforms(mesh, pm: PolyMesh, islands, scale: float):
     return out, worst
 
 
+def sheet_gutter(bed_w: float, bed_h: float) -> float:
+    """Clear space between sheets in the 2D view, mm.
+
+    The ruler lives OUTSIDE each sheet so it never covers the parts it
+    measures, and sheets laid side by side leave no outside unless one is
+    made. Scales with the bed, so the ruler's numbers stay readable on a big
+    one; never under 40 mm.
+    """
+    return max(40.0, 0.12 * max(bed_w, bed_h))
+
+
+def sheet_columns(n: int, bed_w: float, bed_h: float) -> int:
+    """How many sheets to a row, so the whole layout is as square as it gets.
+
+    Stacking every sheet upward is wrong for a tall bed: three 400 x 900
+    sheets become a 400 x 2700 strip the UV editor has to shrink to a sliver
+    to frame. Pick the column count whose bounding box has the aspect ratio
+    closest to 1 - measured on a log scale, so 2:1 and 1:2 are equally bad -
+    and on a tie, the one with fewer empty slots, then fewer columns.
+    """
+    if n <= 1 or bed_w <= 0 or bed_h <= 0:
+        return 1
+    g = sheet_gutter(bed_w, bed_h)
+    best = None
+    for c in range(1, n + 1):
+        r = -(-n // c)
+        key = (round(abs(math.log((c * (bed_w + g)) / (r * (bed_h + g)))), 9),
+               c * r - n, c)
+        if best is None or key < best[0]:
+            best = (key, c)
+    return best[1]
+
+
+def sheet_origin(sheet: int, n: int, bed_w: float, bed_h: float) -> tuple:
+    """Where sheet `sheet` of `n` sits in the 2D view, in mm.
+
+    Row 0 at the bottom, filling left to right, a `sheet_gutter` apart. A
+    part too big for any sheet (sheet < 0) parks in a row of its own above
+    the whole grid, so it never lands on a real sheet.
+    """
+    cols = sheet_columns(max(n, 1), bed_w, bed_h)
+    g = sheet_gutter(bed_w, bed_h) if bed_w > 0 and bed_h > 0 else 0.0
+    px, py = bed_w + g, bed_h + g
+    if sheet < 0:
+        return 0.0, (-(-max(n, 1) // cols) * py if n > 0 else 0.0)
+    return (sheet % cols) * px, (sheet // cols) * py
+
+
+def sheet_layout(n: int, bed_w: float, bed_h: float) -> list:
+    """Every sheet's origin, in order - what the bed overlay draws."""
+    return [sheet_origin(i, n, bed_w, bed_h) for i in range(n)]
+
+
 def write_net_uv(mesh, pm: PolyMesh, islands, spread: bool = True,
                  row_width: float | None = None, gap: float = 10.0,
                  scale: float = 1.0, placement: dict | None = None,
-                 sheet_height: float = 0.0) -> str:
+                 sheet_size: tuple | None = None) -> str:
     """Write the flat net into a UV layer, in millimetres.
 
     An isometric unfold IS a UV parameterisation, and UVs are stored per
@@ -425,7 +478,8 @@ def write_net_uv(mesh, pm: PolyMesh, islands, spread: bool = True,
     # islands are unfolded into a shared origin, so they need spreading out
     #
     # With `placement` the layout IS the packing: each island goes exactly
-    # where its Part was placed on its sheet, and sheets stack upward. That is
+    # where its Part was placed on its sheet, and the sheets are laid out in
+    # the grid `sheet_layout` chooses - the one the bed overlay draws. That is
     # what makes the bed reference mean something - before this the rows were
     # laid out independently of the sheets, so islands straddled the sheet
     # divisions and sat in the margins that pack() had carefully kept clear.
@@ -439,16 +493,16 @@ def write_net_uv(mesh, pm: PolyMesh, islands, spread: bool = True,
     # re-deriving it from mesh.vertices would drop the object transform.
     data = np.zeros((len(mesh.loops), 2), dtype=np.float64)
     loop_island = np.full(len(mesh.loops), -1, dtype=np.int64)
-    spare = max((p.sheet for p in (placement or {}).values()), default=-1) + 1
+    n_sheets = max((p.sheet for p in (placement or {}).values()), default=-1) + 1
+    bw, bh = sheet_size if sheet_size else (0.0, 0.0)
     for isl in islands:
         part = (placement or {}).get(isl.id)
         if part is None:
             ox, oy = offsets[isl.id] if offsets else (0.0, 0.0)
         else:
-            # a part too big for the bed never got a sheet; park it past the
-            # last real one rather than stacking it on sheet 0
-            row = part.sheet if part.sheet >= 0 else spare
-            ox, oy = 0.0, row * sheet_height
+            # a part too big for the bed never got a sheet; sheet_origin parks
+            # it above the grid rather than on sheet 0
+            ox, oy = sheet_origin(part.sheet, n_sheets, bw, bh)
         for f, pos2 in isl.faces.items():
             fn = pm.plane_map(f, pos2)
             for src in pm.source_faces[f]:
