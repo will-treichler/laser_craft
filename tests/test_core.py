@@ -2168,6 +2168,59 @@ def test_oversized_parts_are_parked_side_by_side():
             assert a.cut.distance(b.cut) >= m.part_gap - 1e-6
 
 
+def _slotted_part(width=2.0, seated=None):
+    """A panel with eleven round-ended relief slots `width` wide, rotated the
+    way packing leaves it. At twice the 1 mm part gap, growing it by the gap
+    collapses every slot to zero width and GEOS returns an invalid buffer.
+    Whether the overlay after it then throws depends on the exact
+    coordinates, so both variants here are ones that threw on the old code:
+    as rotated, and rotated then seated on a `seated` mm margin."""
+    from shapely import affinity
+    from cardboard_unfolder.folds import _strip
+    c, d, n = np.array([100.0, 100.0]), np.array([1.0, 0.0]), np.array([0.0, 1.0])
+    slots = unary_union([_strip(c - 30 * d + k * 9 * n, c + 30 * d + k * 9 * n,
+                                width, round_ends=True) for k in range(-5, 6)])
+    part = set_precision(set_precision(box(0, 0, 200, 200), 1e-9).difference(
+        set_precision(slots, 1e-9)), 1e-9)
+    if seated is None:
+        return affinity.rotate(part, 17.3, origin=(123.4, 56.7))
+    part = affinity.rotate(part, 9.2, origin="centroid")
+    x0, y0, _, _ = part.bounds
+    return affinity.translate(part, seated - x0, seated - y0)
+
+
+def test_growing_a_part_by_the_gap_survives_slots_twice_the_gap_wide():
+    """A 2 mm cut width against a 1 mm gap: the helmet's Unfold and Optimise
+    both died in free_region with a GEOS TopologyException. The fix must not
+    change what counts as occupied - only stop the buffer coming back broken."""
+    from cardboard_unfolder.layout import grow
+    part = _slotted_part(2.0)
+    assert part.is_valid
+    raw = part.buffer(1.0)
+    g = grow(part, 1.0)
+    assert g.is_valid and not g.is_empty
+    assert abs(g.area - raw.area) < 1e-3, "the repair must not change what is occupied"
+    pieces = free_region([part], 392.0, 892.0, 1.0, 4.0)
+    assert pieces and all(q.is_valid for q in pieces)
+    assert not any(q.intersects(part) for q in pieces)
+
+
+@pytest.mark.parametrize("seated", [None, 4.0], ids=["rotated", "seated"])
+def test_the_free_region_survives_slots_twice_the_gap_wide(seated):
+    """Both of the user's messages, from the one call that raised them:
+    tighten asks free_region for the room left on a sheet. Rotated, the old
+    code threw "found non-noded intersection" (Unfold); rotated and seated on
+    the margin, "side location conflict" (Optimise)."""
+    part = _slotted_part(2.0, seated=seated)
+    pieces = free_region([part], 392.0, 892.0, 1.0, 4.0)
+    assert pieces and all(q.is_valid for q in pieces)
+    assert not any(q.intersection(part).area > 1e-6 for q in pieces)
+    free = sum(q.area for q in pieces)
+    sheet = box(4.0, 4.0, 396.0, 896.0)
+    assert free == pytest.approx(sheet.difference(part.buffer(1.0).buffer(0)).area,
+                                 abs=1e-3)
+
+
 def _long_part():
     """615 x 200 mm: fits a 400 x 900 bed only standing up."""
     return _blank(box(0, 0, 615, 200), -1)

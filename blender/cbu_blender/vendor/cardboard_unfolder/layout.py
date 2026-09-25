@@ -240,6 +240,30 @@ def orient_min_bbox(part: Part) -> None:
     part.rotate(-np.degrees(angle), origin=centre)
 
 
+def grow(geom, d: float, **kw):
+    """`geom` buffered by `d` for a collision test - and made valid.
+
+    A part carries its relief slots as holes. Growing it by the part gap
+    shrinks every hole by the gap from both sides, so a slot exactly twice the
+    gap wide - a 2 mm cut width against a 1 mm gap - collapses to zero width,
+    and GEOS hands back an INVALID MultiPolygon with a zero-area piece where
+    the slot was. The next overlay then throws ("found non-noded intersection
+    between LINESTRING (x y, x y) and LINESTRING (x y, x y)", or "side
+    location conflict") and the whole unfold fails. The repair changes no
+    area at all - measured to 1e-4 mm2 on the helmet part that did it - so it
+    only runs when the buffer came back broken.
+    """
+    g = geom.buffer(d, **kw)
+    if g.is_valid:
+        return g
+    g = shapely.make_valid(g)
+    # make_valid keeps a collapsed hole as a stray line in a
+    # GeometryCollection; only the area is an obstacle.
+    polys = [q for q in getattr(g, "geoms", [g])
+             if q.geom_type in ("Polygon", "MultiPolygon") and not q.is_empty]
+    return unary_union(polys) if polys else Polygon()
+
+
 def _corner_candidates(placed_boxes, x0: float, y0: float, gap: float) -> list:
     """Positions worth trying for the next part: the sheet corner, and the
     corners of everything already down.
@@ -286,7 +310,7 @@ def find_spot(part: Part, placed_geo: list, placed_box: list, W: float,
         # is the expensive call here and there are hundreds of positions; doing
         # it inside the loop took the core suite from 36 s to 156 s on its own.
         # One side buffered by the full gap is equivalent to both by half.
-        grown = cand.buffer(gap, join_style=2)
+        grown = grow(cand, gap, join_style=2)
         for y, x in cands:
             if x + cw > m + W or y + ch > m + H:
                 continue
@@ -318,7 +342,7 @@ def free_region(placed_geo: list, W: float, H: float, gap: float,
     sheet = box(m, m, m + W, m + H)
     if not placed_geo:
         return [sheet]
-    free = sheet.difference(unary_union(placed_geo).buffer(gap))
+    free = sheet.difference(grow(unary_union(placed_geo), gap))
     if free.is_empty:
         return []
     return [free] if free.geom_type == "Polygon" else list(free.geoms)
@@ -632,7 +656,7 @@ def raster_mask(geom, res: float, gap: float):
     part by one geometry's bounds while its mask was built from another's is
     an offset nothing downstream would catch.
     """
-    g = geom.buffer(gap / 2.0 + res * 0.7072)
+    g = grow(geom, gap / 2.0 + res * 0.7072)
     x0, y0, x1, y1 = g.bounds
     nx = max(1, int(math.ceil((x1 - x0) / res)) + 1)
     ny = max(1, int(math.ceil((y1 - y0) / res)) + 1)

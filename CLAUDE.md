@@ -440,6 +440,26 @@ shared corner computed via two tree paths lands ~1e-14 apart. Without snapping
 to a 1e-9 grid, unions silently lose ~1% of the net and split it into
 fragments. Regression: `test_outline_union_loses_no_area`.
 
+**Growing a part by the gap can hand back invalid geometry - use
+`layout.grow`.** A part carries its relief slots as holes, and a collision
+buffer by the part gap shrinks each hole by the gap from both sides. A slot
+exactly twice the gap wide - a 2 mm fixed cut width against a 1 mm gap -
+collapses to zero width, and GEOS returns an invalid MultiPolygon with a
+zero-area piece where the slot was. The overlay after it then throws, and the
+whole Unfold fails: "found non-noded intersection between LINESTRING (x y, x y)
+and LINESTRING (x y, x y)" in `free_region`, or "side location conflict" once
+the part is seated on the margin (which is what Optimise hit). 3 mm was fine and
+2 mm was not, on the same helmet. Whether it throws depends on the exact
+coordinates - of 108 synthetic slotted panels at exactly 2 mm, one threw as
+rotated, and a quarter did once seated - so the regression fixture is one of
+those, not a general case. `grow` repairs only when the buffer comes back
+broken, and the repair changes no area (1e-4 mm2 on the helmet part).
+`find_spot` and `raster_mask` survived the invalid buffer only because they
+test containment rather than overlaying; they use `grow` too, because a
+predicate on invalid geometry is not an answer anyone should rely on.
+Regressions: `test_growing_a_part_by_the_gap_survives_slots_twice_the_gap_wide`,
+`test_the_free_region_survives_slots_twice_the_gap_wide`.
+
 **Don't trust GEOS' `minimum_rotated_rectangle`.** It returned a degenerate
 zero-width sliver for a cylinder net whose hull was 2.3e5 mm^2 - but only at
 the net's natural offset a few hundred mm from the origin; the same cloud
