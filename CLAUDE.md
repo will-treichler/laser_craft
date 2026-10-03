@@ -10,12 +10,12 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
 
-python -m pytest tests -q               # 288 core invariants (~3 min)
+python -m pytest tests -q               # 338 core invariants (~3 min)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 291 checks, real Blender API
+python blender/test_addon.py            # 329 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
@@ -49,11 +49,12 @@ numbers → kerf → split to bed → pack → layered SVG/DXF.
 | Module | Does |
 |---|---|
 | `mesh.py` | Load, merge coplanar triangles into n-gons, dual graph, planarity gate |
-| `unfold.py` | Rigid unfold, overlap detection, randomised search, set-cover repair, bed splitting |
+| `unfold.py` | Rigid unfold, overlap detection, randomised search, set-cover repair, regret (`reattach`), the optimiser, bed splitting |
+| `cost.py` | The one number the optimiser minimises, with its breakdown |
 | `folds.py` | Relief width from thickness and angle, perforation, kerf |
-| `tabs.py` | Glue tabs with collision rejection, seam numbering |
+| `tabs.py` | Glue tabs with collision rejection, seam numbers and every other label |
 | `fingers.py` | Interlocking box-joint fingers along cut seams |
-| `layout.py` | Parts, narrow-neck detection, shelf packing |
+| `layout.py` | Parts, narrow-neck detection, the three packers (shelf, nest, raster), `tighten` |
 | `export.py` | Layered SVG + DXF + manifest |
 | `strokefont.py` | Single-stroke font for engraved labels |
 
@@ -503,7 +504,15 @@ other packer here is really limited by. On the corpus: annulus 13 sheets to
 faster than the packer it beats (0.5 s against 6.2 s).
 
 Two knobs, and neither wants turning up. **8 or 12 rotations instead of 4, and
-1 mm cells instead of 2, give identical sheet counts for 2-5x the time.** So
+1 mm cells instead of 2, give identical sheet counts for 2-5x the time.**
+That was measured on the square 300 mm bench bed. Re-measured on 300 x 600
+and 600 x 300 beds plus the helmet on 400 x 900, `raster_pack` alone: 8
+angles changed nothing anywhere, and 24 was NOT monotone - the helmet went
+3 sheets to 2, but torus on the portrait bed went 15 to **17** and icosphere2
+3 to 4. Greedy bottom-left with more angles finds a slightly lower spot at an
+awkward angle early and pays for it later. If more angles are ever wanted,
+add a 24-angle raster pass as a FOURTH strategy in `pack()` (which can only
+tie or win) rather than raising `RASTER_ANGLES` - an open decision, below. So
 the win is the question being asked, not the resolution it is asked at - and
 "a finer sweep" is exactly what plateaued before. Restarting with a jittered
 order buys one more sheet on torus (21 -> 20) for six times the work, which is
@@ -1238,6 +1247,16 @@ mtime, and an mtime-based sync then refuses to undo it for the rest of time.
 The next `test_dev` run fails three checks that read like real defects in the
 material model. It now self-heals from the core and says so.
 
+**A running Blender keeps the code it started with.** The add-on is a
+symlink into this repo (`dev_install.py`), so a commit changes the files on
+disk at once - and changes nothing in a Blender that is already open, which
+imported the modules at startup. Parts already on screen were also cut by the
+old code. Measured: the user reported 6 mm fingers after the fix to 3 mm had
+landed; their Blender had started two hours before the commit, and a fresh
+Blender on the same .blend measured 3.000 mm. Restart Blender, or Debug ->
+Reload, and then Unfold again. Check the process start time against the
+commit before believing a regression.
+
 **Hot reload purges `__pycache__` first.** Python validates a `.pyc` from
 source mtime in whole *seconds* plus size, so a same-second edit that doesn't
 change the length silently runs old code.
@@ -1664,7 +1683,29 @@ calibration procedure.
 
 ## State of the milestones
 
-Done: M1 (core), M4 (Blender add-on), debug tooling.
+Done: M1 (core), M4 (Blender add-on), debug tooling, the optimiser, the
+three-strategy packer, interlocking fingers.
+
+**Open decisions - asked, not yet answered by the user:**
+
+- **Finger depth per seam angle.** The depth that clears the other board is
+  `t*sin(phi)` (obtuse), `t*cot(phi/2)` (acute), 0 (concave) - see
+  Interlocking fingers. Proposed: follow it per seam, keep the override as a
+  global fixed depth, and skip fingers below a minimum depth so nearly flat
+  seams are taped. `Cut` does not carry the bend yet; the dual arc's `bend`
+  is available in `build_islands`.
+- **A 24-angle raster pass as a fourth packer** - always, or only when the
+  part count is small. Measured above: helps the helmet by a sheet, hurts
+  torus if it replaced the 4-angle pass, can only tie or win as an extra.
+
+**Unexplained:** `spartan_helm.blend` (the user's file, untracked) reports an
+isometry error of 7e-02 mm through the add-on, where the same model from
+`spartan-helmet-low-poly_reduced.stl` through the CLI reports ~1.4e-05. Not
+the coplanar merge (unchanged at every `merge_tol` down to 0.01 degrees), and
+`split_nonplanar` finds nothing - every polygon is a triangle. Inside costume
+tolerance, but CLAUDE.md treats a failing isometry invariant as wrong code.
+Suspects: `bridge.polymesh_from_object` (object transform), WELD_TOL
+clustering, `planar_tol=None`.
 
 Not done, roughly in value order:
 
