@@ -1607,8 +1607,12 @@ nothing at all at a concave seam, where the boards meet only at the edge.
 Measured by intersecting the two cross-sections in shapely. An earlier note
 here said t / sin(phi), "6 mm at 150", which is the wrong geometry by a factor
 of four at that angle; the user asked what supported it, and nothing did.
-Every seam still gets the one depth today, which is too deep on a shallow
-helmet seam (the notch leaves a gap) and too shallow on a sharp one.
+Every seam gets the one depth - the thickness, or the override - and that
+is **decided, not pending** (2026-10-02): per-seam depth was proposed and the
+user declined it as overcomplicating the feature. It is too deep on a shallow
+helmet seam (the notch leaves a gap) and too shallow on a sharp one, and at
+costume tolerance the override is the answer for a model where that shows.
+Do not reopen it without new evidence from cut board.
 
 **Complementary by construction, not by matching.** `build_islands` writes
 `Cut.a` / `Cut.b` in the SAME vertex order on both halves of a seam (v0 then
@@ -1686,14 +1690,12 @@ calibration procedure.
 Done: M1 (core), M4 (Blender add-on), debug tooling, the optimiser, the
 three-strategy packer, interlocking fingers.
 
+**Decided:** finger depth stays one global value - the board thickness by
+default, `finger_depth_override` to set it - not per seam angle (see
+Interlocking fingers).
+
 **Open decisions - asked, not yet answered by the user:**
 
-- **Finger depth per seam angle.** The depth that clears the other board is
-  `t*sin(phi)` (obtuse), `t*cot(phi/2)` (acute), 0 (concave) - see
-  Interlocking fingers. Proposed: follow it per seam, keep the override as a
-  global fixed depth, and skip fingers below a minimum depth so nearly flat
-  seams are taped. `Cut` does not carry the bend yet; the dual arc's `bend`
-  is available in `build_islands`.
 - **A 24-angle raster pass as a fourth packer** - always, or only when the
   part count is small. Measured above: helps the helmet by a sheet, hurts
   torus if it replaced the 4-angle pass, can only tie or win as an extra.

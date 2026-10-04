@@ -147,8 +147,9 @@ edge swings by exactly one board thickness.
 At other angles the overlap that needs clearing is not one thickness: with
 square-cut ends it is `t·sin θ` for an obtuse corner (1.5 mm at 150° on 3 mm
 board) and `t·cot(θ/2)` for an acute one (5.2 mm at 60°), and nothing at a
-concave seam. Every seam currently gets one depth - the thickness, or the
-override.
+concave seam. Every seam deliberately gets one depth - the thickness, or the
+override - which is simpler to reason about and calibrate; override it for a
+model with mostly sharp or mostly shallow seams.
 
 ## Calibrate before you trust it
 
@@ -176,8 +177,6 @@ reach. Air assist on, never walk away.
 - **Splitting a single oversized face.** Bed splitting only cuts along fold
   edges, so one face bigger than the bed still fails. Needs an in-plane cut plus
   a splice — for cardboard, a glued backing strip.
-- **Finger depth per seam angle** (see above), and a minimum depth below which
-  a nearly flat seam is taped instead.
 - **Better packing sequences** - annealing over order and rotation; the packer
   is greedy bottom-left today.
 - **Modal drag-to-cut seam editing** in the UV editor (click-to-pick works).
