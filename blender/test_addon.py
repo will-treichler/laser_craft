@@ -196,8 +196,70 @@ if svgs:
     root = ET.parse(svgs[0]).getroot()
     labels = {g.get("{http://www.inkscape.org/namespaces/inkscape}label")
               for g in root.iter("{http://www.w3.org/2000/svg}g")}
-    check({"CUT", "PERF_M", "ENGRAVE"} <= labels, f"svg layers present: {sorted(l for l in labels if l)}")
+    check({"CUT", "ENGRAVE"} <= labels, f"svg layers present: {sorted(l for l in labels if l)}")
+    check(not {"PERF_M", "PERF_V"} & labels,
+          "no fold score layers while Score folds is off (the default)")
 check((out / "manifest.json").exists(), "manifest written")
+
+# --- fold scores: off by default, an option, their own colour in the 2D view
+check(s.score_folds is False, "Score folds is off by default")
+_perf_len = sum(g.length for p in ops._LAST[obj.name][2]
+                for g in (p.perf_m, p.perf_v) if not g.is_empty)
+_live = overlay._live_scores.get(obj.name) or []
+_live_len = sum(float(np.sum(np.hypot(*np.diff(l, axis=0).T))) for l in _live)
+check(_perf_len > 0 and abs(_live_len - _perf_len) < 1e-6 * _perf_len + 1e-6,
+      f"the score lines reach the 2D view at their real length "
+      f"({_live_len:.3f} of {_perf_len:.3f} mm)")
+check("score_folds" in overlay._draw_bed.__code__.co_names
+      and "_score_batch" in overlay._draw_bed.__code__.co_names,
+      "and are drawn only while Score folds is on")
+# Not merely unequal: the first choice, orange, was a different tuple from
+# everything and still read as the bed outline and ruler beside it.
+_others = [overlay.CUT_RGBA, overlay.LABEL_RGBA, overlay.SHEET_RGBA,
+           overlay.AXIS_RGBA, overlay.USABLE_RGBA, *overlay.mark_colors()]
+_near = min(float(np.abs(np.subtract(overlay.SCORE_RGBA[:3], c[:3])).max())
+            for c in _others)
+check(_near > 0.3, f"in a colour of their own (closest other colour "
+                   f"differs by {_near:.2f} in some channel)")
+_v, _c = overlay.stroke_segments(_live, 1.0, overlay.SCORE_RGBA)
+check(_v and set(_c) == {overlay.SCORE_RGBA}, "every score segment in that colour")
+s.score_folds = True
+check(bpy.ops.cbu.export() == {"FINISHED"}, "export with Score folds on")
+root = ET.parse(svgs[0]).getroot()
+labels = {g.get("{http://www.inkscape.org/namespaces/inkscape}label")
+          for g in root.iter("{http://www.w3.org/2000/svg}g")}
+check({"PERF_M", "PERF_V"} & labels, "and the score layers are back in the SVG")
+check("; --- SCORE" in sorted(out.glob("*.nc"))[0].read_text(),
+      "and in the G-code")
+s.score_folds = False
+
+# G-code for LaserGRBL: one .nc per sheet, at the Laser panel's settings -
+# read at Export, so changing a power needs no new Unfold.
+ncs = sorted(out.glob("*.nc"))
+check(len(ncs) == len(svgs) >= 1, f"one .nc per sheet ({len(ncs)} for {len(svgs)})")
+for _f in out.glob("*.nc"):
+    _f.unlink()
+s.cut_power, s.cut_speed, s.cut_passes = 900.0, 450.0, 2
+s.air_assist = True
+check(bpy.ops.cbu.export() == {"FINISHED"}, "export with other laser settings")
+_nc = sorted(out.glob("*.nc"))[0].read_text()
+check("; CUT     S900 F450 x2 air" in _nc and "M4 S900" in _nc and "M8" in _nc,
+      "the panel's cut power, speed, passes and air reach the file")
+s.cut_power = 2000.0                    # above $30
+try:
+    _r = bpy.ops.cbu.export()
+except RuntimeError as exc:
+    _r = {"CANCELLED"}
+    print("   ", exc)
+check(_r == {"CANCELLED"}, "a power above Max power is refused, not written")
+s.cut_power, s.cut_speed, s.cut_passes = 1000.0, 500.0, 1
+s.air_assist = False
+s.write_gcode = False
+for _f in out.glob("*.nc"):
+    _f.unlink()
+check(bpy.ops.cbu.export() == {"FINISHED"} and not list(out.glob("*.nc")),
+      "and none at all with Write G-code off")
+s.write_gcode = True
 
 # ------------------------------------------------------------- ico sphere
 obj2 = fresh("Ico", "ico_sphere_add".replace("_add", ""), subdivisions=2, radius=0.13)
@@ -504,6 +566,18 @@ check(_sfc.use_fingers is False and _sfc.finger_width == 15.0,
       "fingers are off by default, 15 mm wide")
 _sfc.use_fingers = True
 _m4 = props.material_from(_sfc)
+_rp = _sfc.bl_rna.properties
+check(abs(_rp["finger_clearance"].default - 0.05) < 1e-6
+      and abs(_m4.finger_clearance - 0.05) < 1e-6,
+      "finger clearance defaults to 0.05 mm and reaches the core")
+check(_rp["relief_fixed"].hard_min == 0.0,
+      "a fixed relief width can be set however thin")
+_sfc.relief_adaptive, _sfc.relief_fixed = False, 0.3
+_mt = props.material_from(_sfc)
+_plan = sys.modules[_L.__name__.rsplit(".", 1)[0] + ".folds"].plan_folds
+check(any(p.style == "relief" for i in _islx for p in _plan(i, _mt)),
+      "a fixed 0.3 mm width is cut as a slot, not perforated")
+_sfc.relief_adaptive, _sfc.relief_fixed = True, 3.0
 check(_m4.use_fingers and _m4.finger_width == 15.0
       and abs(_m4.finger_depth_used - _sfc.thickness) < 1e-6,
       "the finger switch reaches the core, depth = board thickness")
@@ -518,8 +592,17 @@ _partsu = _L.build_parts(_islx, _m4)       # same frame: unpacked, no fingers
 _m4.use_fingers = True
 _rects = [p.cut for p in _partsf if p.cut.wkb != _partsx[_partsf.index(p)].cut.wkb]
 check(bool(_rects), "fingers change the cut outline")
-check(all(p.cut.difference(q.cut).area < 1e-6 for p, q in zip(_partsf, _partsu)),
-      "a finger never stands proud of the part: fingers add nothing, notches cut in")
+# The mesh is the board's mid-plane: a finger stands half the depth out and
+# no further - not the whole depth, which stood a board proud of the model.
+_h = _m4.finger_depth_used / 2.0
+check(all(q.cut.buffer(_h + 1e-6).contains(p.cut)
+          and p.cut.difference(q.cut).area > 0.0
+          for p, q in zip(_partsf, _partsu) if p.cut.wkb != q.cut.wkb),
+      "a finger stands half the depth out past the part, and no further")
+_sfc.corner_hole = True
+check(props.material_from(_sfc).corner_hole,
+      "the corner hole switch reaches the core")
+_sfc.corner_hole = False
 check(sum(p.cut.area for p in _partsf) < _flush,
       "...so a fingered net is smaller, by exactly its notches")
 check(all(len(getattr(p.cut, "geoms", [p.cut]))
@@ -846,9 +929,11 @@ check(_m.label_height == 6.0 and _m.label_min_height == 3.0,
 _s.label_folds = False
 check(props.material_from(_s, obj).label_folds is False,
       "and the M/V toggle does too")
-_s.label_height, _s.label_min_height, _s.label_folds = 4.0, 2.0, True
-check(_s.label_height == 4.0 and _s.label_min_height == 2.0,
-      "defaults are 4 mm text with a 2 mm floor")
+_s.label_height, _s.label_min_height, _s.label_folds = 3.0, 2.0, True
+_rp = _s.bl_rna.properties
+check(_rp["label_height"].default == 3.0
+      and _rp["label_min_height"].default == 2.0,
+      "defaults are 3 mm text with a 2 mm floor")
 
 check(any(c.__name__ == "CBU_PT_labels" for c in ui.classes),
       "the Annotation panel is registered, not just defined")
@@ -1216,6 +1301,69 @@ bpy.ops.cbu.repack()
 _s1 = bpy.context.scene.cbu.last_sheets
 bpy.ops.cbu.repack()
 check(bpy.context.scene.cbu.last_sheets == _s1, "re-packing twice is stable")
+
+# Packing effort: what Re-pack (and so Refresh) packs with. Read on the code
+# object, then exercised once at a small effort so it is not just wired.
+check("pack_effort" in ops.CBU_OT_repack.execute.__code__.co_names,
+      "Re-pack packs with the packing effort setting")
+check("pack_effort" in ui.CBU_PT_uv.draw.__code__.co_consts
+      and "pack_effort" in ui.CBU_PT_main.draw.__code__.co_consts,
+      "the effort slider is beside Re-pack and beside Refresh")
+_scr0 = bpy.context.scene.cbu
+check(_scr0.pack_effort == 0.0, "packing effort defaults to 0 (fast)")
+_scr0.pack_effort = 0.1
+check(bpy.ops.cbu.repack() == {"FINISHED"}, "re-pack runs at a higher effort")
+_scr0.pack_effort = 0.0
+
+# Refresh: a parts-only setting applies to the net in hand, with no new solve
+# - the user asked for it so a change like the corner hole would not mean
+# re-running Optimise. A setting the SOLVE read is named, not silently
+# ignored, because Refresh cannot apply it.
+_scr = bpy.context.scene.cbu
+_isl0 = ops._LAST[obj.name][1]
+_cuts0 = [p.cut.wkb for p in ops._LAST[obj.name][2]]
+_scr.use_fingers = True
+check(bpy.ops.cbu.refresh() == {"FINISHED"}, "refresh runs after an unfold")
+check(ops._LAST[obj.name][1] is _isl0, "refresh keeps the same net (no re-unfold)")
+check([p.cut.wkb for p in ops._LAST[obj.name][2]] != _cuts0,
+      "refresh applies a parts-only setting (fingers)")
+check(ops.unfold_settings_changed(obj, _scr) == [],
+      "a parts-only setting does not count as needing an unfold")
+_bx = _scr.bed_x
+_scr.bed_x = _bx + 50.0
+check(ops.unfold_settings_changed(obj, _scr) == ["bed_x"],
+      f"a solve setting is named as needing an unfold "
+      f"({ops.unfold_settings_changed(obj, _scr)})")
+check(bpy.ops.cbu.refresh() == {"FINISHED"},
+      "refresh still rebuilds the parts when the solve settings moved")
+_scr.bed_x = _bx
+_scr.use_fingers = False
+bpy.ops.cbu.refresh()
+check("cbu.refresh" in ui.CBU_PT_main.draw.__code__.co_consts,
+      "the main panel offers Refresh")
+# The Save board slider is Optimise's alone: Unfold ignores it, so it can
+# only go stale after an Optimise, and the result says when it split smaller.
+check(_scr.board_bias == 0.0, "Save board defaults to large islands (0)")
+bpy.ops.cbu.unfold()
+_scr.board_bias = 0.6
+check("board_bias" not in ops.unfold_settings_changed(obj, _scr),
+      "the slider does not stale a plain Unfold")
+_tb = (_scr.trials, _scr.budget)
+_scr.trials, _scr.budget = 8, 2
+bpy.ops.cbu.optimise()
+# float32 in Blender: 0.6 is stored as 0.6000000238
+check(abs(ops._SOLVED_WITH[obj.name].get("board_bias", -1) - 0.6) < 1e-6,
+      "Optimise records the slider it ran with")
+_scr.board_bias = 0.0
+check(ops.unfold_settings_changed(obj, _scr) == ["board_bias"],
+      "moving the slider after an Optimise asks for another")
+check(" of bed" in _scr.last_detail or "candidate" in _scr.last_detail,
+      f"the Optimise detail line is written ({_scr.last_detail!r})")
+_scr.trials, _scr.budget = _tb
+bpy.ops.cbu.unfold()
+_held = ops._LAST.pop(obj.name)
+check(not bpy.ops.cbu.refresh.poll(), "nothing to refresh before an unfold")
+ops._LAST[obj.name] = _held
 
 # ------------------------------------------------ non-planar faces
 # A bent quad has no flat image at all, so it must be triangulated in the MESH.
@@ -1657,6 +1805,241 @@ check(not _sc.last_optimised and not _sc.last_detail,
       "Unfold after Optimise is a plain unfold, not a second optimise")
 check(_plain.get("candidates") is None and _plain.get("cost") is None,
       "...and its report has no search in it")
+
+# ------------------------------------------------------- cutting together
+# Several objects, one solve: each unfolds on its own, ONE scale for all of
+# them (so a border modelled to fit a rim still fits), and every part on one
+# set of sheets. The saved list says what is cut; empty means the active
+# object, as before.
+bpy.ops.wm.read_factory_settings(use_empty=True)
+bpy.ops.mesh.primitive_cube_add(size=0.1, location=(0, 0, 0.05))
+_A = bpy.context.active_object
+_A.name = "BigBox"
+bpy.ops.mesh.primitive_cube_add(size=0.05, location=(0.3, 0, 0.025))
+_B = bpy.context.active_object
+_B.name = "SmallBox"
+_s = bpy.context.scene.cbu
+_s.trials = 30
+_s.target_height = 0.0
+_s.model_id = ""
+
+check(ops.job_objects(bpy.context)[0] == [_B],
+      "with no list, the active object is what is cut")
+_A.select_set(True)
+_B.select_set(True)
+check(bpy.ops.cbu.job_add() == {"FINISHED"} and len(_s.job) == 2,
+      "Add Selected puts both in the list")
+check(bpy.ops.cbu.job_add() == {"CANCELLED"} and len(_s.job) == 2,
+      "...and adding them again does not duplicate them")
+bpy.ops.object.select_all(action="DESELECT")
+bpy.context.view_layer.objects.active = None
+check(ops.CBU_OT_unfold.poll(bpy.context),
+      "Unfold is available with a list and no active object")
+
+
+def _pairs_clear(names):
+    """The closest two parts on one sheet come, whichever object they are
+    from - the point of packing them together is that they keep the gap."""
+    parts = [p for n in names for p in ops._LAST[n][2]]
+    worst = float("inf")
+    for i, p in enumerate(parts):
+        for q in parts[i + 1:]:
+            if p.sheet == q.sheet and p.sheet >= 0:
+                worst = min(worst, p.cut.distance(q.cut))
+    return worst
+
+
+check(bpy.ops.cbu.unfold() == {"FINISHED"}, "Unfold cuts the list")
+check(_A.name in ops._LAST and _B.name in ops._LAST, "both objects unfolded")
+check(ops._LAST[_A.name][3] == ops._LAST[_B.name][3] == _s.last_sheets,
+      f"they share the sheets ({_s.last_sheets})")
+check(set(ops.group_of(_A.name)) == {_A.name, _B.name}
+      and ops.group_of(_B.name) == ops.group_of(_A.name),
+      "each knows what it was packed with")
+_w = _pairs_clear([_A.name, _B.name])
+check(_w >= _s.part_gap - 1e-6,
+      f"no two parts on a sheet are closer than the gap ({_w:.2f} mm)")
+check(_s.last_sheets == 1, f"two small boxes share ONE sheet ({_s.last_sheets})")
+_mA = {p.model for p in ops._LAST[_A.name][2]}
+_mB = {p.model for p in ops._LAST[_B.name][2]}
+check(_mA and _mB and _mA.isdisjoint(_mB),
+      f"each object's parts carry its own id ({_mA} / {_mB})")
+check("2 objects" in _s.last_report, f"the report says so ({_s.last_report!r})")
+check(overlay.shown_with(_A.name) == (_A.name, _B.name),
+      "the 2D view draws the other object's parts on the shared sheets")
+
+# A typed id gets a letter per object: island numbers restart per object, so
+# HELM-0 twice is exactly the ambiguity the id exists to remove.
+_s.model_id = "JOB"
+_ids = [ops.job_material(_s, o, [_A, _B]).model_id for o in (_A, _B)]
+check(_ids == ["JOBA", "JOBB"], f"a typed id is lettered per object ({_ids})")
+_s.model_id = ""
+
+# One scale for all: Height is measured over everything together.
+_s.target_height = 200.0                  # together they stand 100 mm tall
+check(bpy.ops.cbu.unfold() == {"FINISHED"}, "Unfold with a shared height")
+_eA = ops._LAST[_A.name][0].extents
+_eB = ops._LAST[_B.name][0].extents
+check(abs(_eA[2] - 200.0) < 1e-6 and abs(_eB[2] - 100.0) < 1e-6,
+      f"one factor for both: 200 and 100 mm tall (got {_eA[2]:.3f}, "
+      f"{_eB[2]:.3f}) - not each scaled to 200")
+
+# Re-pack and Refresh take the whole group: packing one alone would put it
+# on top of the other's parts.
+check(bpy.ops.cbu.repack() == {"FINISHED"}, "Re-pack runs on the group")
+check(_pairs_clear([_A.name, _B.name]) >= _s.part_gap - 1e-6,
+      "and the group still keeps the gap")
+check(ops._LAST[_A.name][3] == ops._LAST[_B.name][3],
+      "and still shares one sheet count")
+check(bpy.ops.cbu.refresh() == {"FINISHED"}, "Refresh runs on the group")
+bpy.context.view_layer.objects.active = _A     # Nest Sheets needs one
+check(bpy.ops.cbu.pack_uv() == {"CANCELLED"},
+      "Nest Sheets declines a group rather than nesting half of it")
+
+# Export writes everything on the sheets, both objects.
+import json as _json
+import tempfile as _tf
+_out = Path(_tf.mkdtemp())
+_s.out_dir = str(_out)
+check(bpy.ops.cbu.export() == {"FINISHED"}, "Export the group")
+_man = _json.loads((_out / "manifest.json").read_text())
+check({p["model"] for p in _man["parts"]} == _mA | _mB
+      and len(_man["parts"]) == len(ops._LAST[_A.name][2]) +
+      len(ops._LAST[_B.name][2]),
+      "the manifest lists every part of both objects, by model")
+
+# --- the yardstick
+bpy.context.view_layer.objects.active = _A
+check(bpy.ops.cbu.add_yardstick() == {"FINISHED"}, "Add Yardstick")
+_Y = _s.yardstick
+check(_Y is not None and len(_Y.data.edges) == 1 and len(_Y.data.vertices) == 2,
+      "the yardstick is one edge")
+check(_s.size_mode == "YARDSTICK", "and sizes by it")
+check(bpy.context.active_object == _Y, "and is active, ready to move")
+check(ops.job_ref(bpy.context) == _A,
+      "the panel still reports on the model, not on the stick")
+# Adding it kept the size: the model would have been 200 mm tall.
+_k = _s.yardstick_length / bridge.yardstick_mm(_Y, _s.mm_per_unit)
+check(abs(_k - 2.0) < 1e-6, f"switching to it keeps the size (x{_k:.6f})")
+# Put its ends on a known 50 mm and say it is really 150 mm: x3.
+_Y.location = (0, 0, 0)
+_Y.data.vertices[0].co = (0.0, -0.05, 0.0)
+_Y.data.vertices[1].co = (0.0, 0.0, 0.0)
+_Y.data.update()
+_s.yardstick_length = 150.0
+_ym = bridge.yardstick_mm(_Y, 1000.0)
+# 1e-4, not 1e-6: vertex coordinates are float32, and -0.05 stored that way
+# reads back as 50.0000018 mm.
+check(abs(_ym - 50.0) < 1e-4,
+      f"it measures the distance between its two vertices, in world mm "
+      f"(got {_ym:.7f})")
+check(bpy.ops.cbu.unfold() == {"FINISHED"}, "Unfold sized by the yardstick")
+_eA = ops._LAST[_A.name][0].extents
+check(abs(_eA.max() - 300.0) < 1e-4,
+      f"a 100 mm box with a 50 -> 150 mm yardstick is 300 mm ({_eA.max():.4f})")
+check(_Y.name not in ops._LAST, "the yardstick is never cut")
+_s.job.add().obj = _Y
+check(_Y not in ops.job_objects(bpy.context)[0],
+      "...not even when it is in the list")
+_s.job.remove(len(_s.job) - 1)
+check(not ops.unfold_settings_changed(_A, _s), "nothing stale after Unfold")
+_Y.data.vertices[0].co = (0.0, -0.06, 0.0)
+_Y.data.update()
+check(ops.unfold_settings_changed(_A, _s) == ["yardstick_mm"],
+      f"moving the yardstick needs an Unfold "
+      f"({ops.unfold_settings_changed(_A, _s)})")
+check("Yardstick" in ops.setting_labels(_s, ["yardstick_mm"]),
+      "and the warning names it the way the panel does")
+_Y.data.vertices[0].co = (0.0, -0.05, 0.0)
+_Y.data.update()
+_s.yardstick = None
+check(bpy.ops.cbu.unfold() == {"CANCELLED"},
+      "Size by Yardstick with no yardstick refuses, rather than guessing")
+_s.yardstick = _Y
+_s.size_mode = "HEIGHT"
+_s.target_height = 0.0
+
+# --- a flat piece cut as it is
+bpy.ops.mesh.primitive_grid_add(x_subdivisions=8, y_subdivisions=5,
+                                size=0.12, location=(0.6, 0, 0.0))
+_F = bpy.context.active_object
+_F.name = "FlatPlate"
+_F.rotation_euler = (0.4, 0.2, 0.0)       # flat, but not in an axis plane
+_s.job.add().obj = _F
+_s.merge_coplanar = False                 # keep every grid cell a face
+check(bpy.ops.cbu.unfold() == {"FINISHED"}, "Unfold with a flat plate in the list")
+_s.merge_coplanar = True
+_rep = ops._LAST[_F.name][4]
+_isl = ops._LAST[_F.name][1]
+check(_rep.get("flat_pieces") == 1 and len(_isl) == 1 and not _isl[0].folds,
+      f"the plate is one flat piece with no folds ({_rep.get('flat_pieces')}, "
+      f"{len(_isl)} island(s), {len(_isl[0].faces)} face(s))")
+_pf = ops._LAST[_F.name][2][0]
+check(_pf.perf_m.is_empty and _pf.perf_v.is_empty,
+      "and nothing on it is scored")
+check(abs(_pf.cut.area - 120.0 * 120.0) < 1e-3,
+      f"at its real size ({_pf.cut.area:.3f} mm2)")
+check("flat piece" in _s.last_report, f"the report counts it ({_s.last_report!r})")
+check(_pairs_clear([_A.name, _B.name, _F.name]) >= _s.part_gap - 1e-6,
+      "three objects, still no two parts closer than the gap")
+_uvF = uv_edge_lengths(_F.data, bridge.UV_LAYER)
+_errF = np.abs(_uvF[:, 0] - _uvF[:, 1]).max()
+check(_errF < UV_TOL_MM, f"the plate's net is its real size ({_errF:.1e} mm)")
+
+# --- leaving the list: what was packed together stops re-packing together
+bpy.ops.cbu.job_clear()
+bpy.context.view_layer.objects.active = _B
+check(bpy.ops.cbu.unfold() == {"FINISHED"}, "Unfold one object after the list")
+check(ops.group_of(_B.name) == (_B.name,), "it is packed alone now")
+check(_B.name not in ops.group_of(_A.name),
+      "and the others no longer drag it into their re-pack")
+bpy.context.view_layer.objects.active = _Y
+check(bpy.ops.cbu.unfold() == {"CANCELLED"},
+      "with no list, the yardstick as the active object is refused")
+
+
+# --- a listed object left in Edit Mode behind another active one. The ESD
+# gun: Add Yardstick, run from Edit Mode, made the stick active and left the
+# model in Edit Mode, where its mesh arrays read EMPTY - Optimise then died
+# with "foreach_set(..) sequence length mismatch given 228, needed 0".
+def _ran(op):
+    try:
+        return op() == {"FINISHED"}
+    except RuntimeError as exc:
+        print("   ", exc)
+        return False
+
+
+def _stuck_behind_stick():
+    bpy.ops.object.select_all(action="DESELECT")
+    bpy.context.view_layer.objects.active = _A
+    _A.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.context.view_layer.objects.active = _Y    # what Add Yardstick did
+    return _A.mode == "EDIT" and bpy.context.mode == "OBJECT"
+
+
+_s.job.add().obj = _A
+_s.job.add().obj = _B
+check(_stuck_behind_stick(), "setup: a listed model in Edit Mode, the stick active")
+check(_ran(bpy.ops.cbu.unfold), "Unfold reads a listed model left in Edit Mode")
+check(_A.mode == "OBJECT", "and leaves it in Object Mode")
+check(_stuck_behind_stick(), "setup again")
+check(_ran(bpy.ops.cbu.repack), "Re-pack writes to a listed model left in Edit Mode")
+bpy.ops.cbu.job_clear()
+bpy.ops.object.select_all(action="DESELECT")
+bpy.context.view_layer.objects.active = _A
+_A.select_set(True)
+bpy.ops.object.mode_set(mode="EDIT")
+_s.yardstick = None
+check(_ran(bpy.ops.cbu.add_yardstick), "Add Yardstick from Edit Mode")
+check(_A.mode == "OBJECT",
+      f"does not leave the model behind it in Edit Mode ({_A.mode})")
+bpy.data.objects.remove(_s.yardstick)
+bpy.ops.cbu.job_clear()
+_s.size_mode = "HEIGHT"
+_s.target_height = 0.0
+_s.yardstick = None
 
 # ------------------------------------------------------- reload operator
 # reload_all() unregisters CBU_OT_reload itself, so the operator must not

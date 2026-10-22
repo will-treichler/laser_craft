@@ -55,6 +55,7 @@ class Island:
     faces: dict[int, np.ndarray] = field(default_factory=dict)   # face -> (n,2) ring
     folds: list[Fold] = field(default_factory=list)
     cuts: list[Cut] = field(default_factory=list)
+    flat: bool = False      # a flat piece, cut as it is (`flat_island`)
 
     def outline(self, grid: float = 1e-9):
         """Union of the island's faces: the shape the laser cuts around.
@@ -428,13 +429,36 @@ def mend(pm: PolyMesh, G: nx.Graph, forest: nx.Graph, pos: dict,
 FINALIST_WORK = 60
 FINALIST_CAP = 24
 
+# Bed-split sizes the slider adds, as fractions of the island limit, and the
+# slider position each starts at: a fraction f joins once bias >= (1-f)/0.6,
+# so 85% from 0.25, 70% from 0.5, 50% from 0.84. Splitting below the bed is
+# the only lever that actually makes pieces smaller - lowpoly_dome split to a
+# smaller limit went 4 islands / 4 sheets to 15 / 3 - and they are tried on
+# the best few finalists only, because each one is another pack.
+SPLIT_FRACTIONS = (0.85, 0.7, 0.5)
+SPLIT_FINALISTS = 3
+
+
+def split_fractions(bias: float) -> list:
+    return [1.0] + [f for f in SPLIT_FRACTIONS if (1.0 - f) <= 0.6 * bias + 1e-9]
+
 
 def optimise(pm: PolyMesh, G: nx.Graph, mat, trials: int = 60, seed: int = 0,
              max_size: tuple | None = None, budget: int = 10,
              finalists: int = 6, weights=None, splinter_width: float = 0.0,
              neck_width: float = 0.0, count_sheets=True, progress=None,
-             verbose: bool = False):
+             verbose: bool = False, board_bias: float = 0.0):
     """Choose a tree by what the finished net costs, not by how it starts.
+
+    `board_bias` is the slider (0 = large islands, today's behaviour; 1 =
+    less board): it sets the weights when none are given
+    (`cost.board_weights`) and adds smaller bed-split sizes for the best
+    finalists (`split_fractions`). The sheet term blends from the whole-sheet
+    count at 0 to sheet-equivalents at 1 (the last sheet counted only as far
+    as it is used, after packing it low). Measured: scoring sheet-equivalents
+    at 0 too traded islands for offcut on the default - icosphere2 8 -> 12
+    islands, pikachu 8 -> 9 - and the user's default is large islands.
+
 
     `search` ranks candidates by how many faces overlap, and only among the
     trees that overlap not at all. On the models where that matters it does
@@ -502,9 +526,10 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
     returning False stops the search, which then answers with the best it has.
     A minute of silence is indistinguishable from a hang.
     """
-    from .cost import score_islands, Weights
+    from .cost import score_islands, board_weights
 
-    weights = weights or Weights()
+    bias = min(1.0, max(0.0, float(board_bias)))
+    weights = weights or board_weights(bias)
     if splinter_width <= 0 and mat is not None:
         splinter_width = mat.splinter_width
     rng = np.random.default_rng(seed)
@@ -547,42 +572,76 @@ Candidates are ranked BEFORE the bed split, which looks wrong and was
     if verbose:
         print(f"  {len(cands)} candidate(s), {n_isl} island(s) in the best -> "
               f"{deep} finalist(s)")
-    best = None
-    for rank, (_q, i, T, pos, bad, extra, welds) in enumerate(
-            cands[:max(1, deep)]):
+    def finish(T, pos, bad, extra, welds, i, frac):
+        """Split one finalist at `frac` of the limit, pack it, score it."""
         splits = oversize = 0
         bed = []
         if max_size is not None:
-            T, pos, splits, oversize, bed = split_to_fit(pm, T, pos, *max_size)
+            T, pos, splits, oversize, bed = split_to_fit(
+                pm, T, pos, max_size[0] * frac, max_size[1] * frac)
             bad = overlapping_pairs(T, pos)
         isl = build_islands(pm, G, T, pos)
-        sheets, n_over = None, 0
+        sheets = sheet_eq = None
+        n_over = 0
         if count_sheets and mat is not None:
             # Deferred, and it has to be: layout imports this module, so the
             # two can only meet inside a call. Packing throwaway copies, so
             # nothing the caller holds is moved by the measurement.
-            from .layout import build_parts, raster_pack
+            from .layout import (build_parts, raster_pack, compact_last,
+                                 sheet_equivalents)
             try:
-                sheets, over = raster_pack(build_parts(isl, mat), mat)
+                parts = build_parts(isl, mat, annotate=False)
+                sheets, over = raster_pack(parts, mat)
                 n_over = len(over)
+                # Scored the way pack() will leave it: the last sheet low,
+                # and only as much of it as is used.
+                compact_last(parts, mat)
+                sheet_eq, _off = sheet_equivalents(parts, mat)
             except Exception:                           # noqa: BLE001
-                sheets = None       # a cost term is never worth failing a solve
-        full = score_islands(isl, mat, sheets=sheets, w=weights,
+                sheets = sheet_eq = None   # never worth failing a solve over
+        term = None
+        if sheets is not None and sheet_eq is not None:
+            term = (1.0 - bias) * sheets + bias * sheet_eq
+        full = score_islands(isl, mat, sheets=term, w=weights,
                              oversize=n_over)
         if verbose:
-            print(f"  finalist {rank + 1} (trial {i + 1}): "
-                  f"{sheets} sheet(s), {full.report()}")
-        stats = dict(extra_cuts=extra, rewelds=welds, size_splits=splits,
-                     oversize=oversize, bed=bed, cost=full.total,
-                     terms=full.terms, trial=i + 1, sheets=sheets)
-        if best is None or full.total < best[3]["cost"]:
-            best = (T, pos, bad, stats)
-        n_fin = min(deep, len(cands))
-        if not report(rank + 1, n_fin,
-                      f"scoring finalists {rank + 1}/{n_fin}"):
+            print(f"  finalist (trial {i + 1}, split {frac:.0%}): "
+                  f"{sheet_eq} sheet-eq, {full.report()}")
+        return (T, pos, bad, dict(
+            extra_cuts=extra, rewelds=welds, size_splits=splits,
+            oversize=oversize, bed=bed, cost=full.total, terms=full.terms,
+            trial=i + 1, sheets=sheets, sheet_eq=sheet_eq, split_frac=frac))
+
+    fracs = split_fractions(board_bias) if max_size is not None else [1.0]
+    n_fin = min(deep, len(cands))
+    n_more = min(SPLIT_FINALISTS, n_fin) * (len(fracs) - 1)
+    total = n_fin + n_more
+    scored = []
+    for rank, (_q, i, T, pos, bad, extra, welds) in enumerate(
+            cands[:max(1, deep)]):
+        scored.append((finish(T, pos, bad, extra, welds, i, 1.0),
+                       (T, pos, bad, extra, welds, i)))
+        if not report(rank + 1, total, f"scoring finalists {rank + 1}/{n_fin}"):
+            break
+    else:
+        # The slider's other half: the best few finalists again at smaller
+        # bed splits - smaller pieces, which pack denser. Ranked at full size
+        # first, so only nets already worth having pay for another pack.
+        done = len(scored)
+        for (_res, raw) in sorted(scored, key=lambda s: s[0][3]["cost"])[
+                :SPLIT_FINALISTS]:
+            for frac in fracs[1:]:
+                scored.append((finish(*raw, frac), raw))
+                done += 1
+                if not report(done, total,
+                              f"trying smaller pieces {done - n_fin}/{n_more}"):
+                    break
+            else:
+                continue
             break
 
-    T, pos, bad, stats = best
+    T, pos, bad, stats = min((s[0] for s in scored),
+                             key=lambda r: r[3]["cost"])
     stats["trials_used"] = used
     stats["candidates"] = len(cands)
     stats["mended"] = spent
@@ -1145,6 +1204,11 @@ def _convex_hull(pts: np.ndarray) -> np.ndarray:
     p = np.unique(np.asarray(pts, dtype=float), axis=0)   # also sorts lexically
     if len(p) < 3:
         return p
+    # Plain floats, not numpy rows: the loop below is scalar arithmetic, and
+    # indexing a numpy row per point was 90% of its time. Python floats ARE
+    # float64 and the operations run in the same order, so the hull is
+    # bit-identical (test_the_convex_hull_is_unchanged_by_the_fast_path).
+    p = p.tolist()
 
     def chain(seq):
         out: list = []
@@ -1398,13 +1462,119 @@ def cut_arcs(G_full: nx.Graph, forest: nx.Graph) -> list:
     return sorted(set(out))
 
 
+# ------------------------------------------------------------ flat pieces
+
+# A face may tilt this far from its piece's plane and the piece still count as
+# flat. Steeper than this it is a wall, and a piece with walls is a solid -
+# a box 3 mm thick is within any flatness tolerance and is still not a sheet.
+FLAT_MAX_TILT_DEG = 45.0
+
+
+def _plane_fit(pts: np.ndarray):
+    """Least-squares plane: (centroid, unit normal, max |distance|)."""
+    c = pts.mean(axis=0)
+    _u, _s, vt = np.linalg.svd(pts - c, full_matrices=False)
+    n = vt[-1]
+    return c, n, float(np.abs((pts - c) @ n).max())
+
+
+def flat_pieces(pm: PolyMesh, tol: float, G: nx.Graph | None = None) -> list:
+    """Connected pieces of the mesh that can be cut exactly as they are.
+
+    A piece is one connected component of the dual graph, so it shares no
+    edge with anything else - nothing is ever cut off a larger part to make
+    one. It is flat when every vertex lies within `tol` mm of one plane AND
+    every face faces the same way within FLAT_MAX_TILT_DEG. The second test is
+    what keeps a closed solid out: a 3 mm thick plate modelled as a box is
+    within 3 mm of a plane, and its top, bottom and walls cannot all be laid
+    on a sheet as one shape.
+
+    Returns [(faces, centroid, normal, deviation)], normal pointing the way
+    the faces do.
+    """
+    G = pm.dual_graph() if G is None else G
+    cos_tilt = math.cos(math.radians(FLAT_MAX_TILT_DEG))
+    out = []
+    for comp in nx.connected_components(G):
+        faces = sorted(comp)
+        verts = sorted({v for f in faces for v in pm.faces[f]})
+        if len(verts) < 3:
+            continue
+        c, n, dev = _plane_fit(pm.vertices[verts])
+        if dev > tol:
+            continue
+        d = pm.normals[faces] @ n
+        if d.mean() < 0:
+            n, d = -n, -d
+        if d.min() < cos_tilt:
+            continue
+        out.append((faces, c, n, dev))
+    return out
+
+
+def flat_island(pm: PolyMesh, faces, centroid, normal, iid: int) -> Island:
+    """One flat piece as an island: every face projected onto the piece's
+    plane, no folds, and its open boundary as cuts that pair with nothing.
+
+    No tree, no search and no overlap test: one connected sheet facing one
+    way projects onto its plane without folding over itself, so there is
+    nothing to decide. The in-plane frame is right-handed about the normal,
+    so every face keeps its winding (`mirrored_faces` stays empty). Exactly
+    isometric for a piece that is exactly planar; within the tolerance it is
+    the projection, which is what "cut it flat" means.
+    """
+    a = np.array([1.0, 0.0, 0.0])
+    if abs(normal @ a) > 0.9:
+        a = np.array([0.0, 1.0, 0.0])
+    e1 = a - (a @ normal) * normal
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(normal, e1)
+    P = np.column_stack([e1, e2])
+    isl = Island(id=iid, flat=True)
+    for f in faces:
+        isl.faces[f] = (pm.vertices[pm.faces[f]] - centroid) @ P
+    uses: dict = {}
+    for f in faces:
+        ring = pm.faces[f]
+        for i in range(len(ring)):
+            u, v = ring[i], ring[(i + 1) % len(ring)]
+            uses.setdefault((min(u, v), max(u, v)), []).append(f)
+    for (v0, v1), fs in uses.items():
+        if len(fs) != 1:
+            continue
+        f = fs[0]
+        ring = pm.faces[f]
+        isl.cuts.append(Cut(a=isl.faces[f][ring.index(v0)],
+                            b=isl.faces[f][ring.index(v1)], face=f, seam=-1))
+    return isl
+
+
+def _sub_mesh(pm: PolyMesh, keep: list) -> PolyMesh:
+    """The faces `keep` as a mesh of their own, sharing pm's vertex array -
+    so vertex ids, and every forced cut or fold, mean the same thing in it."""
+    return PolyMesh(pm.vertices, [pm.faces[f] for f in keep],
+                    [pm.source_faces[f] for f in keep])
+
+
+def _renumber(islands: list, fmap: list, first_id: int) -> None:
+    """Point a sub-mesh's islands back at the full mesh's face ids."""
+    for k, isl in enumerate(islands):
+        isl.id = first_id + k
+        isl.faces = {fmap[f]: r for f, r in isl.faces.items()}
+        for fd in isl.folds:
+            fd.f0, fd.f1 = fmap[fd.f0], fmap[fd.f1]
+        for c in isl.cuts:
+            c.face = fmap[c.face]
+
+
 def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
            max_size: tuple[float, float] | None = None,
            forced_cuts: set = (), forced_folds: set = (),
            verbose: bool = False, splinter_width: float = 0.0,
            neck_width: float = 0.0, weights=None, mat=None,
            budget: int = 10, finalists: int = 6, count_sheets: bool = True,
-           progress=None):
+           progress=None, board_bias: float = 0.0,
+           flat_tol: float | None = None):
     """Full unfold: search, repair overlaps, then split anything too big.
 
     max_size is the island limit in mm, which should already have room
@@ -1424,21 +1594,41 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
     by overlap count, which is measurably the wrong way round; both paths are
     kept for exactly that comparison. `progress(done, total, note) -> bool`
     reports through the search and cancels it by returning False.
+
+    `flat_tol` (mm, `Material.flat_tol`) turns on flat pieces: a connected
+    piece within that distance of one plane is cut as the shape it is - one
+    island, no folds, no seams - instead of being searched, and the rest of
+    the mesh is unfolded as usual. None keeps the old behaviour exactly.
     """
+    if flat_tol is not None:
+        flats = flat_pieces(pm, flat_tol)
+        if flats:
+            return _unfold_with_flats(
+                pm, flats, dict(
+                    trials=trials, seed=seed, max_size=max_size,
+                    forced_cuts=forced_cuts, forced_folds=forced_folds,
+                    verbose=verbose, splinter_width=splinter_width,
+                    neck_width=neck_width, weights=weights, mat=mat,
+                    budget=budget, finalists=finalists,
+                    count_sheets=count_sheets, progress=progress,
+                    board_bias=board_bias))
     G_full = pm.dual_graph()
     G, notes = apply_constraints(G_full, forced_cuts, forced_folds)
 
     cost = candidates = mended = None
+    split_frac = 1.0
     if mat is not None:
         forest, pos, bad, st = optimise(
             pm, G, mat, trials=trials, seed=seed, max_size=max_size,
             budget=budget, finalists=finalists, weights=weights,
             splinter_width=splinter_width, neck_width=neck_width,
-            count_sheets=count_sheets, progress=progress, verbose=verbose)
+            count_sheets=count_sheets, progress=progress, verbose=verbose,
+            board_bias=board_bias)
         used, extra, welds = st["trials_used"], st["extra_cuts"], st["rewelds"]
         splits, oversize, bed = st["size_splits"], st["oversize"], st["bed"]
         cost = st["cost"]
         candidates, mended = st["candidates"], st["mended"]
+        split_frac = st.get("split_frac", 1.0)
     else:
         forest, pos, bad, used = search(pm, G, trials=trials, seed=seed,
                                         verbose=verbose, max_size=max_size)
@@ -1460,9 +1650,46 @@ def unfold(pm: PolyMesh, trials: int = 250, seed: int = 0,
     islands = build_islands(pm, G_full, forest, pos)
     report = dict(cut_arcs=cut_arcs(G_full, forest), bed_cut_arcs=bed_arcs,
                   trials_used=used, extra_cuts=extra, rewelds=welds,
-                  size_splits=splits,
+                  size_splits=splits, split_frac=split_frac,
                   cost=cost, candidates=candidates, mended=mended,
                   islands=len(islands), unresolved=len(bad),
                   oversize_islands=oversize, notes=notes,
                   isometry_error=isometry_error(pm, pos))
+    return islands, report
+
+
+def _unfold_with_flats(pm: PolyMesh, flats: list, kw: dict):
+    """unfold() with the flat pieces taken out first and laid down as they are.
+
+    The rest is a mesh of its own (`_sub_mesh`), unfolded with every setting
+    unchanged; its islands come back pointing at the full mesh's faces, and
+    the flat islands are numbered after them. A flat piece has no seams, so
+    seam numbers, the cut set and every repair statistic are the rest's alone.
+    """
+    flat_faces = {f for faces, *_ in flats for f in faces}
+    rest = [f for f in range(len(pm.faces)) if f not in flat_faces]
+    if rest:
+        islands, report = unfold(_sub_mesh(pm, rest), **kw)
+        _renumber(islands, rest, 0)
+    else:
+        islands, report = [], dict(
+            cut_arcs=[], bed_cut_arcs=[], trials_used=0, extra_cuts=0,
+            rewelds=0, size_splits=0, split_frac=1.0, cost=None,
+            candidates=None, mended=None, unresolved=0, oversize_islands=0,
+            notes=[], isometry_error=0.0)
+    report = dict(report)
+    worst = report["isometry_error"]
+    for faces, c, n, _dev in flats:
+        isl = flat_island(pm, faces, c, n, len(islands))
+        islands.append(isl)
+        worst = max(worst, isometry_error(pm, isl.faces))
+        if kw.get("max_size") is not None:
+            w, h = min_rect_size(np.vstack(list(isl.faces.values())))
+            mw, mh = kw["max_size"]
+            if not (min(w, h) <= min(mw, mh) and max(w, h) <= max(mw, mh)):
+                report["oversize_islands"] = report.get("oversize_islands", 0) + 1
+    report["islands"] = len(islands)
+    report["isometry_error"] = worst
+    report["flat_pieces"] = len(flats)
+    report["flat_deviation"] = max(f[3] for f in flats)
     return islands, report

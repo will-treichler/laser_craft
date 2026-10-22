@@ -212,25 +212,48 @@ class PolyMesh:
         """Return f(points3d) -> points2d, the rigid map that placed this face.
 
         Needed to push 2D results back onto geometry that lives on the face
-        but isn't in its ring - the original triangles inside a merged n-gon.
+        but isn't in its ring - the original triangles inside a merged n-gon,
+        and every polygon `write_net_uv` writes.
+
+        FITTED to every corner of the ring (a 2-D Procrustes fit, both
+        handednesses tried, the better kept), not read off the first edge. On
+        a flat face the two are the same map. On a bent one they are not: the
+        first version took the whole orientation from the first edge, and on
+        the user's helmet that edge was 1.94 mm long - flattening the face
+        shortened and turned it a little, and 372 mm along the sliver the turn
+        put the face 11.8 mm from its own cut outline in the 2D view. Fitted,
+        the map lands within the bend itself
+        (`test_plane_map_puts_a_bent_face_where_the_unfold_put_it`).
         """
         ring = self.faces[face]
         V = self.vertices[ring]
-        o = V[0]
-        u = V[1] - o
+        o = V.mean(axis=0)
+        n = self.normals[face]
+        u = V[np.argmax(np.linalg.norm(V - o, axis=1))] - o
+        u = u - n * float(u @ n)
         u = u / np.linalg.norm(u)
-        w = np.cross(self.normals[face], u)
-
-        d = pos2[1] - pos2[0]
-        d = d / np.linalg.norm(d)
-        e = np.array([-d[1], d[0]])
-        # handedness: match the sign of ring vertex 2 in both frames
-        k = np.sign(float((V[2] - o) @ w)) * np.sign(float((pos2[2] - pos2[0]) @ e))
-        k = k if k != 0 else 1.0
+        w = np.cross(n, u)
+        P = np.asarray(pos2, dtype=float)
+        pc = P.mean(axis=0)
+        Q = P - pc
+        best = None
+        for k in (1.0, -1.0):
+            L = np.column_stack([(V - o) @ u, k * ((V - o) @ w)])
+            # rotation taking L onto Q, least squares (2-D Kabsch)
+            a = float(np.sum(L[:, 0] * Q[:, 0] + L[:, 1] * Q[:, 1]))
+            b = float(np.sum(L[:, 0] * Q[:, 1] - L[:, 1] * Q[:, 0]))
+            th = np.arctan2(b, a)
+            c, s = np.cos(th), np.sin(th)
+            R = np.array([[c, -s], [s, c]])
+            err = float(np.sum((L @ R.T - Q) ** 2))
+            if best is None or err < best[0]:
+                best = (err, k, R)
+        _err, k, R = best
 
         def fn(p):
             r = np.atleast_2d(np.asarray(p, dtype=float)) - o
-            return pos2[0] + np.outer(r @ u, d) + k * np.outer(r @ w, e)
+            loc = np.column_stack([r @ u, k * (r @ w)])
+            return loc @ R.T + pc
         return fn
 
     # ---------------------------------------------------------------- build

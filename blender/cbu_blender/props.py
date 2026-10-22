@@ -6,8 +6,9 @@ from __future__ import annotations
 import os
 
 import bpy
-from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
-                       IntProperty, StringProperty, FloatVectorProperty)
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
+                       FloatProperty, IntProperty, PointerProperty,
+                       StringProperty, FloatVectorProperty)
 
 from . import log as cbulog
 
@@ -48,25 +49,53 @@ def rewrite_net(self, context):
         return
     try:
         from . import bridge, overlay, ops
-        cached = ops._LAST.get(obj.name)
-        if not cached:
-            return
-        pm, islands, parts, sheets, _rep = cached
-        if obj.mode != "OBJECT":
-            return                      # uv_layers data is empty in Edit Mode
         mat = material_from(self)
-        bridge.write_net_uv(obj.data, pm, islands,
-                            scale=bridge.uv_scale(*mat.bed),
-                            placement={p.island_id: p for p in parts},
-                            sheet_size=mat.bed)
-        overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
-                               sheets=sheets)
+        # every object sharing the sheets, or the others' parts stay drawn
+        # at the old scale beside this one's
+        for name in ops.group_of(obj.name):
+            o = bpy.data.objects.get(name)
+            cached = ops._LAST.get(name)
+            if o is None or not cached or o.mode != "OBJECT":
+                continue                # uv_layers data is empty in Edit Mode
+            pm, islands, parts, sheets, _rep = cached
+            bridge.write_net_uv(o.data, pm, islands,
+                                scale=bridge.uv_scale(*mat.bed),
+                                placement={p.island_id: p for p in parts},
+                                sheet_size=mat.bed)
+            overlay.set_net_bounds(name, bridge.net_bounds(o.data),
+                                   sheets=sheets)
         overlay.refresh_live_cuts()
     except Exception:                                   # noqa: BLE001
         pass                    # a settings tweak must never break the session
 
 
+def _is_mesh(_self, obj) -> bool:
+    return obj.type == "MESH"
+
+
+class CBUJobItem(bpy.types.PropertyGroup):
+    """One object in the saved list of what is cut together."""
+    obj: PointerProperty(name="Object", type=bpy.types.Object, poll=_is_mesh)
+
+
+SIZE_ITEMS = [
+    ("HEIGHT", "Height",
+     "Scale so everything being cut is this tall along world Z, measured "
+     "over all the objects together. 0 = the model's real size"),
+    ("YARDSTICK", "Yardstick",
+     "Scale so the yardstick - a one-edge mesh placed across a dimension you "
+     "know, e.g. head width - is the length you type"),
+]
+
+
 class CBUSettings(bpy.types.PropertyGroup):
+    # --- what is cut ---
+    # A saved list, not the selection: what goes on the sheets together is a
+    # decision about the job, and re-selecting it before every Unfold is a way
+    # to cut half a costume. Empty means the active object, as before.
+    job: CollectionProperty(type=CBUJobItem)
+    job_index: IntProperty(name="Active row", default=0, min=0)
+
     # --- material ---
     flute: EnumProperty(name="Flute", items=FLUTE_ITEMS, default="B")
     thickness: FloatProperty(
@@ -101,14 +130,30 @@ class CBUSettings(bpy.types.PropertyGroup):
         description=("mm per finger. Stretched a little so a whole number of "
                      "them fills each edge; an edge too short for two fingers "
                      "of at least half this width is left plain"))
+    finger_clearance: FloatProperty(
+        name="Clearance", default=0.05, min=0.0, max=2.0, precision=2,
+        step=1,
+        description=("Play between a finger and the walls of its notch, mm "
+                     "per side. The finger is cut this much narrower at each "
+                     "end so the joint goes together by hand; 0 is a snug "
+                     "fit"))
     finger_depth_override: BoolProperty(
         name="Override depth", default=False,
-        description=("Depth follows the board thickness - a finger has to "
-                     "pass through the board it mates with. Tick to set it "
-                     "yourself, e.g. for a sharp dihedral angle"))
+        description=("Depth follows the board thickness: the mesh is the "
+                     "board's mid-plane, so a finger stands half of it out "
+                     "past the edge and the notch goes half of it in. Tick "
+                     "to set it yourself, e.g. for a sharp dihedral angle"))
     finger_depth: FloatProperty(
         name="Finger depth", default=3.0, min=0.5, max=30.0,
-        description="mm, used only when the depth is overridden")
+        description=("mm, the whole swing - half out, half in. Used only "
+                     "when the depth is overridden"))
+    corner_hole: BoolProperty(
+        name="Corner hole", default=False,
+        description=("Cut a round relief hole, one board across and centred "
+                     "on the vertex, where a seam ends in a sharp concave "
+                     "corner - the apex of a slit - and run the fingers back "
+                     "to it instead of stopping short of the corner. "
+                     "Refresh applies it without re-unfolding"))
 
     # --- fold relief ---
     relief_adaptive: BoolProperty(
@@ -117,8 +162,10 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "the board needs to close. Off uses a fixed width, which "
                      "is what you want when cutting to a known blade width"))
     relief_fixed: FloatProperty(
-        name="Cut width", default=3.0, min=0.1, max=30.0,
-        description="Fixed relief width, used when Adaptive is off")
+        name="Cut width", default=3.0, min=0.0, max=30.0, precision=2,
+        step=1,
+        description=("Fixed relief width, used when Adaptive is off. Cut at "
+                     "exactly this width however thin; 0 cuts no slot"))
     perf_cut: FloatProperty(
         name="Perforation length", default=1.0, min=0.1, max=50.0,
         description="Length of each cut along a fold line")
@@ -166,6 +213,56 @@ class CBUSettings(bpy.types.PropertyGroup):
         description="mm between parts. The char halo sets this, not the "
                     "kerf - 1 mm will scorch the web between neighbours")
 
+    # --- laser (G-code for GRBL / LaserGRBL) ---
+    laser_max: FloatProperty(precision=0,
+        name="Max power (S)", default=1000.0, min=1.0,
+        description="GRBL $30: the S value of full power. Every power below "
+                    "is in these units")
+    dynamic_power: BoolProperty(
+        name="Dynamic power (M4)", default=True,
+        description="M4 lowers the power as the head slows into a corner, "
+                    "so corners do not scorch. Off writes M3, constant power. "
+                    "Either way the machine must be in laser mode ($32=1) or "
+                    "the beam stays on while travelling")
+    cut_power: FloatProperty(precision=0, name="Cut power", default=1000.0, min=0.0,
+                             description="S value for the part outlines and "
+                                         "holes. Measured on 3 mm board: 1000")
+    cut_speed: FloatProperty(precision=0, name="Cut speed", default=500.0, min=1.0,
+                             description="mm/min. Measured on 3 mm board: 500")
+    cut_passes: IntProperty(name="Cut passes", default=1, min=0, max=20)
+    score_folds: BoolProperty(
+        name="Score folds", default=False,
+        description="Burn a line along every fold, at the score power. Off, "
+                    "no fold line reaches the SVG, DXF or G-code - at cut "
+                    "power the dashes would be slits through the board. "
+                    "Relief slots on sharp folds are part of the cut either "
+                    "way. On, the lines draw magenta in the UV editor")
+    score_power: FloatProperty(precision=0,
+        name="Score power", default=250.0, min=0.0,
+        description="S value for the fold score. Starts at the engrave "
+                    "power, which does not cut through; untested as a score")
+    score_speed: FloatProperty(precision=0, name="Score speed", default=1000.0, min=1.0,
+                               description="mm/min")
+    score_passes: IntProperty(name="Score passes", default=1, min=0, max=20)
+    engrave_power: FloatProperty(precision=0,
+        name="Engrave power", default=250.0, min=0.0,
+        description="S value for seam numbers, M/V marks and part ids. "
+                    "Measured: 250")
+    engrave_speed: FloatProperty(precision=0, name="Engrave speed", default=1000.0, min=1.0,
+                                 description="mm/min. Measured: 1000")
+    engrave_passes: IntProperty(name="Engrave passes", default=1, min=0, max=20)
+    air_assist: BoolProperty(
+        name="Air assist", default=False,
+        description="Switch air assist on and off in the file, for each "
+                    "operation that asks for it")
+    cut_air: BoolProperty(name="Cut", default=True)
+    score_air: BoolProperty(name="Score", default=True)
+    engrave_air: BoolProperty(name="Engrave", default=False)
+    air_on: StringProperty(name="Air on", default="M8",
+                           description="G-code that switches air on (GRBL "
+                                       "flood coolant M8, or mist M7)")
+    air_off: StringProperty(name="Air off", default="M9")
+
     # --- size ---
     mm_per_unit: FloatProperty(
         name="mm per scene unit", default=1000.0, min=0.0001,
@@ -173,10 +270,32 @@ class CBUSettings(bpy.types.PropertyGroup):
                     "the 3D scene. 1000 if 1 unit = 1 metre. This is not the "
                     "UV editor's scale, which is set by the bed and shown in "
                     "the UV panel")
+    size_mode: EnumProperty(name="Size by", items=SIZE_ITEMS,
+                            default="HEIGHT")
     target_height: FloatProperty(
         name="Target height", default=0.0, min=0.0,
-        description="Scale the model to this height in mm. 0 = use the "
-                    "object's real size")
+        description="mm along world Z, over every object being cut together - "
+                    "one scale for all of them, so they keep their sizes "
+                    "relative to each other. 0 = the model's real size")
+    yardstick: PointerProperty(
+        name="Yardstick", type=bpy.types.Object, poll=_is_mesh,
+        description="A mesh with exactly one edge, placed across a dimension "
+                    "you know. Never cut, even when it is in the list")
+    yardstick_length: FloatProperty(
+        name="Real length", default=150.0, min=0.1,
+        description="mm: how long the yardstick's edge really is. Everything "
+                    "is scaled by this over its length in the scene")
+    flat_tol: FloatProperty(
+        name="Flat tolerance", default=3.0, min=0.0, max=50.0,
+        description="mm. A separate piece of a model that lies within this of "
+                    "one plane is cut as the flat shape it is - no unfolding, "
+                    "no folds, no seams. A piece with walls (a thin box) is "
+                    "never flat")
+    min_bend: FloatProperty(
+        name="Minimum bend", default=1.0, min=0.0, max=30.0,
+        description="Degrees. A fold bending less is left uncut: no score, no "
+                    "relief slot, no M/V. A judgement - board bends this far "
+                    "on its own")
     apply_transform: BoolProperty(name="Apply object transform", default=True)
 
     # --- unfolding ---
@@ -196,6 +315,20 @@ class CBUSettings(bpy.types.PropertyGroup):
     # Unfold afterwards - in that session and in the saved .blend - quietly
     # ran the slow path, so the fast button was no longer fast. Optimise is
     # its own operator (cbu.optimise) and Unfold is always the quick one.
+    pack_effort: FloatProperty(
+        name="Packing effort", default=0.0, min=0.0, max=1.0, subtype="FACTOR",
+        description=("Used by Re-pack and Refresh. 0 runs the three packers "
+                     "and keeps the one using least board; toward 1 it also "
+                     "tries up to 24 restarts with more rotations and "
+                     "shuffled part orders. Slower, and only sometimes "
+                     "better - part shape, not effort, usually decides"))
+    board_bias: FloatProperty(
+        name="Save board", default=0.0, min=0.0, max=1.0, subtype="FACTOR",
+        description=("Optimise only. 0 keeps islands as large as the bed "
+                     "allows (the default); toward 1 it counts board for "
+                     "more and pieces for less, and also tries splitting "
+                     "into smaller pieces, which pack denser. The unused "
+                     "part of the last sheet counts as saved board"))
     budget: IntProperty(
         name="Optimise candidates", default=10, min=1, max=100,
         description="How many candidates the optimiser may mend and score. "
@@ -215,7 +348,7 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "Keep it SHORT - label length is what decides whether a "
                      "small island can carry one at all"))
     label_height: FloatProperty(
-        name="Text height", default=4.0, min=0.5, max=30.0,
+        name="Text height", default=3.0, min=0.5, max=30.0,
         description="Engraved text height in mm, where there is room for it")
     label_min_height: FloatProperty(
         name="Minimum height", default=2.0, min=0.5, max=30.0,
@@ -239,6 +372,12 @@ class CBUSettings(bpy.types.PropertyGroup):
     # --- output ---
     out_dir: StringProperty(name="Output", subtype="DIR_PATH", default="//cbu_out")
     write_dxf: BoolProperty(name="Also write DXF", default=True)
+    write_gcode: BoolProperty(
+        name="Write G-code (.nc)", default=True,
+        description="One .nc file per sheet for a GRBL laser (LaserGRBL), "
+                    "with the Laser panel's power, speed and passes for each "
+                    "operation. The SVG has one setting for everything in "
+                    "LaserGRBL")
 
     # --- overlay ---
     show_cut: BoolProperty(
@@ -295,6 +434,11 @@ class CBUSettings(bpy.types.PropertyGroup):
                      "numbers, the M/V fold marks and the model id. These live "
                      "only in the exported parts, so without this the first "
                      "place you see them is the SVG"))
+
+    show_net_scores: BoolProperty(
+        name="Show fold scores", default=True,
+        description=("Draw the fold score lines over the net, in magenta, "
+                     "when Score folds is on in the Laser panel"))
 
     show_overlay: BoolProperty(
         name="Show islands", default=True,
@@ -397,8 +541,10 @@ def material_from(s: CBUSettings, obj=None):
     m.use_tabs = s.use_tabs
     m.use_fingers = s.use_fingers
     m.finger_width = s.finger_width
+    m.finger_clearance = s.finger_clearance
     m.finger_depth_override = s.finger_depth_override
     m.finger_depth = s.finger_depth
+    m.corner_hole = s.corner_hole
     m.relief_adaptive = s.relief_adaptive
     m.relief_fixed = s.relief_fixed
     m.perf_cut = s.perf_cut
@@ -416,7 +562,20 @@ def material_from(s: CBUSettings, obj=None):
     m.label_edge_frac = s.label_edge_frac
     m.label_folds = s.label_folds
     m.model_id = model_id_for(s, obj)
+    m.flat_tol = s.flat_tol
+    m.min_bend = s.min_bend
+    for k in LASER_KEYS:
+        setattr(m, k, getattr(s, k))
     return m
+
+
+# Settings the G-code writer reads; same names on Material and the scene.
+LASER_KEYS = ("laser_max", "dynamic_power", "score_folds",
+              "cut_power", "cut_speed", "cut_passes",
+              "score_power", "score_speed", "score_passes",
+              "engrave_power", "engrave_speed", "engrave_passes",
+              "air_assist", "cut_air", "score_air", "engrave_air",
+              "air_on", "air_off")
 
 
 def restyle_marks(self, context):
@@ -451,7 +610,7 @@ def sync_thickness(self, context):
     context.scene.cbu.thickness = FLUTES[context.scene.cbu.flute]["thickness"]
 
 
-classes = (CBUSettings,)
+classes = (CBUJobItem, CBUSettings)
 
 
 def register():

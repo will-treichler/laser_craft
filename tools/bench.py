@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from cardboard_unfolder import Material, PolyMesh                    # noqa: E402
 from cardboard_unfolder.layout import (build_parts, inscribed_width,  # noqa: E402
-                                       narrow_necks, pack)
+                                       narrow_necks, pack, sheet_equivalents)
 from cardboard_unfolder.unfold import mirrored_faces, unfold          # noqa: E402
 
 
@@ -80,7 +80,10 @@ def corpus(height_mm: float, max_tris: int = 20000):
     ]
     for name, path in (("pikachu",
                         "OLD_VERSION_READ_DESCRIPTION_pikachu_1gen_flowalistik.STL"),
-                       ("helmet", "spartan-helmet-low-poly.stl")):
+                       ("helmet", "spartan-helmet-low-poly.stl"),
+                       # the same helmet decimated to 137 triangles: an open
+                       # shell, and the one real model that is committed
+                       ("helmet137", "examples/spartan_helmet_reduced.stl")):
         f = ROOT / path
         if not f.is_file():
             continue
@@ -107,7 +110,7 @@ def corpus(height_mm: float, max_tris: int = 20000):
 
 
 def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
-            budget=10):
+            budget=10, bias=0.0, effort=0.0):
     """One row. Returns a dict of plain numbers, nothing shapely."""
     pm = PolyMesh.from_trimesh(tm).scale_to_height(height_mm)
     pad = 2 * mat.tab_depth + 2 * mat.kerf
@@ -116,12 +119,13 @@ def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
     t0 = time.perf_counter()
     islands, rep = unfold(pm, trials=trials, seed=seed, max_size=limit,
                           splinter_width=mat.splinter_width,
-                          mat=mat if optimise else None, budget=budget)
+                          mat=mat if optimise else None, budget=budget,
+                          board_bias=bias)
     t_unfold = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     parts = build_parts(islands, mat)
-    sheets, over = pack(parts, mat)
+    sheets, over = pack(parts, mat, effort=effort)
     t_pack = time.perf_counter() - t0
 
     widths = [inscribed_width(p.cut) for p in parts]
@@ -134,6 +138,9 @@ def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
     # announcing the best score in the table.
     area = sum(p.cut.area for p in parts if p.sheet >= 0)
     bed_area = mat.usable_bed[0] * mat.usable_bed[1]
+    # Board actually consumed: whole sheets, plus the last only as far along
+    # its long side as the parts reach - the rest is an offcut kept for later.
+    sheet_eq, offcut = sheet_equivalents(parts, mat)
 
     # The pre-split positions are the only frame in which faces are comparable;
     # unfold() has already re-rooted every component, so measure the mirror
@@ -161,8 +168,10 @@ def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
         # FACE bigger than the bed has no answer here at all (milestone 4).
         oversize=len(over),
         util=round(100.0 * area / sheets / bed_area, 1) if sheets else 0.0,
+        sheet_eq=round(sheet_eq, 2), offcut=round(100.0 * offcut, 1),
         seam_mm=round(seam_mm),
         extra_cuts=rep["extra_cuts"], size_splits=rep["size_splits"],
+        split=rep.get("split_frac", 1.0),
         mirrored=mirrored, unresolved=rep["unresolved"],
         iso=rep["isometry_error"],
         t_unfold=round(t_unfold, 2), t_pack=round(t_pack, 2),
@@ -172,13 +181,15 @@ def measure(name, tm, mat, height_mm, trials, seed, optimise=False,
 COLS = [("model", "%-11s"), ("faces", "%5d"), ("islands", "%7d"),
         ("splinters", "%9d"), ("tiny", "%4d"), ("min_width", "%9.1f"),
         ("necks", "%5d"),
-        ("sheets", "%6d"), ("oversize", "%8d"), ("util", "%5.1f"),
+        ("sheets", "%6d"), ("sheet_eq", "%8.2f"), ("offcut", "%6.1f"),
+        ("oversize", "%8d"), ("util", "%5.1f"), ("split", "%5.2f"),
         ("seam_mm", "%7d"),
         ("extra_cuts", "%10d"), ("mirrored", "%8d"),
         ("t_unfold", "%8.2f"), ("t_pack", "%6.2f")]
 # Lower is better for all of these; util is the one that wants to go up.
-BETTER_UP = {"util"}
-WATCH = ["islands", "splinters", "tiny", "sheets", "oversize", "util",
+BETTER_UP = {"util", "offcut"}
+WATCH = ["islands", "splinters", "tiny", "sheets", "sheet_eq", "offcut",
+         "oversize", "util",
          "seam_mm", "extra_cuts",
          "mirrored"]
 
@@ -238,6 +249,10 @@ def main(argv=None):
                     help="skip models bigger than this")
     ap.add_argument("--optimise", action="store_true",
                     help="cost-driven tree search instead of overlap count")
+    ap.add_argument("--bias", type=float, default=0.0,
+                    help="the Optimise slider: 0 large islands, 1 less board")
+    ap.add_argument("--effort", type=float, default=0.0,
+                    help="packing effort, 0 to 1 (extra raster restarts)")
     ap.add_argument("--budget", type=int, default=10,
                     help="candidates the cost search may mend")
     ap.add_argument("--only", default=None, help="substring filter on model name")
@@ -253,6 +268,7 @@ def main(argv=None):
 
     say(f"bed {w:g}x{h:g}  flute {a.flute}  gap {a.gap:g}  tabs {a.tabs}  "
           f"height {a.height:g}  trials {a.trials}  seed {a.seed}  "
+          f"{'bias %g  ' % a.bias if a.optimise else ''}"
           f"splinter under {mat.splinter_width:g} mm")
     say(header())
     rows = []
@@ -263,7 +279,8 @@ def main(argv=None):
         # printed as it goes: a silent ten-minute run looks like a hang, which
         # is the same complaint the optimiser's progress hook exists for
         r = measure(name, tm, mat, a.height, a.trials, a.seed,
-                    optimise=a.optimise, budget=a.budget)
+                    optimise=a.optimise, budget=a.budget, bias=a.bias,
+                    effort=a.effort)
         rows.append(r)
         say(row(r))
     say(f"total {time.perf_counter() - t0:.1f} s")

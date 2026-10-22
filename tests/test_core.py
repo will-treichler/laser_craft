@@ -12,6 +12,7 @@ import numpy as np
 import networkx as nx
 import trimesh
 import pytest
+import shapely
 from shapely.geometry import (Polygon, MultiLineString, box,
                               Point, LineString)
 from shapely.ops import unary_union
@@ -49,6 +50,9 @@ from cardboard_unfolder.fingers import (place_fingers, segments, inward,
 from cardboard_unfolder.unfold import Island, Cut
 
 
+EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
+
+
 def meshes():
     out = []
     for name, tm in [
@@ -59,6 +63,12 @@ def meshes():
         ("icosphere1", trimesh.creation.icosphere(subdivisions=1)),
         ("capsule", trimesh.creation.capsule(count=[10, 10])),
         ("annulus", trimesh.creation.annulus(r_min=.5, r_max=1, height=1, sections=14)),
+        # The one real model here. Every primitive above is convex or nearly
+        # so, has no concave n-gons after the coplanar merge, and closes - the
+        # helmet is an open shell of 137 triangles from a real costume, which
+        # is the shape of input this exists for.
+        ("helmet", trimesh.load(str(EXAMPLES / "spartan_helmet_reduced.stl"),
+                                force="mesh", process=True)),
     ]:
         tm.apply_scale(200.0 / tm.extents.max())
         out.append((name, tm))
@@ -729,6 +739,55 @@ def test_the_optimiser_answers_with_a_net_that_could_be_cut(name, tm):
     assert not mirrored_faces(pm, pos)
     assert stats["mended"] <= 3, "the mending budget is a budget"
     assert stats["candidates"] >= 1
+
+
+def test_the_board_slider_at_zero_is_todays_optimiser():
+    """The user's default is large islands - today's behaviour. So the slider
+    at 0 must be exactly the old weights and try no smaller split."""
+    from cardboard_unfolder.cost import Weights, board_weights
+    from cardboard_unfolder.unfold import split_fractions
+    assert board_weights(0.0) == Weights()
+    assert split_fractions(0.0) == [1.0]
+
+
+def test_the_board_slider_adds_smaller_pieces_and_weighs_board_more():
+    from cardboard_unfolder.cost import Weights, board_weights
+    from cardboard_unfolder.unfold import split_fractions
+    prev_f, prev_w = [1.0], Weights()
+    for b in np.linspace(0.0, 1.0, 11):
+        f, w = split_fractions(b), board_weights(b)
+        assert f[0] == 1.0 and set(prev_f) <= set(f), b
+        assert w.sheet >= prev_w.sheet and w.island <= prev_w.island, b
+        assert w.splinter == Weights().splinter, "buildability is not traded"
+        assert w.oversize == Weights().oversize
+        prev_f, prev_w = f, w
+    assert split_fractions(1.0) == [1.0, 0.85, 0.7, 0.5]
+
+
+def test_saving_board_still_answers_with_a_net_that_could_be_cut():
+    """At the far end of the slider the optimiser also splits finalists to
+    smaller limits. Whatever it picks must still be a real net - every face,
+    no overlap, exact - and fit the smaller limit it was split to."""
+    from cardboard_unfolder.unfold import min_rect_size
+    pm = PolyMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=1))
+    pm = pm.scale_to_height(250)
+    G = pm.dual_graph()
+    mat = Material()
+    pad = 2 * mat.tab_depth + 2 * mat.kerf
+    limit = (mat.usable_bed[0] - pad, mat.usable_bed[1] - pad)
+    forest, pos, bad, st = optimise(pm, G, mat, trials=6, seed=0,
+                                    max_size=limit, budget=3, finalists=2,
+                                    board_bias=1.0)
+    assert set(forest) == set(G)
+    assert not overlapping_pairs(forest, pos)
+    assert isometry_error(pm, pos) < 1e-6
+    assert not mirrored_faces(pm, pos)
+    f = st["split_frac"]
+    assert f in (1.0, 0.85, 0.7, 0.5)
+    for comp in nx.connected_components(forest):
+        w, h = min_rect_size(np.vstack([pos[x] for x in comp]))
+        lw, lh = limit[0] * f, limit[1] * f
+        assert (w <= lw + 1e-6 and h <= lh + 1e-6) or                (h <= lw + 1e-6 and w <= lh + 1e-6), (w, h, f)
 
 
 def test_the_optimiser_can_see_sheets():
@@ -1614,6 +1673,82 @@ def test_min_rect_area_is_invariant_under_translation():
             assert w * h == pytest.approx(base, rel=1e-9)
 
 
+def _reference_hull(pts):
+    """The monotone chain as it was before it was handed plain floats - kept
+    here, verbatim in its arithmetic, as the definition the fast path must
+    reproduce."""
+    p = np.unique(np.asarray(pts, dtype=float), axis=0)
+    if len(p) < 3:
+        return p
+
+    def chain(seq):
+        out = []
+        for q in seq:
+            while len(out) >= 2:
+                a, b = out[-2], out[-1]
+                cross = ((b[0] - a[0]) * (q[1] - a[1])
+                         - (b[1] - a[1]) * (q[0] - a[0]))
+                if cross > 0.0:
+                    break
+                out.pop()
+            out.append(q)
+        return out
+
+    lower, upper = chain(p), chain(p[::-1])
+    return np.array(lower[:-1] + upper[:-1], dtype=float)
+
+
+def test_the_convex_hull_is_unchanged_by_the_fast_path():
+    """`_convex_hull` runs its loop over Python floats rather than numpy rows,
+    for speed. Bed splitting and every packer's orientation go through it, so
+    "nearly the same hull" is not good enough - it has to be the same bits,
+    on random clouds, on collinear runs, and on real nets."""
+    from cardboard_unfolder.unfold import _convex_hull
+    rng = np.random.default_rng(5)
+    clouds = [rng.normal(size=(int(rng.integers(1, 300)), 2))
+              * rng.uniform(1e-3, 500.0) + rng.uniform(-900, 900, 2)
+              for _ in range(200)]
+    clouds += [np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]),
+               np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 0.0]]),
+               np.round(rng.uniform(0, 5, (400, 2)))]   # heavy ties
+    for name, tm in ALL:
+        pm = PolyMesh.from_trimesh(tm).scale_to_height(200)
+        islands, _ = unfold(pm, trials=10, seed=0)
+        clouds += [shapely.get_coordinates(i.outline()) for i in islands]
+    for pts in clouds:
+        got, want = _convex_hull(pts), _reference_hull(pts)
+        assert got.shape == want.shape and np.array_equal(got, want)
+
+
+def _sliver_next_to_a_triangle(lift):
+    """A 372 x 1.94 mm quad whose FIRST edge is the short one, its far corner
+    lifted `lift` mm out of plane, sharing its long edge with a triangle -
+    the shape of polygon 129 on the user's helmet."""
+    V = np.array([[0, 0, 0], [0, 1.94, 0], [372, 1.94, lift], [372, 0, 0],
+                  [186, -50, 0]], dtype=float)
+    pm = PolyMesh.from_rings(V, [[0, 1, 2, 3], [3, 4, 0]], merge=False,
+                             planar_tol=None)
+    pos = unfold_tree(pm, pm.dual_graph(), 1)       # rooted at the triangle
+    return pm, pos
+
+
+def test_plane_map_puts_a_bent_face_where_the_unfold_put_it():
+    """The user's screenshot: the cut outline right, the face drawn beside it.
+    write_net_uv pushes each Blender polygon through `plane_map`, which took
+    the face's whole orientation from its FIRST edge - here 1.94 mm long. A
+    bent face cannot be flattened exactly, so that edge comes out a little
+    short and turned, and 372 mm along the sliver the turn was 11.8 mm.
+    Fitted to every corner instead, the map lands within the bend itself."""
+    pm, pos = _sliver_next_to_a_triangle(0.36)
+    fn = pm.plane_map(0, pos[0])
+    off = np.linalg.norm(fn(pm.vertices[pm.faces[0]]) - pos[0], axis=1).max()
+    assert off < 0.5, f"corners land {off:.2f} mm from the unfold"
+    # and a flat face is still exact
+    pm, pos = _sliver_next_to_a_triangle(0.0)
+    fn = pm.plane_map(0, pos[0])
+    assert np.abs(fn(pm.vertices[pm.faces[0]]) - pos[0]).max() < 1e-9
+
+
 def test_min_area_rect_survives_degenerate_clouds():
     """Collinear and coincident inputs must return a usable answer, not raise
     and not report a size that hides a real extent."""
@@ -2047,6 +2182,121 @@ def test_the_raster_packer_leaves_no_overlap_and_nothing_off_the_sheet(name, tm)
         assert y1 <= m.sheet_margin + m.usable_bed[1] + 1e-6
 
 
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_an_unannotated_part_has_exactly_the_annotated_cut(name, tm):
+    """The optimiser packs every finalist to count its sheets, and builds
+    those parts with `annotate=False` - no labels, no perforation. That is
+    only sound if what the packer reads is untouched, so the cut must be the
+    same geometry to the last bit, with fingers and tabs both off and on."""
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(200)
+    for fingers, tabs in ((False, False), (True, True)):
+        m = Material.from_flute("B")
+        m.use_fingers, m.use_tabs = fingers, tabs
+        pad = 2 * m.tab_depth + 2 * m.kerf
+        islands, _ = unfold(pm, trials=20, seed=0,
+                            max_size=(m.usable_bed[0] - pad,
+                                      m.usable_bed[1] - pad))
+        full = build_parts(islands, m)
+        bare = build_parts(islands, m, annotate=False)
+        assert [p.island_id for p in full] == [p.island_id for p in bare]
+        for a, b in zip(full, bare):
+            assert shapely.to_wkb(a.cut) == shapely.to_wkb(b.cut),                 f"{name} island {a.island_id}: cut differs without labels"
+            assert b.engrave.is_empty and b.perf_m.is_empty
+
+
+def _clear_of_each_other(parts, mat):
+    """Every placed pair at least the part gap apart, everything on its bed."""
+    W, H = mat.usable_bed
+    m = mat.sheet_margin
+    by = {}
+    for p in parts:
+        if p.sheet >= 0:
+            by.setdefault(p.sheet, []).append(p)
+            x0, y0, x1, y1 = p.bounds
+            assert x0 >= m - 1e-6 and y0 >= m - 1e-6, p.island_id
+            assert x1 <= m + W + 1e-6 and y1 <= m + H + 1e-6, p.island_id
+    for group in by.values():
+        for a in range(len(group)):
+            for b in range(a + 1, len(group)):
+                d = group[a].cut.distance(group[b].cut)
+                assert d >= mat.part_gap - 1e-6, (group[a].island_id,
+                                                  group[b].island_id, d)
+
+
+@pytest.mark.parametrize("bed", [(400.0, 900.0), (900.0, 400.0)],
+                         ids=["portrait", "landscape"])
+def test_the_last_sheet_is_packed_low_along_the_long_side(bed):
+    """Three small parts spread along a last sheet. The pass packs them as
+    short a way along the bed's LONG side as they go - up a portrait bed,
+    across a landscape one - so the rest is one strip of board kept for
+    another job (the user's rule: "take the ratio on the long dimension")."""
+    from cardboard_unfolder.layout import compact_last, sheet_equivalents
+    m = Material.from_flute("B")
+    m.bed = bed
+    long_ax = 0 if bed[0] > bed[1] else 1
+    parts = []
+    for k, at in enumerate((20.0, 300.0, 700.0)):
+        xy = [m.sheet_margin + 10.0, m.sheet_margin + 10.0]
+        xy[long_ax] = m.sheet_margin + at
+        parts.append(_blank(box(xy[0], xy[1], xy[0] + 60, xy[1] + 40), 0))
+    eq0, off0 = sheet_equivalents(parts, m)
+    assert compact_last(parts, m)
+    eq1, off1 = sheet_equivalents(parts, m)
+    assert off1 > off0 and eq1 < eq0
+    reach = max(p.bounds[2 + long_ax] for p in parts) - m.sheet_margin
+    assert reach < 150.0, reach         # three 60 x 40 parts, side by side
+    _clear_of_each_other(parts, m)
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_packing_the_last_sheet_low_keeps_every_part_clear(name, tm):
+    """After pack() - which now ends with the last-sheet pass - every part is
+    on its bed and a part gap from every other. The raster is conservative by
+    construction; this is the check that nothing it moved came to rest on
+    top of anything else, on a tall bed where the pass has most to do."""
+    m = Material.from_flute("B")
+    m.bed = (400.0, 900.0)
+    pad = 2 * m.tab_depth + 2 * m.kerf
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(200)
+    islands, _ = unfold(pm, trials=20, seed=0,
+                        max_size=(m.usable_bed[0] - pad, m.usable_bed[1] - pad))
+    parts = build_parts(islands, m, annotate=False)
+    pack(parts, m)
+    _clear_of_each_other(parts, m)
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_pack_breaks_a_sheet_tie_on_board_used(name, tm):
+    """When strategies tie on parts placed and whole sheets, pack() keeps the
+    one using the least board. It used to keep whichever ran first - shelf
+    packing - and on the helmet that was 1.59 sheets of board where the
+    raster packer needed 1.26, with visible voids on sheet 1."""
+    from cardboard_unfolder.layout import (shelf_pack, nest as nest_fn,
+                                           raster_pack, compact_last,
+                                           sheet_equivalents)
+    m = Material.from_flute("B")
+    m.bed = (400.0, 900.0)
+    pad = 2 * m.tab_depth + 2 * m.kerf
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(250)
+    islands, _ = unfold(pm, trials=20, seed=0,
+                        max_size=(m.usable_bed[0] - pad, m.usable_bed[1] - pad))
+    each = []
+    for fn in (shelf_pack, nest_fn, raster_pack):
+        ps = build_parts(islands, m, annotate=False)
+        n, _ = fn(ps, m)
+        n = tighten(ps, n, m)
+        compact_last(ps, m)
+        each.append((sum(1 for p in ps if p.sheet < 0), n,
+                     sheet_equivalents(ps, m)[0]))
+    ps = build_parts(islands, m, annotate=False)
+    n, _ = pack(ps, m)
+    got = (sum(1 for p in ps if p.sheet < 0), n, sheet_equivalents(ps, m)[0])
+    best = min(each)
+    assert got[:2] <= best[:2]
+    if got[:2] == best[:2]:
+        assert got[2] <= best[2] + 1e-9, (got, each)
+
+
 def test_pack_never_loses_to_any_strategy():
     """No packer dominates, so pack() runs all three and keeps the winner.
 
@@ -2330,7 +2580,8 @@ def test_writes_valid_svg_and_dxf(tmp_path):
     assert root.get("viewBox") == "0 0 600.0 400.0"
     labels = {g.get("{http://www.inkscape.org/namespaces/inkscape}label")
               for g in root.iter("{http://www.w3.org/2000/svg}g")}
-    assert {"CUT", "PERF_M", "ENGRAVE"} <= labels
+    assert {"CUT", "ENGRAVE"} <= labels
+    assert not {"PERF_M", "PERF_V"} & labels, "fold scores are off by default"
 
     doc = ezdxf.readfile(sorted((tmp_path / "out").glob("*.dxf"))[0])
     used = {e.dxf.layer for e in doc.modelspace()}
@@ -2405,6 +2656,7 @@ def test_finger_defaults():
     m = Material.from_flute("B")
     assert m.use_fingers is False
     assert m.finger_width == 15.0
+    assert m.finger_clearance == 0.05, "the user's number after a first build"
     assert m.finger_depth_used == m.thickness == 3.0
     assert Material.from_flute("C").finger_depth_used == 4.0
     m.finger_depth = 5.5
@@ -2424,7 +2676,7 @@ def test_fingers_off_change_nothing():
 
 def test_finger_segments_are_about_the_width_and_never_alone():
     mat = Material.from_flute("B")
-    w, d = mat.finger_width, mat.finger_depth_used
+    w, d = mat.finger_width, mat.finger_depth_used / 2.0
     for L in np.arange(5.0, 200.0, 0.7):
         segs = segments(L, mat)
         if L - 2 * d < 2 * MIN_FRAC * w:
@@ -2464,14 +2716,62 @@ def test_inward_is_read_from_the_ring_not_the_centroid():
         assert np.allclose(inward(isl, cut), (-1.0, 0.0))
 
 
+def _lopsided_seams(J):
+    """Seams jointed on one half only: every notch on the same side, so the
+    other half has no notch - and no finger worth the name - at all.
+
+    Halves are told apart by (island, face), not island alone, because both
+    halves of a slit inside one island belong to the same island."""
+    halves = {}
+    for js in J.values():
+        for j in js:
+            if j.kind == "notch":
+                halves.setdefault(j.seam, set()).add((j.island, j.face))
+    seams = {j.seam for js in J.values() for j in js}
+    return sorted(s for s in seams if len(halves.get(s, ())) < 2)
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_a_fingered_seam_is_notched_on_both_halves(name, tm):
+    """A box joint alternates: each half carries notches for the other's
+    fingers. Segments are refused one at a time - a notch that would run into
+    a relief slot, say - and refusals could leave a seam with every notch on
+    ONE half: a lone notch, with nothing on the other side to show it is a
+    joint at all. On the helmet that was 6 of 44 seams, at the inner ends of
+    folds where the slots crowd the seam. Such a seam is left plain on both
+    halves, the same as one too short to joint."""
+    assert _lopsided_seams(_fingered(tm)[2]) == []
+
+
+def test_the_helmet_has_no_lopsided_finger_joint_at_its_own_settings():
+    """The settings the lopsided joints were found at: 320 mm tall, fixed 2 mm
+    relief slots, a 400 x 900 bed - every fold a slot, which is what crowds
+    the seam ends."""
+    tm = dict(ALL)["helmet"]
+    mat = Material.from_flute("B", use_fingers=True, relief_adaptive=False,
+                              relief_fixed=2.0)
+    mat.bed = (400.0, 900.0)
+    pad = 2 * mat.tab_depth + 2 * mat.kerf
+    pm = PolyMesh.from_trimesh(tm).scale_to_height(320)
+    islands, _ = unfold(pm, trials=250, seed=0,
+                        max_size=(mat.usable_bed[0] - pad,
+                                  mat.usable_bed[1] - pad))
+    bodies = {i.id: apply_relief(i.outline(), plan_folds(i, mat))
+              for i in islands}
+    J = place_fingers(islands, mat, bodies)
+    assert any(J.values()), "nothing jointed - the test would prove nothing"
+    assert _lopsided_seams(J) == []
+
+
 @pytest.mark.parametrize("name,tm", ALL, ids=IDS)
 def test_both_halves_of_a_fingered_seam_mate_exactly(name, tm):
-    """Bring both halves onto their shared edge. On every jointed segment the
-    finger half is solid board for one depth in from the edge and the notched
-    half is empty there - so the finger fills the notch, with no gap and no
-    overlap. Nothing crosses the edge on either side: that is the next test."""
+    """Bring both halves onto their shared edge. The mesh is the board's
+    mid-plane, so on every jointed segment the finger half is solid board
+    from half a depth OUT past the edge to half a depth in, and the notched
+    half is empty for that half depth in - the finger fills the notch."""
     islands, mat, J = _fingered(tm)
-    d = mat.finger_depth_used
+    d = mat.finger_depth_used / 2.0
+    play = mat.finger_clearance
     parts = {p.island_id: p for p in _fingered_parts(tm)[0]}
     by = {i.id: i for i in islands}
     cuts = {}
@@ -2490,9 +2790,16 @@ def test_both_halves_of_a_fingered_seam_mate_exactly(name, tm):
             theirs = cuts[other_key]
             t0, t1 = j.t
             e = 1e-3
-            slot = _in_cut_frame(mine, by[iid], t0 + e, t1 - e, e, d - e)
+            slot = _in_cut_frame(mine, by[iid], t0 + play + e, t1 - play - e,
+                                 -d + e, d - e)
             A = parts[iid].cut.intersection(slot)
             assert A.area == pytest.approx(slot.area, rel=1e-6), (j.seam, j.t)
+            # ...and stands `c` clear of the notch's walls on both sides:
+            # the clearance that lets the joint go together by hand.
+            for lo, hi in ((t0 + e, t0 + play - e), (t1 - play + e, t1 - e)):
+                gap = _in_cut_frame(mine, by[iid], lo, hi, -d + e, -e)
+                assert parts[iid].cut.intersection(gap).area < 1e-9, \
+                    (j.seam, j.t, "no clearance beside the finger")
             # Only the notched half's OWN side of the edge: across it, a slit
             # inside one island can have the other half of the V lying in the
             # flat sheet - separate board, somewhere else once folded.
@@ -2505,23 +2812,175 @@ def test_both_halves_of_a_fingered_seam_mate_exactly(name, tm):
 
 
 @pytest.mark.parametrize("name,tm", ALL, ids=IDS)
-def test_a_finger_never_stands_proud_of_the_model(name, tm):
-    """The mesh edge is the OUTER corner and each board lies inward of its
-    face, so the half kept to the edge already reaches the far face of the
-    other panel. A finger that also grew outward - the first version, +/-3 mm
-    on 3 mm board - stood a board's thickness proud of the assembled model.
-    So a fingered part never reaches past its own unfingered outline, and
-    the edge swings by exactly one depth: every notch takes its whole
-    rectangle and nothing else."""
+def test_a_finger_reaches_half_a_depth_past_the_edge_and_no_further(name, tm):
+    """The mesh is the board's MID-plane, so a finger stands half the depth
+    out past the mesh edge - flush with the other board's outer face at a
+    right angle - and a notch goes half the depth in. Not a whole depth: the
+    first version stood a board's thickness proud of the model. What the
+    part gains is exactly its fingers and what it loses exactly its notches:
+    the edge swings by one depth in all."""
     islands, mat, J = _fingered(tm)
+    h = mat.finger_depth_used / 2.0
     on, off = _fingered_parts(tm)
     for p, q in zip(on, off):
-        assert p.cut.difference(q.cut).area < 1e-6, f"part {p.island_id} grew"
-    removed = sum(q.cut.area - p.cut.area for p, q in zip(on, off))
+        assert q.cut.buffer(h + 1e-6).contains(p.cut), \
+            f"part {p.island_id} reaches past half a depth"
+    added = sum(p.cut.difference(q.cut).area for p, q in zip(on, off))
+    removed = sum(q.cut.difference(p.cut).area for p, q in zip(on, off))
+    fingers = sum(j.poly.area for js in J.values() for j in js
+                  if j.kind == "finger")
     notched = sum(j.poly.area for js in J.values() for j in js
                   if j.kind == "notch")
-    assert notched > 0
-    assert removed == pytest.approx(notched, rel=1e-6)
+    slack = sum(2 * mat.finger_clearance * h for js in J.values() for j in js
+                if j.kind == "finger")
+    assert notched > 0 and fingers == pytest.approx(notched - slack, rel=1e-9)
+    assert added == pytest.approx(fingers, rel=1e-5)
+    assert removed == pytest.approx(notched, rel=1e-5)
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_a_finger_stays_clear_of_every_other_board_in_the_flat(name, tm):
+    """A finger stands out into the sheet, and in a narrow V - a slit inside
+    one island - the far half of the V is right there near the apex. The
+    joint must END where a finger would come within a part gap of other
+    board, and the seam run plain to the point from there; the laser would
+    otherwise fuse the two. Measured against the island before fingers."""
+    islands, mat, J = _fingered(tm)
+    clear = max(mat.part_gap, mat.kerf)
+    h = mat.finger_depth_used / 2.0
+    by = {i.id: i for i in islands}
+    _, off = _fingered_parts(tm)
+    bare = {q.island_id: q.cut for q in off}
+    n = 0
+    for iid, js in J.items():
+        cuts = {(c.seam, c.face): c for c in by[iid].cuts}
+        for j in js:
+            if j.kind != "finger":
+                continue
+            c = cuts[(j.seam, j.face)]
+            t0, t1 = j.t
+            reach = _in_cut_frame(c, by[iid], t0 - clear + 1e-6,
+                                  t1 + clear - 1e-6, -h - clear + 1e-6, -1e-5)
+            assert not bare[iid].intersects(reach), (j.seam, j.t)
+            n += 1
+    assert n > 0
+
+
+def test_corner_holes_are_off_by_default_and_change_nothing_then():
+    m = Material.from_flute("B", use_fingers=True)
+    assert m.corner_hole is False
+    tm = dict(ALL)["helmet"]
+    islands, _ = unfold(PolyMesh.from_trimesh(tm), trials=40, seed=0)
+    a = build_parts(islands, m)
+    b = build_parts(islands, Material.from_flute("B", use_fingers=True,
+                                                 corner_hole=False))
+    assert [p.cut.wkb for p in a] == [p.cut.wkb for p in b]
+
+
+def test_a_corner_hole_is_centred_on_every_sharp_seam_vertex():
+    """The helmet's nets have slits whose sides meet at a few degrees - the
+    corners where the two boards crush into each other as the slit closes.
+    With the switch on, each such vertex the part can spare gets a round hole
+    one board across CENTRED on it (the user's correction to a first version
+    that set a teardrop just past it), and no part is ever split by one."""
+    from cardboard_unfolder.folds import sharp_seam_corners
+    tm = dict(ALL)["helmet"]
+    islands, _ = unfold(PolyMesh.from_trimesh(tm), trials=40, seed=0)
+    m0 = Material.from_flute("B")
+    m1 = Material.from_flute("B", corner_hole=True)
+    off, on = build_parts(islands, m0), build_parts(islands, m1)
+    r = m1.thickness / 2.0
+    corners = cut = 0
+    for isl, p, q in zip(islands, off, on):
+        assert _pieces(q.cut) == _pieces(p.cut)
+        # the body the parts are built from: relief slots can sit at a corner
+        body = apply_relief(isl.outline(), plan_folds(isl, m1))
+        found = sharp_seam_corners(isl, body)
+        corners += len(found)
+        for pt, _into in found:
+            disc = Point(pt).buffer(0.98 * r)
+            if not q.cut.intersects(disc):
+                cut += 1                        # the whole disc is gone
+                continue
+            # dropped only because it would have split the part
+            trial = p.cut.difference(Point(pt).buffer(r))
+            assert _pieces(trial) > _pieces(p.cut), pt
+    assert corners > 0 and cut > 0, "the fixture has no sharp corner to relieve"
+
+
+def test_a_corner_hole_joins_the_notch_bottom_with_no_spike():
+    """The user's screenshot: a notch starting at the hole's EDGE leaves a
+    spike of board between its end wall and the circle, pointing at the
+    vertex. The notch must run from the vertex, its bottom - half a depth in
+    - tangent to a hole of that same radius, so the band between the hole
+    and the notch holds no board at all."""
+    from cardboard_unfolder.folds import apply_corner_holes
+    tm = dict(ALL)["helmet"]
+    islands, _ = unfold(PolyMesh.from_trimesh(tm), trials=40, seed=0)
+    m = Material.from_flute("B", use_fingers=True, corner_hole=True)
+    h = m.finger_depth_used / 2.0
+    holes = {}
+    for i in islands:
+        _b, holes[i.id] = apply_corner_holes(
+            i, apply_relief(i.outline(), plan_folds(i, m)), 2 * h)
+    parts = {p.island_id: p for p in build_parts(islands, m)}
+    by = {i.id: i for i in islands}
+    bodies = {}
+    for i in islands:
+        bodies[i.id], _ = apply_corner_holes(
+            i, apply_relief(i.outline(), plan_folds(i, m)), 2 * h)
+    J = place_fingers(islands, m, bodies, holes=holes, hole_r=h)
+    checked = 0
+    for iid, js in J.items():
+        cuts = {(c.seam, c.face): c for c in by[iid].cuts}
+        for j in js:
+            if j.kind != "notch":
+                continue
+            c = cuts[(j.seam, j.face)]
+            for t_end, p in ((0.0, c.a), (c.length, c.b)):
+                if not any(np.hypot(*(np.asarray(p) - q)) < 1e-6
+                           for q in holes[iid]):
+                    continue
+                # only a notch that reaches the hole: the corner it shares
+                # with the hole, two radii along and half a depth in, must
+                # hold no board - that is where the spike was
+                t0, t1 = j.t
+                if t_end == 0.0 and t0 >= 2 * h:
+                    continue
+                if t_end > 0.0 and t1 <= c.length - 2 * h:
+                    continue
+                lo, hi = ((0.0, 2 * h) if t_end == 0.0
+                          else (c.length - 2 * h, c.length))
+                band = _in_cut_frame(c, by[iid], lo, hi, 1e-3, h - 1e-3)
+                band = band.intersection(Polygon(by[iid].faces[c.face]))
+                left = parts[iid].cut.intersection(band).area
+                assert left < 1e-4, (j.seam, j.t, left)
+                checked += 1
+    assert checked > 0, "no notch runs to a hole - the test proved nothing"
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_with_corner_holes_no_two_fingers_overlap(name, tm):
+    """With holes on, a slit's joint runs back to the hole at its apex, where
+    the two halves' fingers point at each other across a gap that closes to
+    nothing - each is clipped at the V's centreline. Two fingers of one
+    island never share board, and no part comes apart."""
+    islands, _ = unfold(PolyMesh.from_trimesh(tm), trials=40, seed=0)
+    m = Material.from_flute("B", use_fingers=True, corner_hole=True)
+    from cardboard_unfolder.folds import apply_corner_holes
+    bodies, holes = {}, {}
+    for i in islands:
+        bodies[i.id], holes[i.id] = apply_corner_holes(
+            i, apply_relief(i.outline(), plan_folds(i, m)), m.thickness)
+    J = place_fingers(islands, m, bodies, holes=holes, hole_r=m.thickness / 2)
+    for js in J.values():
+        fs = [j.poly for j in js if j.kind == "finger"]
+        for a in range(len(fs)):
+            for b in range(a + 1, len(fs)):
+                assert fs[a].intersection(fs[b]).area < 1e-9
+    parts = build_parts(islands, m)
+    bare = build_parts(islands, Material.from_flute("B", corner_hole=True))
+    assert [_pieces(p.cut) for p in parts] == [_pieces(p.cut) for p in bare]
 
 
 @pytest.mark.parametrize("name,tm", ALL, ids=IDS)
@@ -2614,7 +3073,63 @@ def test_a_deeper_override_makes_deeper_fingers():
         assert js
         for j in js:
             t0, t1 = j.t
-            assert j.poly.area == pytest.approx((t1 - t0) * want, rel=1e-6)
+            w = t1 - t0 - (2 * mat.finger_clearance if j.kind == "finger"
+                           else 0.0)
+            assert j.poly.area == pytest.approx(w * want / 2.0, rel=1e-6)
+
+
+def test_finger_clearance_zero_is_a_snug_fit_and_it_only_narrows_fingers():
+    """0 is the old joint exactly: the finger as wide as its notch. Any
+    clearance comes off the finger alone - the notch, and every check it
+    passed, stay as they were, so the same segments are jointed."""
+    tm = ALL[0][1]
+    _, m0, J0 = _fingered(tm, finger_clearance=0.0)
+    _, m1, J1 = _fingered(tm, finger_clearance=0.3)
+    key = lambda J: sorted((j.seam, j.island, j.kind, j.t)
+                           for v in J.values() for j in v)
+    assert key(J0) == key(J1)
+    for j in (j for v in J0.values() for j in v):
+        t0, t1 = j.t
+        assert j.poly.area == pytest.approx((t1 - t0) * m0.finger_depth_used
+                                            / 2.0, rel=1e-6)
+    n0 = {(j.seam, j.t): j.poly.wkb for v in J0.values() for j in v
+          if j.kind == "notch"}
+    n1 = {(j.seam, j.t): j.poly.wkb for v in J1.values() for j in v
+          if j.kind == "notch"}
+    assert n0 == n1
+
+
+def test_text_defaults_to_three_mm():
+    """3 mm, the user's call after the first assembled model; the 2 mm floor
+    is unchanged."""
+    m = Material.from_flute("B")
+    assert m.label_height == 3.0 and m.label_min_height == 2.0
+
+
+def test_a_fixed_relief_width_is_cut_however_thin():
+    """A fixed width is what the machine is asked to cut, so it is cut at
+    that width - the 1.2 mm perforate-instead threshold belongs to the
+    ADAPTIVE width. It used to apply to both, so a fixed 1 mm slot quietly
+    became a perforation: with fold scoring off, nothing at all."""
+    from cardboard_unfolder.unfold import Fold
+    a, b = np.array([0.0, 0.0]), np.array([60.0, 0.0])
+    isl = Island(id=0, faces={0: np.array([(0, 0), (60, 0), (30, -40)], float),
+                              1: np.array([(0, 0), (30, 40), (60, 0)], float)})
+    isl.folds = [Fold(a=a, b=b, f0=0, f1=1, bend=math.radians(90))]
+    for w in (1.0, 0.5, 0.1, 0.02):
+        # square ends, so the area is exactly width x cut length
+        m = Material.from_flute("B", relief_adaptive=False, relief_fixed=w,
+                                round_cut_ends=False)
+        (p,) = plan_folds(isl, m)
+        assert p.style == "relief", w
+        cut = sum(e - s for s, e in fold_intervals(60.0, m))
+        assert p.slot.area == pytest.approx(w * cut, rel=1e-6), w
+    m = Material.from_flute("B", relief_adaptive=False, relief_fixed=0.0)
+    assert plan_folds(isl, m)[0].style == "perf", "0 means no slot"
+    # adaptive keeps its threshold: a shallow fold is only perforated
+    m = Material.from_flute("B")
+    isl.folds[0].bend = math.radians(15)
+    assert plan_folds(isl, m)[0].style == "perf"
 
 
 # ------------------------------------------------------------------- font
@@ -2629,3 +3144,451 @@ def test_stroke_font_covers_labels_and_scales():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ------------------------------------------------------------- flat pieces
+
+def _flat_ring_mesh(tilt=0.7, offset=(5.0, 7.0, 11.0), r0=40.0, r1=80.0,
+                    n=24):
+    """A flat washer, triangulated - the shape the coplanar merge cannot
+    rebuild, because one face with a hole is not a face. Tilted out of every
+    axis plane so the plane fit has to do the work."""
+    ring = Polygon([(r1 * math.cos(t), r1 * math.sin(t))
+                    for t in np.linspace(0, 2 * math.pi, n, endpoint=False)],
+                   [[(r0 * math.cos(t), r0 * math.sin(t))
+                     for t in np.linspace(0, 2 * math.pi, n, endpoint=False)]])
+    tris = shapely.constrained_delaunay_triangles(ring)
+    verts, idx, rings = [], {}, []
+    for t in tris.geoms:
+        r = []
+        for x, y in list(t.exterior.coords)[:-1]:
+            k = (round(x, 9), round(y, 9))
+            if k not in idx:
+                idx[k] = len(verts)
+                verts.append((x, y, 0.0))
+            r.append(idx[k])
+        # constrained_delaunay winds either way; face +z, consistently
+        if _signed2d(np.array(verts)[r]) < 0:
+            r = r[::-1]
+        rings.append(r)
+    c, s = math.cos(tilt), math.sin(tilt)
+    R = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    return np.array(verts) @ R.T + np.array(offset), rings, ring
+
+
+def _signed2d(p):
+    x, y = p[:, 0], p[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def test_a_flat_piece_is_cut_as_the_shape_it_is():
+    """One island, no folds, the hole kept, exact. Without flat pieces the
+    same washer is a tree of triangles with every diagonal a fold - a 300 mm
+    border was 22,303 "folds" and 6 m of perforation."""
+    v, rings, shape = _flat_ring_mesh()
+    pm = PolyMesh.from_rings(v, rings, merge=False)
+    islands, rep = unfold(pm, flat_tol=3.0)
+    assert rep["flat_pieces"] == 1 and len(islands) == 1
+    isl = islands[0]
+    assert not isl.folds
+    assert sorted(isl.faces) == list(range(len(pm.faces)))
+    out = isl.outline()
+    assert abs(out.area - shape.area) < 1e-6 * shape.area
+    assert len(out.interiors) == 1
+    assert rep["isometry_error"] < 1e-9
+    assert mirrored_faces(pm, isl.faces) == []
+    assert all(c.seam == -1 for c in isl.cuts)
+    part = build_parts(islands, Material.from_flute("B"))[0]
+    assert part.perf_m.is_empty and part.perf_v.is_empty
+
+
+def test_a_piece_within_the_tolerance_is_flat_and_beyond_it_is_not():
+    v, rings, _ = _flat_ring_mesh(tilt=0.0, offset=(0, 0, 0))
+    bowed = v.copy()
+    bowed[:, 2] = 2.0 * (bowed[:, 0] / 80.0) ** 2        # up to 2 mm
+    pm = PolyMesh.from_rings(bowed, rings, merge=False)
+    from cardboard_unfolder.unfold import flat_pieces
+    assert len(flat_pieces(pm, 3.0)) == 1
+    assert flat_pieces(pm, 0.5) == []
+
+
+def test_a_thin_closed_solid_is_not_a_flat_piece():
+    """A 2 mm plate modelled as a box is within 3 mm of a plane, and its top,
+    bottom and walls still cannot be one flat shape."""
+    from cardboard_unfolder.unfold import flat_pieces
+    pm = PolyMesh.from_trimesh(trimesh.creation.box(extents=(100, 60, 2)))
+    assert flat_pieces(pm, 3.0) == []
+
+
+@pytest.mark.parametrize("name,tm", ALL, ids=IDS)
+def test_no_corpus_model_has_a_flat_piece(name, tm):
+    """So flat_tol changes nothing on any of them."""
+    from cardboard_unfolder.unfold import flat_pieces
+    assert flat_pieces(PolyMesh.from_trimesh(tm), 3.0) == []
+
+
+def test_flat_pieces_leave_the_rest_of_the_model_alone():
+    """A flat washer beside a box, in ONE mesh: the box unfolds exactly as it
+    does on its own, its faces keep their ids, and the washer is one more
+    island after it."""
+    box_tm = trimesh.creation.box(extents=(60, 60, 60))
+    pm_box = PolyMesh.from_trimesh(box_tm)
+    v, rings, _ = _flat_ring_mesh(offset=(200.0, 0.0, 0.0))
+    nb = len(pm_box.vertices)
+    pm = PolyMesh(np.vstack([pm_box.vertices, v]),
+                  [list(r) for r in pm_box.faces] + [[i + nb for i in r]
+                                                     for r in rings])
+    alone, _ = unfold(pm_box, seed=3)
+    both, rep = unfold(pm, seed=3, flat_tol=3.0)
+    assert rep["flat_pieces"] == 1
+    assert len(both) == len(alone) + 1
+    for a, b in zip(alone, both):
+        assert a.id == b.id and sorted(a.faces) == sorted(b.faces)
+        for f in a.faces:
+            assert np.array_equal(a.faces[f], b.faces[f])
+        assert [(c.face, c.seam) for c in a.cuts] == [(c.face, c.seam)
+                                                     for c in b.cuts]
+    flat = both[-1]
+    assert flat.id == len(alone)
+    assert sorted(flat.faces) == list(range(len(pm_box.faces), len(pm.faces)))
+
+
+def test_a_fold_that_does_not_bend_is_not_scored():
+    """The annulus caps are flat rings the merge cannot rebuild, so their
+    triangle diagonals are 0-degree "folds" - and each was perforated and
+    marked M or V. Below `min_bend` a fold is left alone; at 0 the old
+    behaviour comes back, which is what proves the rule is doing it."""
+    tm = dict(ALL)["annulus"]
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, seed=0)
+    flat = [f for i in islands for f in i.folds
+            if abs(f.bend) < math.radians(1.0)]
+    assert flat, "the fixture must have unbent folds"
+    mat = Material.from_flute("B")
+    for isl in islands:
+        for plan in plan_folds(isl, mat):
+            if abs(plan.fold.bend) < math.radians(mat.min_bend):
+                assert plan.style == "flat" and not plan.perf
+                assert plan.slot is None
+            else:
+                assert plan.style != "flat"
+    old = Material.from_flute("B", min_bend=0.0)
+    scored = sum(len(p.perf) for isl in islands for p in plan_folds(isl, old)
+                 if abs(p.fold.bend) < math.radians(1.0))
+    assert scored > 0, "at min_bend 0 the unbent folds are scored again"
+
+
+def test_an_unbent_fold_gets_no_fold_mark():
+    """Only the unbent folds' plans: no M or V - and the same folds planned
+    at min_bend 0 do get marks, so the room was there."""
+    tm = dict(ALL)["annulus"]
+    pm = PolyMesh.from_trimesh(tm)
+    islands, _ = unfold(pm, seed=0)
+    mat = Material.from_flute("B")
+    old = Material.from_flute("B", min_bend=0.0)
+    marked_old = 0
+    for isl in islands:
+        flat = [p for p in plan_folds(isl, mat) if p.style == "flat"]
+        assert fold_labels(isl, flat, mat) == []
+        ids = {id(p.fold) for p in flat}
+        again = [p for p in plan_folds(isl, old) if id(p.fold) in ids]
+        marked_old += len(fold_labels(isl, again, old))
+    assert marked_old > 0
+
+
+def test_a_part_knows_its_model():
+    """Island ids restart per object; on shared sheets the model says whose."""
+    pm = PolyMesh.from_trimesh(trimesh.creation.box(extents=(50, 50, 50)))
+    islands, _ = unfold(pm)
+    parts = build_parts(islands, Material.from_flute("B", model_id="BOX"))
+    assert {p.model for p in parts} == {"BOX"}
+
+
+def test_a_flat_piece_is_not_told_to_re_unfold():
+    """Narrow places in a flat piece are its drawing, not the unfold's - a
+    different seed changes nothing, so the warning must not say it would."""
+    # two discs joined by a 3 mm bar: a pinch drawn into the piece
+    shape = unary_union([Point(0, 0).buffer(30), Point(100, 0).buffer(30),
+                         box(0, -1.5, 100, 1.5)])
+    tris = shapely.constrained_delaunay_triangles(shape)
+    verts, idx, rings = [], {}, []
+    for t in tris.geoms:
+        r = []
+        for x, y in list(t.exterior.coords)[:-1]:
+            k = (round(x, 9), round(y, 9))
+            if k not in idx:
+                idx[k] = len(verts)
+                verts.append((x, y, 5.0))
+            r.append(idx[k])
+        if _signed2d(np.array(verts)[r]) < 0:
+            r = r[::-1]
+        rings.append(r)
+    pm = PolyMesh.from_rings(np.array(verts), rings, merge=False)
+    islands, _ = unfold(pm, flat_tol=3.0)
+    assert islands[0].flat
+    warns = build_parts(islands, Material.from_flute("B"))[0].warnings
+    assert any("flat piece" in w for w in warns), warns
+    assert not any("seed" in w for w in warns), warns
+
+
+# ------------------------------------------------------------- G-code (GRBL)
+
+def _grbl(text):
+    """What a GRBL 1.1 laser in laser mode ($32=1) does with a file: every
+    lit G1 segment as (op, (x0, y0), (x1, y1), S, F, air), in order, plus
+    the state it ends in. G0 never burns - laser mode turns the beam off for
+    rapids - and M5 turns it off until the next M3/M4."""
+    x = y = 0.0
+    s = f = 0.0
+    beam = air = False
+    op = None
+    burns = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("; ---"):
+            op = line[5:].strip()
+            continue
+        line = line.split(";")[0].strip()
+        if not line:
+            continue
+        words = dict((w[0], float(w[1:]) if w[1:] else 0.0)
+                     for w in line.split())
+        if "S" in words:
+            s = words["S"]
+        if "F" in words:
+            f = words["F"]
+        if "M" in words:
+            m = int(words["M"])
+            beam = {3: True, 4: True, 5: False}.get(m, beam)
+            air = {7: True, 8: True, 9: False}.get(m, air)
+        if "G" in words:
+            g = int(words["G"])
+            nx, ny = words.get("X", x), words.get("Y", y)
+            if g == 1 and beam and s > 0:
+                burns.append((op, (x, y), (nx, ny), s, f, air))
+            if g in (0, 1):
+                x, y = nx, ny
+    return burns, dict(beam=beam, air=air, x=x, y=y)
+
+
+def _gcode_parts(name, mat):
+    tm = dict(ALL)[name]
+    pm = PolyMesh.from_trimesh(tm)
+    pad = 2 * mat.tab_depth + 2 * mat.kerf
+    islands, _ = unfold(pm, trials=40, max_size=(mat.usable_bed[0] - pad,
+                                                 mat.usable_bed[1] - pad))
+    parts = build_parts(islands, mat)
+    sheets, _ = pack(parts, mat)
+    return parts, sheets
+
+
+def _seg_len(b):
+    return math.hypot(b[2][0] - b[1][0], b[2][1] - b[1][1])
+
+
+def _geom_len(geoms):
+    return sum(g.length for g in geoms if g is not None and not g.is_empty)
+
+
+def _mid(b):
+    return shapely.Point((b[1][0] + b[2][0]) / 2, (b[1][1] + b[2][1]) / 2)
+
+
+@pytest.mark.parametrize("name", ["cylinder", "helmet"])
+def test_gcode_burns_exactly_what_the_sheet_holds(name, tmp_path):
+    """Per operation, the lit length is the geometry's length times its
+    passes, and every lit segment lies on that operation's geometry - so
+    nothing is missing, nothing is burned twice by accident, and no travel
+    move is lit."""
+    from cardboard_unfolder.gcode import write_gcode
+    mat = Material.from_flute("B")
+    mat.cut_passes = 2
+    mat.score_folds = True
+    parts, sheets = _gcode_parts(name, mat)
+    for sh in range(sheets):
+        f = tmp_path / f"s{sh}.nc"
+        write_gcode(f, parts, mat, sh, sheets)
+        burns, end = _grbl(f.read_text())
+        mine = [p for p in parts if p.sheet == sh]
+        want = {
+            "ENGRAVE": ([p.engrave for p in mine], mat.engrave_passes),
+            "SCORE": ([g for p in mine for g in (p.perf_m, p.perf_v)],
+                      mat.score_passes),
+            "CUT": ([p.cut.boundary for p in mine], mat.cut_passes),
+        }
+        for op, (geoms, n) in want.items():
+            lit = [b for b in burns if b[0] == op]
+            got = sum(_seg_len(b) for b in lit)
+            exp = _geom_len(geoms) * n
+            # coordinates are written to 0.001 mm: each end moves at most
+            # 0.0005 mm per axis, so each segment by at most 2 * 0.0005 * sqrt 2
+            assert got == pytest.approx(exp, abs=1.5e-3 * len(lit) + 1e-6), (op, sh)
+            if not exp:
+                continue
+            body = unary_union([g for g in geoms if not g.is_empty])
+            far = max(body.distance(_mid(b)) for b in burns if b[0] == op)
+            assert far < 2e-3, f"{op}: a lit segment {far:.4f} mm off its geometry"
+        assert not end["beam"], "the file must end with the laser off"
+    # the fixture is not vacuous
+    assert any(not p.perf_m.is_empty or not p.perf_v.is_empty for p in parts)
+    assert any(not p.engrave.is_empty for p in parts)
+
+
+def test_gcode_cuts_every_hole_before_its_outline(tmp_path):
+    """Relief slots and corner holes are holes in the part: if the outline
+    cuts through first the part drops and they are never finished. Every
+    pass of every hole comes before the first pass of its outline."""
+    from cardboard_unfolder.gcode import write_gcode
+    mat = Material.from_flute("B")
+    mat.cut_passes = 3
+    mat.relief_threshold = 0.0          # every fold a slot: plenty of holes
+    parts, sheets = _gcode_parts("helmet", mat)
+    holes_seen = 0
+    for sh in range(sheets):
+        f = tmp_path / f"s{sh}.nc"
+        write_gcode(f, parts, mat, sh, sheets)
+        burns = [b for b in _grbl(f.read_text())[0] if b[0] == "CUT"]
+        mids = [_mid(b) for b in burns]
+        for p in (q for q in parts if q.sheet == sh):
+            polys = p.cut.geoms if hasattr(p.cut, "geoms") else [p.cut]
+            for poly in polys:
+                if not poly.interiors:
+                    continue
+                outer = poly.exterior
+                inner = MultiLineString([list(r.coords) for r in poly.interiors])
+                i_out = [i for i, m in enumerate(mids) if outer.distance(m) < 1e-3]
+                i_in = [i for i, m in enumerate(mids) if inner.distance(m) < 1e-3]
+                assert i_out and i_in
+                holes_seen += len(poly.interiors)
+                assert max(i_in) < min(i_out), "an outline was cut before its holes"
+    assert holes_seen, "the fixture has no holes to test"
+
+
+def test_gcode_runs_engrave_then_score_then_cut_at_their_own_settings(tmp_path):
+    from cardboard_unfolder.gcode import write_gcode
+    mat = Material.from_flute("B")
+    mat.score_folds = True
+    mat.score_power, mat.score_speed = 600.0, 800.0
+    parts, sheets = _gcode_parts("cylinder", mat)
+    f = tmp_path / "s.nc"
+    write_gcode(f, parts, mat, 0, sheets)
+    text = f.read_text()
+    burns, _ = _grbl(text)
+    seq = [b[0] for b in burns]
+    order = [op for i, op in enumerate(seq) if i == 0 or seq[i - 1] != op]
+    assert order == ["ENGRAVE", "SCORE", "CUT"], order
+    want = {"ENGRAVE": (250.0, 1000.0), "SCORE": (600.0, 800.0),
+            "CUT": (1000.0, 500.0)}
+    for b in burns:
+        assert (b[3], b[4]) == want[b[0]], b[0]
+    assert "M4" in text and "M3" not in text, "dynamic power is M4"
+    assert all(b[3] <= mat.laser_max for b in burns)
+
+
+def test_gcode_stays_on_the_bed_and_refuses_otherwise(tmp_path):
+    """Origin front-left, Y away from you: the sheet's own coordinates,
+    unflipped, so every point is inside the bed the parts were packed for.
+    A part off the bed is a file that would run the head into the frame."""
+    from cardboard_unfolder.gcode import write_gcode
+    mat = Material.from_flute("B")
+    parts, sheets = _gcode_parts("cylinder", mat)
+    f = tmp_path / "s.nc"
+    write_gcode(f, parts, mat, 0, sheets)
+    W, H = mat.bed
+    pts = [q for b in _grbl(f.read_text())[0] for q in (b[1], b[2])]
+    assert all(-1e-3 <= x <= W + 1e-3 and -1e-3 <= y <= H + 1e-3 for x, y in pts)
+    # not flipped: the lowest lit point is the lowest point of the parts
+    lo = min(p.cut.bounds[1] for p in parts if p.sheet == 0)
+    assert min(y for _, y in pts) == pytest.approx(lo, abs=1e-3)
+    p0 = next(p for p in parts if p.sheet == 0)
+    p0.translate(mat.bed[0], 0.0)
+    with pytest.raises(ValueError, match="leaves"):
+        write_gcode(tmp_path / "bad.nc", parts, mat, 0, sheets)
+
+
+def test_gcode_refuses_power_above_the_machine_maximum(tmp_path):
+    from cardboard_unfolder.gcode import write_gcode
+    mat = Material.from_flute("B")
+    parts, sheets = _gcode_parts("box", mat)
+    mat.laser_max = 255.0               # a $30=255 machine: 1000 is not a value
+    with pytest.raises(ValueError, match=r"\$30"):
+        write_gcode(tmp_path / "s.nc", parts, mat, 0, sheets)
+
+
+def test_gcode_air_assist_only_when_fitted_and_only_where_asked(tmp_path):
+    from cardboard_unfolder.gcode import write_gcode
+    mat = Material.from_flute("B")
+    parts, sheets = _gcode_parts("cylinder", mat)
+    f = tmp_path / "off.nc"
+    write_gcode(f, parts, mat, 0, sheets)
+    text = f.read_text()
+    assert "M8" not in text and "M7" not in text, "no air assist fitted by default"
+
+    mat.air_assist = True
+    mat.score_folds = True
+    f = tmp_path / "on.nc"
+    write_gcode(f, parts, mat, 0, sheets)
+    burns, end = _grbl(f.read_text())
+    for b in burns:
+        assert b[5] == {"ENGRAVE": False, "SCORE": True, "CUT": True}[b[0]], b[0]
+    assert not end["air"] and not end["beam"], "air and laser off at the end"
+
+
+def test_write_all_writes_one_gcode_file_per_sheet(tmp_path):
+    from cardboard_unfolder import run
+    tm = trimesh.creation.box()
+    p = tmp_path / "cube.stl"
+    tm.export(p)
+    rep = run(p, tmp_path / "out", Material.from_flute("B"), height_mm=110,
+              trials=20, dxf=False, verbose=False)
+    ncs = sorted((tmp_path / "out").glob("*.nc"))
+    assert len(ncs) == rep["sheets"] >= 1
+    run(p, tmp_path / "none", Material.from_flute("B"), height_mm=110,
+        trials=20, dxf=False, verbose=False, gcode=False)
+    assert not list((tmp_path / "none").glob("*.nc"))
+
+
+def test_fold_scores_are_off_by_default_and_burn_nowhere(tmp_path):
+    """The user's call: a fold score is an option, off by default. At the
+    cut setting the perforation dashes are slits through the board, so with
+    it off no fold line reaches any output - SVG, DXF or G-code - and the
+    relief slots, which are holes in the cut, still do."""
+    import xml.etree.ElementTree as ET
+    import ezdxf
+    from cardboard_unfolder.export import write_svg, write_dxf
+    from cardboard_unfolder.gcode import write_gcode
+    mat = Material.from_flute("B")
+    assert mat.score_folds is False
+    parts, sheets = _gcode_parts("cylinder", mat)
+    assert any(not p.perf_m.is_empty or not p.perf_v.is_empty for p in parts), \
+        "the fixture has fold lines to leave out"
+
+    def layers(m):
+        write_svg(tmp_path / "s.svg", parts, m, 0)
+        root = ET.parse(tmp_path / "s.svg").getroot()
+        svg = {g.get("{http://www.inkscape.org/namespaces/inkscape}label")
+               for g in root.iter("{http://www.w3.org/2000/svg}g")}
+        write_dxf(tmp_path / "s.dxf", parts, m, 0)
+        dxf = {e.dxf.layer for e in ezdxf.readfile(tmp_path / "s.dxf").modelspace()}
+        write_gcode(tmp_path / "s.nc", parts, m, 0, sheets)
+        nc = {b[0] for b in _grbl((tmp_path / "s.nc").read_text())[0]}
+        return svg, dxf, nc
+
+    svg, dxf, nc = layers(mat)
+    for name, got in (("svg", svg), ("dxf", dxf), ("nc", nc)):
+        assert not {"PERF_M", "PERF_V", "SCORE"} & got, (name, got)
+        assert "CUT" in got and "ENGRAVE" in got, (name, got)
+
+    mat.score_folds = True
+    svg, dxf, nc = layers(mat)
+    assert {"PERF_M", "PERF_V"} & svg and {"PERF_M", "PERF_V"} & dxf
+    assert "SCORE" in nc
+
+
+def test_a_fold_score_does_not_default_to_cutting_power():
+    """Switched on, the score starts where the board is known not to cut
+    through - the measured engrave setting - not at the cut setting."""
+    mat = Material.from_flute("B")
+    assert (mat.score_power, mat.score_speed) == (mat.engrave_power,
+                                                  mat.engrave_speed)
+    assert mat.score_power < mat.cut_power

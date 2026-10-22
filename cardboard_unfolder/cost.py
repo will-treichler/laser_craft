@@ -109,6 +109,31 @@ class Weights:
     bed_free_frac: float = 0.5
 
 
+def board_weights(bias: float) -> Weights:
+    """The Optimise slider, "large islands" (0) to "less board" (1).
+
+    0 is today's weights exactly - the default, the user's choice. Toward 1,
+    board counts for more and pieces for less: the sheet term (now in
+    sheet-equivalents, so the last sheet's offcut counts) up to five times,
+    the per-island and seam terms down, and the big-island pressure up,
+    because an island over half a sheet is one no other can share with.
+    Splinters and oversize are untouched: a net nobody can hold or cut is not
+    a saving at any setting.
+
+    These factors are JUDGEMENTS, set so the far end is decisive without
+    swamping buildability. The other half of the slider is not here - see
+    `unfold.split_fractions` - because weights only choose among nets, and
+    island size is decided by the bed split.
+    """
+    b = min(1.0, max(0.0, float(bias)))
+    w = Weights()
+    w.sheet = w.sheet * (1.0 + 4.0 * b)
+    w.island = w.island * (1.0 - 0.8 * b)
+    w.seam = w.seam * (1.0 - 0.5 * b)
+    w.bed = w.bed * (1.0 + 1.0 * b)
+    return w
+
+
 @dataclass
 class Score:
     total: float

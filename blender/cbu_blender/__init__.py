@@ -14,7 +14,7 @@ import sys
 import bpy
 from bpy.app.handlers import persistent
 
-from . import log, deps, props, bridge, overlay, ops, ui, dev
+from . import build, log, deps, props, bridge, overlay, ops, ui, dev
 
 _MODULES = (log, deps, props, bridge, overlay, ops, ui, dev)
 
@@ -27,6 +27,7 @@ def _on_load(_dummy):
     afterwards is a classic addon crash."""
     overlay.clear()
     ops._LAST.clear()
+    ops._GROUP.clear()
 
 
 @persistent

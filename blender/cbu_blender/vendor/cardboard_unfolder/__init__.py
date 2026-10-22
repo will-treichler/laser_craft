@@ -25,7 +25,7 @@ __all__ = ["Material", "FLUTES", "PolyMesh", "unfold", "build_parts",
 def run(mesh_path, outdir, material: Material | None = None,
         height_mm: float | None = None, scale: float | None = None,
         trials: int = 250, seed: int = 0, merge_coplanar: bool = True,
-        dxf: bool = True, verbose: bool = True) -> dict:
+        dxf: bool = True, verbose: bool = True, gcode: bool = True) -> dict:
     """Full pipeline. Returns a report dict; writes SVG/DXF/manifest to outdir."""
     mat = material or Material.from_flute("B")
     log = print if verbose else (lambda *a, **k: None)
@@ -47,11 +47,15 @@ def run(mesh_path, outdir, material: Material | None = None,
 
     islands, rep = unfold(pm, trials=trials, seed=seed, max_size=limit,
                           verbose=verbose,
-                          splinter_width=mat.splinter_width)
+                          splinter_width=mat.splinter_width,
+                          flat_tol=mat.flat_tol)
     log(f"unfolded: {rep['islands']} island(s), isometry error "
         f"{rep['isometry_error']:.1e}, {rep['trials_used']} trial(s), "
         f"{rep['extra_cuts']} repair cut(s), {rep['rewelds']} re-weld(s), "
         f"{rep['size_splits']} bed split(s)")
+    if rep.get("flat_pieces"):
+        log(f"  {rep['flat_pieces']} flat piece(s) cut as they are, within "
+            f"{rep['flat_deviation']:.2f} mm of their plane")
     if rep["unresolved"]:
         log(f"  ! {rep['unresolved']} overlap(s) could not be resolved")
 
@@ -68,7 +72,7 @@ def run(mesh_path, outdir, material: Material | None = None,
         log("    (bed-size splitting with splice joints is M6 - for now scale "
             "down or add cuts)")
 
-    files = write_all(outdir, parts, mat, sheets, rep, dxf=dxf)
+    files = write_all(outdir, parts, mat, sheets, rep, dxf=dxf, gcode=gcode)
     log(f"wrote {len(files)} file(s) to {outdir}")
 
     rep.update(sheets=sheets, parts=len(parts),

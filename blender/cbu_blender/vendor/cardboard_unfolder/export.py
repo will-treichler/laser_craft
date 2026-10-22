@@ -48,6 +48,14 @@ def _lines(geom):
     return [np.asarray(g.coords) for g in gs if not g.is_empty]
 
 
+def _marked(p, mat: Material):
+    """The open-line layers of a part that are burned: the fold scores only
+    when `score_folds` is on - off, they would be slits at whatever power the
+    software gives the layer - and the engraving always."""
+    out = [("PERF_M", p.perf_m), ("PERF_V", p.perf_v)] if mat.score_folds else []
+    return out + [("ENGRAVE", p.engrave)]
+
+
 def _path(pts, close):
     d = f"M {pts[0][0]:.4f},{pts[0][1]:.4f} " + " ".join(
         f"L {x:.4f},{y:.4f}" for x, y in pts[1:])
@@ -69,8 +77,7 @@ def write_svg(path, parts, mat: Material, sheet: int, flip_y: bool = True) -> No
     for p in mine:
         for r in _rings(p.cut):
             buckets["CUT"].append((r, True))
-        for name, geom in (("PERF_M", p.perf_m), ("PERF_V", p.perf_v),
-                           ("ENGRAVE", p.engrave)):
+        for name, geom in _marked(p, mat):
             for l in _lines(geom):
                 buckets[name].append((l, False))
 
@@ -112,8 +119,7 @@ def write_dxf(path, parts, mat: Material, sheet: int) -> None:
         for r in _rings(p.cut):
             msp.add_lwpolyline([tuple(c) for c in r[:-1]], close=True,
                                dxfattribs={"layer": "CUT"})
-        for name, geom in (("PERF_M", p.perf_m), ("PERF_V", p.perf_v),
-                           ("ENGRAVE", p.engrave)):
+        for name, geom in _marked(p, mat):
             for l in _lines(geom):
                 msp.add_lwpolyline([tuple(c) for c in l], close=False,
                                    dxfattribs={"layer": name})
@@ -131,7 +137,7 @@ def write_manifest(path, parts, mat: Material, sheets: int, report: dict) -> Non
                       "relief_threshold", "bed", "sheet_margin", "part_gap")},
         "sheets": sheets,
         "unfold": report,
-        "parts": [{"id": p.island_id, "sheet": p.sheet,
+        "parts": [{"id": p.island_id, "model": p.model, "sheet": p.sheet,
                    "size_mm": [round(v, 2) for v in p.size],
                    "area_mm2": round(p.cut.area, 1),
                    "cut_length_mm": round(cutlen(p), 1),
@@ -142,7 +148,11 @@ def write_manifest(path, parts, mat: Material, sheets: int, report: dict) -> Non
 
 
 def write_all(outdir, parts, mat: Material, sheets: int, report: dict,
-              dxf: bool = True, stem: str = "sheet") -> list[str]:
+              dxf: bool = True, stem: str = "sheet",
+              gcode: bool = True) -> list[str]:
+    """SVG (and DXF) per sheet for LightBurn or Inkscape, G-code per sheet
+    for a GRBL laser (LaserGRBL), and the manifest."""
+    from .gcode import write_gcode
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     written = []
@@ -153,6 +163,10 @@ def write_all(outdir, parts, mat: Material, sheets: int, report: dict,
         if dxf:
             g = outdir / f"{stem}_{s + 1:02d}.dxf"
             write_dxf(g, parts, mat, s)
+            written.append(str(g))
+        if gcode:
+            g = outdir / f"{stem}_{s + 1:02d}.nc"
+            write_gcode(g, parts, mat, s, sheets)
             written.append(str(g))
     write_manifest(outdir / "manifest.json", parts, mat, sheets, report)
     written.append(str(outdir / "manifest.json"))

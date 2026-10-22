@@ -20,7 +20,7 @@ from shapely.strtree import STRtree
 
 from .material import Material
 from .unfold import Island, min_area_rect
-from .folds import (plan_folds, apply_relief, offset_cut,
+from .folds import (plan_folds, apply_relief, apply_corner_holes, offset_cut,
                     corner_relief)
 from .tabs import place_tabs, island_labels
 from .fingers import place_fingers, apply_fingers, fingered_seams
@@ -36,6 +36,9 @@ class Part:
     warnings: list = field(default_factory=list)
     sheet: int = -1
     xform: np.ndarray = field(default_factory=lambda: np.eye(3))
+    # Which model this came from. Island ids restart at 0 per object, so
+    # once several objects share the sheets the id alone is ambiguous.
+    model: str = ""
 
     def apply(self, fn):
         self.cut = fn(self.cut)
@@ -153,15 +156,37 @@ def _mls(segs) -> MultiLineString:
     return MultiLineString(out) if out else MultiLineString([])
 
 
-def build_parts(islands: list[Island], mat: Material) -> list[Part]:
-    """Island -> Part: relief slots subtracted, fingers and tabs on, kerf applied."""
+def build_parts(islands: list[Island], mat: Material,
+                annotate: bool = True) -> list[Part]:
+    """Island -> Part: relief slots subtracted, fingers and tabs on, kerf applied.
+
+    `annotate=False` builds the cut and nothing else - no perforation, no
+    labels, no neck warnings - for a caller that only wants to know how the
+    parts PACK. The optimiser packs every finalist to count its sheets, and
+    labelling was a third of each build there while changing nothing the
+    packer reads. The cut is the same geometry either way
+    (`test_an_unannotated_part_has_exactly_the_annotated_cut`).
+    """
     plans_by = {isl.id: plan_folds(isl, mat) for isl in islands}
     bodies = {isl.id: apply_relief(isl.outline(), plans_by[isl.id])
               for isl in islands}
+    # Before the fingers, so a notch keeps its wall from the hole too - and
+    # the fingers are told where the holes are, to run back to them.
+    # One finger depth across when fingers are on: the notch bottom is half
+    # a depth in, so a hole of that radius meets it at a tangent (the user's
+    # spec). One board across without fingers - nothing to be tangent to.
+    holes = {}
+    hole_size = mat.finger_depth_used if mat.use_fingers else mat.thickness
+    if mat.corner_hole:
+        for isl in islands:
+            bodies[isl.id], holes[isl.id] = apply_corner_holes(
+                isl, bodies[isl.id], hole_size)
     # Fingers first: a seam that interlocks needs no flap, and a flap laid
     # along a fingered edge would bury the fingers. Tabs then go on the seams
     # that could not take a finger.
-    joints = place_fingers(islands, mat, bodies) if mat.use_fingers else {}
+    joints = (place_fingers(islands, mat, bodies, holes=holes,
+                            hole_r=hole_size / 2.0)
+              if mat.use_fingers else {})
     # Tabs are optional: most cardboard is taped or gets a glued backing strip,
     # and the flaps cost about a fifth of the sheet in area.
     tabs, skipped = (place_tabs(islands, mat, skip=fingered_seams(joints))
@@ -178,6 +203,22 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
             body = unary_union([shapely.set_precision(body, 1e-9)] +
                                [shapely.set_precision(t, 1e-9) for t in tab_polys])
 
+        cut = offset_cut(body, mat.edge_offset)
+        if cut.is_empty:
+            warns.append(
+                f"edge offset {mat.edge_offset:+.2f}mm removed this part "
+                f"entirely; cutting it at its own edge instead")
+            cut = body
+        # Only an OUTWARD offset buries a notch apex, so there is nothing to
+        # relieve without one.
+        if mat.corner_relief and mat.edge_offset > 0:
+            cut = corner_relief(body, cut, mat.kerf, mat.corner_overcut)
+        if not annotate:
+            parts.append(Part(island_id=isl.id, cut=cut, perf_m=_mls([]),
+                              perf_v=_mls([]), engrave=_mls([]),
+                              warnings=warns, model=mat.model_id))
+            continue
+
         perf_m, perf_v = [], []
         for p in plans:
             (perf_m if p.is_mountain else perf_v).extend(p.perf)
@@ -192,18 +233,15 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
         for lab in island_labels(isl, plans, mat, body):
             strokes.extend(lab.strokes)
 
-        cut = offset_cut(body, mat.edge_offset)
-        if cut.is_empty:
-            warns.append(
-                f"edge offset {mat.edge_offset:+.2f}mm removed this part "
-                f"entirely; cutting it at its own edge instead")
-            cut = body
-        # Only an OUTWARD offset buries a notch apex, so there is nothing to
-        # relieve without one.
-        if mat.corner_relief and mat.edge_offset > 0:
-            cut = corner_relief(body, cut, mat.kerf, mat.corner_overcut)
         necks = narrow_necks(cut, max(3.0, 2.0 * mat.thickness))
-        if necks:
+        if necks and getattr(isl, "flat", False):
+            # A flat piece is the shape it was drawn as: no seed or trial
+            # count changes it, so the unfold advice below would be wrong.
+            warns.append(
+                f"{necks} place(s) narrower than "
+                f"{max(3.0, 2.0*mat.thickness):.0f}mm in this flat piece - "
+                f"fragile in board this thick; widen them in the model")
+        elif necks:
             warns.append(
                 f"{necks} neck(s) narrower than {max(3.0, 2.0*mat.thickness):.0f}mm - "
                 f"the net rejoins itself through a near-pinch and will tear there. "
@@ -212,7 +250,7 @@ def build_parts(islands: list[Island], mat: Material) -> list[Part]:
         parts.append(Part(
             island_id=isl.id, cut=cut,
             perf_m=_mls(perf_m), perf_v=_mls(perf_v),
-            engrave=_mls(strokes), warnings=warns))
+            engrave=_mls(strokes), warnings=warns, model=mat.model_id))
 
     if skipped:
         parts[0].warnings.append(
@@ -399,6 +437,37 @@ def _put(part: Part, angle: float, moved) -> None:
     part.rotate(angle, origin=tuple(part.cut.centroid.coords)[0])
     b = part.bounds
     part.translate(moved.bounds[0] - b[0], moved.bounds[1] - b[1])
+
+
+def long_axis(mat: Material) -> int:
+    """0 if the bed is longer in x, 1 if in y - or square, which keeps the
+    packers' original bottom-first order. Parts are pushed toward the low end
+    of this axis, so a part-used last sheet leaves its offcut as one strip,
+    the full width of the short side, at the far end of the long one (the
+    user's rule: "take the ratio on the long dimension")."""
+    W, H = mat.usable_bed
+    return 0 if W > H else 1
+
+
+def sheet_equivalents(parts: list[Part], mat: Material) -> tuple[float, float]:
+    """(sheets used, as a fraction; the fraction of the last sheet left free).
+
+    Every sheet but the last counts whole. The last counts only as far along
+    the long axis as its parts reach: what is beyond them is a strip of board
+    the full width of the sheet, kept for another job. So 3 sheets with the
+    last 40% used is 2.4 - one number for "how much board did this take",
+    which an integer sheet count cannot give: it reads the same whether the
+    last sheet holds one sliver or is nearly full.
+    """
+    on = [p for p in parts if p.sheet >= 0]
+    if not on:
+        return 0.0, 0.0
+    last = max(p.sheet for p in on)
+    ax = long_axis(mat)
+    span = mat.usable_bed[ax]
+    reach = max(p.bounds[2 + ax] for p in on if p.sheet == last) - mat.sheet_margin
+    frac = min(1.0, max(0.0, reach / span))
+    return last + frac, 1.0 - frac
 
 
 def seat_sheets(parts: list[Part], mat: Material) -> None:
@@ -664,7 +733,16 @@ def raster_mask(geom, res: float, gap: float):
     return m, x0, y0
 
 
-def free_offsets(F, shape, mask: np.ndarray) -> np.ndarray:
+def mask_fft(mask: np.ndarray, shape) -> np.ndarray:
+    """The transform of a part's mask, ready for `free_offsets`.
+
+    It depends only on the mask and the sheet's grid, so a part tried against
+    sheet after sheet can carry it rather than recompute it every time.
+    """
+    return np.fft.rfft2(mask[::-1, ::-1].astype(np.float64), s=shape)
+
+
+def free_offsets(F, shape, mask: np.ndarray, Mk=None) -> np.ndarray:
     """Every grid offset at which `mask` lands on nothing, in one shot.
 
     Cross-correlating the sheet's occupancy with the part gives the overlap
@@ -676,12 +754,14 @@ def free_offsets(F, shape, mask: np.ndarray) -> np.ndarray:
     `F` is the occupancy already transformed - it is shared across a part's
     rotations, which is most of the saving once there is more than one angle.
     The 0.5 threshold is because a float transform lands on ~1e-12, not 0.
+    `Mk` is the mask's own transform from `mask_fft`, when the caller has it.
     """
     gh, gw = shape
     h, w = mask.shape
     if h > gh or w > gw:
         return None
-    Mk = np.fft.rfft2(mask[::-1, ::-1].astype(np.float64), s=(gh, gw))
+    if Mk is None:
+        Mk = mask_fft(mask, (gh, gw))
     corr = np.fft.irfft2(F * Mk, s=(gh, gw))
     # corr[y + h - 1, x + w - 1] is the overlap of the mask placed at (x, y)
     return corr[h - 1:gh, w - 1:gw] < 0.5
@@ -758,7 +838,7 @@ def raster_spot(part: Part, F, shape, mat: Material, res: float = RASTER_RES,
 
 
 def raster_pack(parts: list[Part], mat: Material, res: float = RASTER_RES,
-                angles=RASTER_ANGLES) -> tuple[int, list[Part]]:
+                angles=RASTER_ANGLES, jitter=None) -> tuple[int, list[Part]]:
     """True-shape bottom-left over a raster, with FFT collision.
 
     `nest` asks "does this part fit at one of these corners"; this asks "where
@@ -767,8 +847,13 @@ def raster_pack(parts: list[Part], mat: Material, res: float = RASTER_RES,
     sheets to 2 and torus from 22 to 21, ties everything else, and on pikachu
     it is also ten times faster than the packer it beats.
 
-    Rotations are rasterised once per part rather than per placement, and the
-    occupancy is transformed once per part rather than once per angle.
+    Rotations are rasterised once per part rather than per placement. The
+    occupancy is transformed only when a part has landed on it - a part that
+    does not fit changes nothing - and each mask's transform is computed the
+    first time it is needed and kept, since a large part is tried against
+    sheet after sheet. Same arrays into the same transforms, so the packing is
+    bit-identical to recomputing both every time; on a torus it was 11,520
+    transforms.
     """
     W, H = mat.usable_bed
     gap = mat.part_gap
@@ -783,23 +868,35 @@ def raster_pack(parts: list[Part], mat: Material, res: float = RASTER_RES,
             oversized.append(p)
         else:
             fit.append(p)
-    fit.sort(key=lambda p: -p.cut.area)
+    if jitter is None:
+        fit.sort(key=lambda p: -p.cut.area)
+    else:
+        # Decreasing area, shuffled a little: a restart that asks the same
+        # greedy question in a slightly different order. `jitter` is a numpy
+        # Generator, so a restart is reproducible from its seed.
+        noise = {id(p): float(np.exp(jitter.normal(0.0, 0.3))) for p in fit}
+        fit.sort(key=lambda p: -p.cut.area * noise[id(p)])
 
-    shapes = {id(p): [(a,) + raster_mask(affinity.rotate(p.cut, a,
-                                                         origin="centroid"),
-                                        res, gap) for a in angles]
+    shapes = {id(p): [[a, *raster_mask(affinity.rotate(p.cut, a,
+                                                       origin="centroid"),
+                                       res, gap), None] for a in angles]
               for p in fit}
 
     sheet = 0
     occ = np.zeros((gh, gw), dtype=np.float64)
+    F = None                            # occ's transform, while it is current
     remaining = list(fit)
     while remaining:
         leftovers = []
         for p in remaining:
-            F = np.fft.rfft2(occ, s=(gh, gw))
+            if F is None:
+                F = np.fft.rfft2(occ, s=(gh, gw))
             best = None
-            for ang, m, mx0, my0 in shapes[id(p)]:
-                ok = free_offsets(F, (gh, gw), m)
+            for entry in shapes[id(p)]:
+                ang, m, mx0, my0, Mk = entry
+                if Mk is None and m.shape[0] <= gh and m.shape[1] <= gw:
+                    Mk = entry[4] = mask_fft(m, (gh, gw))
+                ok = free_offsets(F, (gh, gw), m, Mk)
                 if ok is None or not ok.any():
                     continue
                 ys, xs = np.nonzero(ok)
@@ -818,19 +915,133 @@ def raster_pack(parts: list[Part], mat: Material, res: float = RASTER_RES,
                         gy * res - my0 + mat.sheet_margin)
             p.sheet = sheet
             occ[gy:gy + m.shape[0], gx:gx + m.shape[1]] += m
+            F = None
         if len(leftovers) == len(remaining):
             break                       # nothing fits an empty sheet
         remaining = leftovers
         if remaining:
             sheet += 1
             occ = np.zeros((gh, gw), dtype=np.float64)
+            F = None
 
     for p in oversized:
         p.sheet = -1
     return (sheet + 1 if fit else 0), oversized
 
 
-def pack(parts: list[Part], mat: Material) -> tuple[int, list[Part]]:
+# Rotation sets the last-sheet pass tries, and the part orders. More angles
+# than the main packer, because here they can only help: the pass keeps a
+# result only if it frees more board, and a last sheet holds a handful of
+# parts, not dozens.
+COMPACT_ANGLE_SETS = (RASTER_ANGLES,
+                      tuple(float(a) for a in range(0, 360, 45)),
+                      tuple(float(a) for a in range(0, 360, 30)))
+
+
+def compact_last(parts: list[Part], mat: Material,
+                 res: float = RASTER_RES) -> bool:
+    """Re-pack the last sheet so its parts reach as short a way along the
+    bed's long axis as they can, leaving the rest as one offcut strip.
+
+    Every packer here is bottom-left for the sake of FITTING parts, which is
+    not the same as keeping them low: on a 300 mm bed the helmet's last sheet
+    was a third full and reached 98% of the way up. So each part, largest
+    first, goes where its FAR edge along the long axis ends lowest - not its
+    near edge - ties to the low end of the short axis. A few part orders and
+    rotation sets are tried, and the best is kept only if it measurably beats
+    what was there, so this can only tie or free board. Returns whether it
+    moved anything.
+    """
+    on = [p for p in parts if p.sheet >= 0]
+    if not on:
+        return False
+    last = max(p.sheet for p in on)
+    group = [p for p in on if p.sheet == last]
+    before, _ = sheet_equivalents(parts, mat)
+    ax = long_axis(mat)
+    W, H = mat.usable_bed
+    gw, gh = int(math.ceil(W / res)), int(math.ceil(H / res))
+    gap = mat.part_gap
+
+    masks: dict = {}
+
+    def mask(i, a):
+        if (i, a) not in masks:
+            m, mx0, my0 = raster_mask(
+                affinity.rotate(group[i].cut, a, origin="centroid"), res, gap)
+            masks[(i, a)] = (m, mx0, my0,
+                             mask_fft(m, (gh, gw))
+                             if m.shape[0] <= gh and m.shape[1] <= gw else None)
+        return masks[(i, a)]
+
+    def dims(i):
+        x0, y0, x1, y1 = group[i].bounds
+        return x1 - x0, y1 - y0
+
+    idx = range(len(group))
+    orders = [sorted(idx, key=lambda i: -group[i].cut.area),
+              sorted(idx, key=lambda i: -max(dims(i))),
+              sorted(idx, key=lambda i: -dims(i)[ax]),
+              sorted(idx, key=lambda i: -dims(i)[1 - ax])]
+    best = None
+    for angles in COMPACT_ANGLE_SETS:
+        for order in orders:
+            occ = np.zeros((gh, gw), dtype=np.float64)
+            plan, reach, ok = {}, 0, True
+            for i in order:
+                F = np.fft.rfft2(occ, s=(gh, gw))
+                pick = None
+                for a in angles:
+                    m, mx0, my0, Mk = mask(i, a)
+                    if Mk is None:
+                        continue
+                    free = free_offsets(F, (gh, gw), m, Mk)
+                    if free is None or not free.any():
+                        continue
+                    ys, xs = np.nonzero(free)
+                    far = (ys + m.shape[0]) if ax == 1 else (xs + m.shape[1])
+                    near = xs if ax == 1 else ys
+                    k = int(np.lexsort((near, far))[0])
+                    key = (int(far[k]), int(near[k]))
+                    if pick is None or key < pick[0]:
+                        pick = (key, a, int(ys[k]), int(xs[k]))
+                if pick is None:
+                    ok = False
+                    break
+                (f, _n), a, gy, gx = pick
+                m = masks[(i, a)][0]
+                occ[gy:gy + m.shape[0], gx:gx + m.shape[1]] += m
+                plan[i] = (a, gx, gy)
+                reach = max(reach, f)
+            if ok and (best is None or reach < best[0]):
+                best = (reach, plan)
+    if best is None:
+        return False
+
+    state = [(p.cut, p.perf_m, p.perf_v, p.engrave, p.xform) for p in group]
+    for i, (a, gx, gy) in best[1].items():
+        p = group[i]
+        _m, mx0, my0, _Mk = masks[(i, a)]
+        p.rotate(a, origin=p.cut.centroid.coords[0])
+        # mx0/my0 are the mask grid's own origin - see raster_mask
+        p.translate(gx * res - mx0 + mat.sheet_margin,
+                    gy * res - my0 + mat.sheet_margin)
+    after, _ = sheet_equivalents(parts, mat)
+    if after < before - 1e-9:
+        return True
+    for p, st in zip(group, state):     # no better: put it back exactly
+        (p.cut, p.perf_m, p.perf_v, p.engrave, p.xform) = st
+    return False
+
+
+# Extra raster restarts at full packing effort. Each is one raster pack plus
+# the last-sheet pass; only the best of them is tightened, because tighten is
+# the expensive step.
+EFFORT_RESTARTS = 24
+
+
+def pack(parts: list[Part], mat: Material, effort: float = 0.0,
+         progress=None) -> tuple[int, list[Part]]:
     """Pack onto sheets, taking whichever strategy wins on this net.
 
 No strategy dominates. True-shape nesting is far better when parts are small
@@ -857,6 +1068,11 @@ No strategy dominates. True-shape nesting is far better when parts are small
 
     start_state = snap()
     trials = []
+    extra = int(round(max(0.0, min(1.0, effort)) * EFFORT_RESTARTS))
+
+    def report(done, note):
+        return progress is None or progress(done, 3 + extra, note)
+
     for fn in (shelf_pack, nest, raster_pack):
         restore(start_state)
         for p in parts:
@@ -867,10 +1083,41 @@ No strategy dominates. True-shape nesting is far better when parts are small
         # different amounts, so the winner before tightening is not
         # necessarily the winner after it.
         sheets = tighten(parts, sheets, mat)
+        # And pack the last sheet low before comparing, for the same reason.
+        compact_last(parts, mat)
         # Count what is actually off the sheets, not what the strategy owned up
         # to: nest and raster_pack also leave a part unplaced when it passes
         # the size test and still fits no empty sheet, without listing it.
-        trials.append((sheets, sum(1 for p in parts if p.sheet < 0), snap()))
+        trials.append((sheets, sum(1 for p in parts if p.sheet < 0),
+                       sheet_equivalents(parts, mat)[0], snap()))
+        report(len(trials), f"packing: {fn.__name__}")
+
+    # Packing effort: restarts of the raster packer, each with its own
+    # rotation set and a shuffled part order, scored after the last-sheet pass
+    # alone. The best is then tightened and has to beat the three above on
+    # the same terms. On the helmet nothing here beat the tie-break below -
+    # more angles, more orders, finer cells and ruin-and-recreate were all
+    # measured - so effort is offered, not assumed (see CLAUDE.md).
+    restarts = []
+    for k in range(extra):
+        restore(start_state)
+        for p in parts:
+            p.xform = np.eye(3)
+        sheets, _over = raster_pack(parts, mat,
+                                    angles=COMPACT_ANGLE_SETS[k % len(COMPACT_ANGLE_SETS)],
+                                    jitter=np.random.default_rng(k))
+        compact_last(parts, mat)
+        restarts.append((sum(1 for p in parts if p.sheet < 0), sheets,
+                         sheet_equivalents(parts, mat)[0], snap()))
+        if not report(3 + k + 1, f"packing harder {k + 1}/{extra}"):
+            break
+    if restarts:
+        _u, sheets, _e, state = min(restarts, key=lambda t: t[:3])
+        restore(state)
+        sheets = tighten(parts, sheets, mat)
+        compact_last(parts, mat)
+        trials.append((sheets, sum(1 for p in parts if p.sheet < 0),
+                       sheet_equivalents(parts, mat)[0], snap()))
 
     # Parts left off FIRST, sheets second. The other way round, a strategy
     # that gives up on a part reports fewer sheets and wins for it - shelf
@@ -878,8 +1125,16 @@ No strategy dominates. True-shape nesting is far better when parts are small
     # up, called it one sheet, and beat three sheets with everything on.
     # Sheets only count PLACED parts, so a dropped part is not a saving, it is
     # a part that cannot be cut.
-    trials.sort(key=lambda t: (t[1], t[0]))
-    sheets, _, winner = trials[0]
+    #
+    # Then BOARD, which the whole-sheet count cannot see: two strategies that
+    # both need 2 sheets tied, and the tie went to whichever ran first -
+    # shelf packing. On the helmet's 14 pieces that left sheet 1 at 41% with
+    # gaps a reader could see from across the room, where the raster packer
+    # filled it to 59%: 1.59 sheets of board against 1.26. More angles, more
+    # part orders, finer cells and a void-fill pass at 72 angles / 1 mm were
+    # all measured on the same parts and bought nothing on top of this.
+    trials.sort(key=lambda t: (t[1], t[0], t[2]))
+    sheets, _, _eq, winner = trials[0]
     restore(winner)
 
     # A part too big for the bed is never placed, so it keeps whatever

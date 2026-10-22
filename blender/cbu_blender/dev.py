@@ -24,18 +24,30 @@ from . import log
 
 # Dependency order. Leaves first: reloading a module rebinds the names it
 # imported at module level, so anything it depends on must already be fresh.
+# Dependency order: a module is reloaded after everything it imports from, or
+# its `from .x import y` binds the stale y. Every module that is ever loaded
+# must be here - fingers and cost were not, so Reload kept running the old
+# finger code under a freshly reloaded layout (test_dev: "every loaded add-on
+# module is reloaded").
 CORE_MODULES = [
+    "vendor",
     "vendor.cardboard_unfolder.material",
     "vendor.cardboard_unfolder.strokefont",
     "vendor.cardboard_unfolder.mesh",
     "vendor.cardboard_unfolder.unfold",
+    "vendor.cardboard_unfolder.cost",
     "vendor.cardboard_unfolder.folds",
     "vendor.cardboard_unfolder.tabs",
+    "vendor.cardboard_unfolder.fingers",
     "vendor.cardboard_unfolder.layout",
     "vendor.cardboard_unfolder.export",
+    "vendor.cardboard_unfolder.gcode",
     "vendor.cardboard_unfolder",
 ]
-ADDON_MODULES = ["log", "deps", "props", "bridge", "overlay", "ops", "ui", "dev"]
+# build first: it fingerprints the files as they are loaded, so it should
+# describe the code the modules below are about to pick up.
+ADDON_MODULES = ["build", "log", "deps", "props", "bridge", "overlay", "ops",
+                 "ui", "dev"]
 
 
 def _purge_bytecode(pkg_dir: Path) -> int:
@@ -160,10 +172,13 @@ class CBU_OT_debugpy(bpy.types.Operator):
 
 def state_dict(context) -> dict:
     """Everything worth pasting into a bug report."""
-    from . import ops
+    from . import ops, build
     s = context.scene.cbu
     obj = context.active_object
     d = {
+        "build": {"git": build.GIT, "code": build.CODE,
+                  "code_on_disk": build.disk_code(0.0),
+                  "loaded_at": build.LOADED_AT},
         "blender": bpy.app.version_string,
         "python": sys.version.split()[0],
         "platform": sys.platform,

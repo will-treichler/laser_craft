@@ -36,6 +36,9 @@ def main(argv=None) -> int:
                         "so the panels lock together during assembly")
     g.add_argument("--finger-width", type=float, default=None,
                    help="mm per finger (default 15)")
+    g.add_argument("--finger-clearance", type=float, default=None,
+                   help="play between a finger and its notch, mm per side "
+                        "(default 0.05)")
     g.add_argument("--finger-depth", type=float, default=None,
                    help="mm; overrides the default, which is the board "
                         "thickness")
@@ -47,7 +50,7 @@ def main(argv=None) -> int:
                         "is what decides whether a small island can carry a "
                         "label at all")
     g.add_argument("--text-height", type=float, default=None,
-                   help="engraved text height, mm (default 4)")
+                   help="engraved text height, mm (default 3)")
     g.add_argument("--text-min", type=float, default=None,
                    help="never engrave smaller than this, mm (default 2); "
                         "a label that will not fit is left off instead")
@@ -57,6 +60,21 @@ def main(argv=None) -> int:
     g = ap.add_argument_group("machine")
     g.add_argument("--bed", default="600x400", help="bed size WxH in mm")
     g.add_argument("--margin", type=float, help="sheet margin, mm")
+    g.add_argument("--cut", metavar="S,F[,N]",
+                   help="cut power (GRBL S), speed mm/min, passes "
+                        "(default 1000,500,1)")
+    g.add_argument("--score", metavar="S,F[,N]",
+                   help="burn the fold lines at this power, speed, passes "
+                        "(off unless given; e.g. 250,1000 - untested as a "
+                        "score)")
+    g.add_argument("--engrave", metavar="S,F[,N]",
+                   help="label power, speed, passes (default 250,1000,1)")
+    g.add_argument("--laser-max", type=float,
+                   help="GRBL $30, the S value of full power (default 1000)")
+    g.add_argument("--air", action="store_true",
+                   help="air assist on (M8/M9) for cuts and scores")
+    g.add_argument("--no-gcode", action="store_true",
+                   help="skip the per-sheet .nc files")
 
     g = ap.add_argument_group("unfolding")
     g.add_argument("--trials", type=int, default=250,
@@ -65,6 +83,11 @@ def main(argv=None) -> int:
                    help="change this if a net comes out badly pinched")
     g.add_argument("--no-merge", action="store_true",
                    help="keep the original triangles instead of merging coplanar faces")
+    g.add_argument("--flat-tol", type=float, default=None,
+                   help="mm: a separate piece within this of one plane is cut "
+                        "as the flat shape it is (default 3; negative = never)")
+    g.add_argument("--min-bend", type=float, default=None,
+                   help="degrees: folds bending less are left uncut (default 1)")
     g.add_argument("--no-dxf", action="store_true")
     g.add_argument("--preview", action="store_true", help="also write PNG previews")
     a = ap.parse_args(argv)
@@ -93,9 +116,34 @@ def main(argv=None) -> int:
         mat.label_min_height = a.text_min
     if a.no_fold_marks:
         mat.label_folds = False
+    for op in ("cut", "score", "engrave"):
+        v = getattr(a, op)
+        if v is None:
+            continue
+        try:
+            nums = [float(x) for x in v.split(",")]
+            assert len(nums) in (2, 3)
+        except (ValueError, AssertionError):
+            ap.error(f"--{op} wants power,speed[,passes], e.g. 1000,500,2 "
+                     f"(got {v!r})")
+        if op == "score":
+            mat.score_folds = True
+        setattr(mat, f"{op}_power", nums[0])
+        setattr(mat, f"{op}_speed", nums[1])
+        if len(nums) == 3:
+            setattr(mat, f"{op}_passes", int(nums[2]))
+    if a.laser_max is not None:
+        mat.laser_max = a.laser_max
+    mat.air_assist = a.air
+    if a.flat_tol is not None:
+        mat.flat_tol = a.flat_tol if a.flat_tol >= 0 else None
+    if a.min_bend is not None:
+        mat.min_bend = a.min_bend
     mat.use_fingers = a.fingers
     if a.finger_width is not None:
         mat.finger_width = a.finger_width
+    if a.finger_clearance is not None:
+        mat.finger_clearance = a.finger_clearance
     if a.finger_depth is not None:
         mat.finger_depth_override = True
         mat.finger_depth = a.finger_depth
@@ -106,7 +154,7 @@ def main(argv=None) -> int:
 
     rep = run(a.mesh, a.out, mat, height_mm=a.height, scale=a.scale,
               trials=a.trials, seed=a.seed, merge_coplanar=not a.no_merge,
-              dxf=not a.no_dxf)
+              dxf=not a.no_dxf, gcode=not a.no_gcode)
 
     if a.preview:
         print("(preview needs matplotlib; re-run without --preview if it is missing)")

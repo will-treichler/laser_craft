@@ -22,6 +22,7 @@ Two corrections theory doesn't give you:
     demands 2.0t. Hence the crush factor, default 0.75. This one is empirical.
 """
 from __future__ import annotations
+import math
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -138,7 +139,7 @@ def perf_segments(a: np.ndarray, b: np.ndarray, mat: Material,
 class FoldPlan:
     fold: Fold
     width: float                # relief opening, mm (0 if perf-only)
-    style: str                  # "perf" | "relief"
+    style: str                  # "perf" | "relief" | "flat" (no cut at all)
     slot: Polygon | None        # material to remove (bridges already subtracted)
     perf: list                  # [(p,q), ...] dashed segments on remaining material
     warn: str = ""
@@ -197,6 +198,14 @@ def plan_folds(island: Island, mat: Material) -> list[FoldPlan]:
     plans = []
     flute = flute_warning(mat)
     for f in island.folds:
+        # A fold that barely bends is not a fold to the board. Without this a
+        # face the coplanar merge cannot rebuild - a flat ring, which would
+        # need a hole - keeps every triangle diagonal as a "fold", and each
+        # is scored: 56 zero-degree folds on the annulus caps, 6 m of
+        # perforation across a flat 300 mm border.
+        if abs(f.bend) < math.radians(mat.min_bend):
+            plans.append(FoldPlan(f, 0.0, "flat", None, []))
+            continue
         w = relief_width(f.bend, mat)
         warn = flute
         if w > mat.max_relief:
@@ -204,7 +213,13 @@ def plan_folds(island: Island, mat: Material) -> list[FoldPlan]:
                     f"{np.degrees(abs(f.bend)):.0f} deg - use a double score here")
             w = mat.max_relief
 
-        if w < mat.relief_threshold:
+        # The threshold is for the ADAPTIVE width only. A fixed width is the
+        # width the user asked the machine to cut, so it is cut however thin;
+        # applying the threshold to it turned a fixed 1 mm slot into a
+        # perforation - and, with fold scoring off, into nothing at all.
+        small = (w < mat.relief_threshold if mat.relief_adaptive
+                 else w <= 0.0)
+        if small:
             plans.append(FoldPlan(f, w, "perf", None, perf_segments(f.a, f.b, mat), warn))
             continue
 
@@ -238,6 +253,93 @@ def apply_relief(outline, plans: list[FoldPlan], grid: float = 1e-9):
         return outline
     cut = shapely.set_precision(unary_union(slots), grid)
     return shapely.set_precision(outline, grid).difference(cut)
+
+
+# The widest opening that still counts as a sharp corner, degrees. A slit
+# whose sides meet at more than this has room for the boards to close without
+# crushing. A judgement, deliberately not exposed: one switch is enough.
+SHARP_OPENING = 90.0
+
+
+def sharp_seam_corners(island, body, rho: float = 0.25) -> list:
+    """Sharp concave corners where a cut seam ends, as (point, into) pairs.
+
+    `into` is the unit direction from the corner into the board, along the
+    bisector. A corner is read by sampling a small circle round it against
+    `body`: more than half board is concave, and the empty arc is the
+    opening. Sampling rather than angle arithmetic, because the outline has
+    been unioned from independently placed faces and the ring may not visit
+    the corner exactly once.
+    """
+    ang = np.linspace(0.0, 2.0 * np.pi, 144, endpoint=False)
+    dirs = np.column_stack([np.cos(ang), np.sin(ang)])
+    seen, out = set(), []
+    for c in island.cuts:
+        if c.seam < 0:
+            continue
+        for p in (np.asarray(c.a, float), np.asarray(c.b, float)):
+            key = (round(p[0], 6), round(p[1], 6))
+            if key in seen:
+                continue
+            seen.add(key)
+            pts = p + rho * dirs
+            inside = shapely.contains_xy(body, pts[:, 0], pts[:, 1])
+            frac = float(inside.mean())
+            if frac <= 0.5 or frac >= 1.0:
+                continue                         # convex, or not on the edge
+            if 360.0 * (1.0 - frac) >= SHARP_OPENING:
+                continue
+            gap = dirs[~inside].mean(axis=0)
+            n = np.linalg.norm(gap)
+            if n < 1e-12:
+                continue
+            out.append((p, -gap / n))
+    return out
+
+
+HOLE_SEGS = 16          # quarter-circle segments of a corner hole
+
+
+def hole_disc(p, r: float) -> Polygon:
+    """A corner hole: a polygon CIRCUMSCRIBING the circle of radius r, not
+    inscribed in it. A notch bottom tangent to the true circle would
+    otherwise stand a hair inside the polygon's chords and leave a sliver
+    of board along the tangent - the spike, only thinner."""
+    return Point(p).buffer(r / np.cos(np.pi / (4 * HOLE_SEGS)),
+                           quad_segs=HOLE_SEGS)
+
+
+def apply_corner_holes(island, body, size: float, grid: float = 1e-9):
+    """Cut a round hole `size` across, centred ON the vertex, at each sharp
+    seam corner. Returns (body, the centres actually cut).
+
+    Centred on the vertex - the user's call, after a first version that set a
+    teardrop just past it - because the vertex is exactly where the boards
+    meet, and because the fingers are let run back to the hole's edge
+    (`place_fingers(holes=...)`), which needs the hole to be where the seam
+    ends. A hole that would split the part is dropped, like a corner_relief
+    slit: a narrow neck can be held by nothing but the board it removes.
+    """
+    r = size / 2.0
+    corners = [p for p, _into in sharp_seam_corners(island, body)]
+    if not corners:
+        return body, []
+    holes = [hole_disc(p, r) for p in corners]
+
+    def pieces(g):
+        return len(getattr(g, "geoms", [g]))
+
+    n0 = pieces(body)
+    out = shapely.set_precision(body.difference(unary_union(holes)), grid)
+    if pieces(out) == n0:
+        return out, corners
+    kept = []
+    for p, h in zip(corners, holes):   # one at a time, keeping the safe ones
+        trial = shapely.set_precision(body.difference(h), grid)
+        if pieces(trial) == n0:
+            body = trial
+            kept.append(p)
+    return body, kept
 
 
 def corner_relief(body, cut, kerf: float, overcut: float = 0.0,

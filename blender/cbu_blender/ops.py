@@ -10,13 +10,202 @@ import bmesh
 import bpy
 import numpy as np
 from bpy.props import BoolProperty, EnumProperty
+from mathutils import Vector
 
 from . import bridge, overlay
 from . import log as cbulog
 from .props import material_from
 
 _LAST = {}          # object name -> (pm, islands, parts, sheets, report)
+# object name -> every object name solved and packed with it, itself included.
+# Its parts in _LAST are its own; the sheets are shared with the rest.
+_GROUP = {}
 LAST_TIMINGS = cbulog.Timings()
+
+# The settings a solve reads: the mesh as built (merge, scale, transform),
+# the bed-split limit (bed, margin, and the tab and kerf allowance), and the
+# search itself. Everything else - fingers, holes, tabs, relief, labels - only
+# shapes the parts, so Refresh can apply it to the net already in hand.
+UNFOLD_KEYS = ("merge_coplanar", "merge_tol", "mm_per_unit", "apply_transform",
+               "size_mode", "target_height", "yardstick_length", "flat_tol",
+               "limit_to_bed", "bed_x", "bed_y", "margin",
+               "tab_depth", "kerf", "trials", "seed", "budget")
+# Inputs to a solve that are not settings: which objects were cut together,
+# and how long the yardstick was in the scene. Named as the panel would.
+EXTRA_KEYS = {"objects": "Objects", "yardstick_mm": "Yardstick"}
+_SOLVED_WITH = {}   # object name -> {key: value} as the last solve read them
+
+
+def unfold_settings(s, obj=None) -> dict:
+    out = {k: getattr(s, k) for k in UNFOLD_KEYS}
+    if obj is not None:
+        out["objects"] = job_names(s, obj)
+    if s.size_mode == "YARDSTICK":
+        out["yardstick_mm"] = _yardstick_or_none(s)
+    return out
+
+
+def setting_labels(s, keys) -> str:
+    """The panel's own names for some settings - "Bed X", not "bed_x"."""
+    return ", ".join(EXTRA_KEYS[k] if k in EXTRA_KEYS
+                     else s.bl_rna.properties[k].name for k in keys)
+
+
+def _current(s, obj, k):
+    if k == "objects":
+        return job_names(s, obj)
+    if k == "yardstick_mm":
+        return _yardstick_or_none(s)
+    return getattr(s, k)
+
+
+def unfold_settings_changed(obj, s) -> list:
+    """Names of the solve's settings that have changed since `obj` was last
+    unfolded - what a Refresh cannot apply."""
+    was = _SOLVED_WITH.get(obj.name) if obj is not None else None
+    if was is None:
+        return []
+    out = []
+    for k in was:
+        a, b = _current(s, obj, k), was[k]
+        if isinstance(a, float) and isinstance(b, float):
+            moved = abs(a - b) > 1e-6 * max(1.0, abs(b))
+        else:
+            moved = a != b
+        if moved:
+            out.append(k)
+    return out
+
+
+# ------------------------------------------------------- what is cut, how big
+
+def job_objects(context):
+    """The objects cut together: the saved list, or the active object when
+    the list is empty. Returns (objects, error). The yardstick is never cut,
+    even when it is in the list."""
+    s = context.scene.cbu
+    stick = s.yardstick
+    listed = [it.obj for it in s.job if it.obj is not None]
+    if listed:
+        objs = []
+        for o in listed:
+            if (o.type == "MESH" and o != stick and o not in objs
+                    and context.scene.objects.get(o.name) is not None):
+                objs.append(o)
+        if not objs:
+            return [], ("the list has nothing to cut - the yardstick never is, "
+                        "and deleted objects are skipped")
+    else:
+        o = context.active_object
+        if o is None or o.type != "MESH":
+            return [], "select a mesh object"
+        if o == stick:
+            return [], ("that is the yardstick, which is never cut - select "
+                        "the model")
+        objs = [o]
+    for o in objs:
+        if len(o.data.polygons) == 0:
+            return [], f"{o.name} has no faces"
+    return objs, None
+
+
+def job_ref(context):
+    """The object Re-pack, Refresh, Export and the panel act for: the first
+    cut object in the list, or the active object. Not simply the active
+    object - right after Add Yardstick that is the stick."""
+    s = context.scene.cbu
+    for it in s.job:
+        o = it.obj
+        if o is not None and o.type == "MESH" and o != s.yardstick:
+            return o
+    obj = context.active_object
+    return obj if obj is not None and obj.type == "MESH" else None
+
+
+def job_names(s, obj) -> tuple:
+    """Who `obj` would be cut with now - for the staleness check, which has
+    no context to hand. Same rule as job_objects, by name."""
+    stick = s.yardstick
+    listed = [it.obj.name for it in s.job
+              if it.obj is not None and it.obj.type == "MESH"
+              and it.obj != stick]
+    if listed:
+        return tuple(dict.fromkeys(listed))
+    return (obj.name,) if obj is not None else ()
+
+
+def _yardstick_or_none(s):
+    try:
+        return bridge.yardstick_mm(s.yardstick, s.mm_per_unit,
+                                   s.apply_transform)
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def object_mode(context, objs) -> bool:
+    """Every object in `objs`, and the yardstick, in Object Mode - not just
+    the active one. Returns whether the active object was in Edit Mode, to
+    put it back after.
+
+    An object in Edit Mode keeps its live data in a BMesh and its mesh's
+    attribute and UV arrays read as EMPTY - `foreach_set(..) given 228,
+    needed 0`. With a list, the active object need not be one of the
+    objects cut: Add Yardstick from Edit Mode used to leave the model in Edit
+    Mode with the stick active, and taking only the active object out of it
+    then left the model's mesh unreadable."""
+    was_edit = context.mode == "EDIT_MESH"
+    if context.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    stuck = [o for o in list(objs) + [context.scene.cbu.yardstick]
+             if o is not None and o.mode != "OBJECT"]
+    if stuck:
+        vl = context.view_layer
+        active = vl.objects.active
+        try:
+            for o in stuck:
+                vl.objects.active = o
+                bpy.ops.object.mode_set(mode="OBJECT")
+        finally:
+            vl.objects.active = active
+    return was_edit
+
+
+def size_factor(s, pms) -> float:
+    """ONE scale for everything cut together, so the pieces keep their sizes
+    relative to each other: a border modelled to fit a helmet's rim still
+    fits it. Height is measured over all of them; the yardstick is measured
+    exactly as the model is (same transform, same mm per unit)."""
+    if s.size_mode == "YARDSTICK":
+        if s.yardstick is None:
+            raise ValueError("Size by Yardstick, but no yardstick is set - "
+                             "Add Yardstick, or pick one in Machine & Size")
+        got = bridge.yardstick_mm(s.yardstick, s.mm_per_unit,
+                                  s.apply_transform)
+        return s.yardstick_length / got
+    if s.target_height > 0:
+        lo = min(float(pm.vertices[:, 2].min()) for pm in pms)
+        hi = max(float(pm.vertices[:, 2].max()) for pm in pms)
+        if hi - lo < 1e-9:
+            raise ValueError("nothing being cut has any height along Z - "
+                             "set Height to 0, or use a yardstick")
+        return s.target_height / (hi - lo)
+    return 1.0
+
+
+def job_material(s, obj, objs):
+    """The object's Material. With several objects a typed Model ID gets a
+    letter each (HELMA, HELMB), because island numbers restart per object
+    and two pieces both stamped HELM-0 are the problem the id solves."""
+    mat = material_from(s, obj)
+    tag = (s.model_id or "").strip()
+    if tag and len(objs) > 1:
+        mat.model_id = tag + chr(ord("A") + objs.index(obj) % 26)
+    return mat
+
+
+def group_of(name) -> tuple:
+    """Everything `name` was last packed with, itself included."""
+    return _GROUP.get(name, (name,))
 
 
 def _core():
@@ -30,15 +219,6 @@ def _core():
     return (importlib.import_module(base + ".unfold"),
             importlib.import_module(base + ".layout"),
             importlib.import_module(base + ".export"))
-
-
-def _active_mesh(context):
-    obj = context.active_object
-    if obj is None or obj.type != "MESH":
-        return None, "select a mesh object"
-    if len(obj.data.polygons) == 0:
-        return None, "mesh has no faces"
-    return obj, None
 
 
 # --------------------------------------------------------------- marking
@@ -123,17 +303,26 @@ def publish_cuts(obj, parts, mat, pm=None, islands=None):
         # in the exported parts, exactly like the tabs - so without this the 2D
         # view shows no seam numbers, no M/V and no model id, and the first
         # place they appear is the SVG.
-        labels = []
-        eng = part.engrave
-        if eng is not None and not eng.is_empty:
-            for ln in getattr(eng, "geoms", [eng]):
-                pts = np.asarray(ln.coords)
-                if len(pts) >= 2:
-                    labels.append(pts @ inv[:2, :2].T + inv[:2, 2])
+        def lines(*geoms):
+            out = []
+            for g in geoms:
+                if g is None or g.is_empty:
+                    continue
+                for ln in getattr(g, "geoms", [g]):
+                    pts = np.asarray(ln.coords)
+                    if len(pts) >= 2:
+                        out.append(pts @ inv[:2, :2].T + inv[:2, 2])
+            return out
+        labels = lines(part.engrave)
+        # The fold score lines, published whether or not they are burned:
+        # the overlay draws them only while Score folds is on, so the switch
+        # shows and hides them without a Refresh.
+        scores = lines(part.perf_m, part.perf_v)
         if rings:
             groups.append({"refs": [int(loop_idx[0]), int(loop_idx[j])],
                            "ref_pts": (src_pts[0], src_pts[j]),
-                           "rings": rings, "labels": labels})
+                           "rings": rings, "labels": labels,
+                           "scores": scores})
     overlay.set_net_cuts(obj.name, groups)
     # Resolve them straight away. The cache is what the draw handler reads, and
     # it is only otherwise filled on a depsgraph update - so without this the
@@ -405,6 +594,15 @@ class CBU_OT_select_marked(bpy.types.Operator):
 RUNNING = None
 
 
+class Member:
+    """One object's share of a Solve: its mesh, its search settings, its
+    Material (the model id differs per object), and what came back."""
+
+    def __init__(self, name, pm, kwargs, mat):
+        self.name, self.pm, self.kwargs, self.mat = name, pm, kwargs, mat
+        self.islands = self.rep = self.parts = None
+
+
 class Solve:
     """The bpy-free half of an unfold, packaged so it can run off the main
     thread while the operator keeps taking events.
@@ -422,17 +620,33 @@ class Solve:
     already better than the old rule's answer.
     """
 
-    def __init__(self, U, pm, kwargs, L=None, mat=None, timings=None):
-        self.U, self.pm, self.kwargs = U, pm, kwargs
-        self.L, self.mat, self.T = L, mat, timings
-        self.islands = self.rep = self.error = None
-        self.parts = self.sheets = self.oversized = None
+    def __init__(self, U, pm, kwargs, L=None, mat=None, timings=None,
+                 members=None):
+        # One Member per object cut together; the arguments describe the
+        # first, which is all a single-object solve (or a test) ever has.
+        self.members = members or [Member(None, pm, kwargs, mat)]
+        self.U, self.L, self.mat, self.T = U, L, mat, timings
+        self.error = None
+        self.sheets = self.oversized = None
         self.done = self.total = 0
         self.note = ""
         self.started = time.monotonic()
         self.finished = None
         self._stop = False
         self.ui = None          # optional main-thread callback, set by the caller
+
+    # The single-object view, for callers that only ever had one.
+    pm = property(lambda self: self.members[0].pm)
+    kwargs = property(lambda self: self.members[0].kwargs)
+    islands = property(lambda self: self.members[0].islands)
+    rep = property(lambda self: self.members[0].rep)
+
+    @property
+    def parts(self):
+        """Every member's parts - what was packed together."""
+        if any(m.parts is None for m in self.members):
+            return None
+        return [p for m in self.members for p in m.parts]
 
     @property
     def fraction(self) -> float:
@@ -470,16 +684,26 @@ class Solve:
         the moment it looked finished.
         """
         try:
-            with _stage(self.T, "unfold"):
-                self.islands, self.rep = self.U.unfold(
-                    self.pm, progress=self.progress, **self.kwargs)
+            many = len(self.members) > 1
+            for m in self.members:
+                # Each object unfolds on its own - they share no edge, so
+                # nothing one decides can matter to another - and only the
+                # packing is shared. The note says whose search is running.
+                def hook(done, total, note, _m=m):
+                    return self.progress(
+                        done, total, f"{_m.name}: {note}" if many else note)
+                with _stage(self.T, "unfold"):
+                    m.islands, m.rep = self.U.unfold(m.pm, progress=hook,
+                                                     **m.kwargs)
             if self.L is not None and self.mat is not None:
                 # No per-part hook in the packer, so this phase has a label and
                 # an elapsed time rather than a moving bar - still better than
                 # a bar sitting at 100% while nothing appears to happen.
                 self.done, self.total, self.note = 0, 0, "packing sheets"
                 with _stage(self.T, "parts"):
-                    self.parts = self.L.build_parts(self.islands, self.mat)
+                    for m in self.members:
+                        m.parts = self.L.build_parts(m.islands,
+                                                     m.mat or self.mat)
                 with _stage(self.T, "pack"):
                     self.sheets, self.oversized = self.L.pack(self.parts,
                                                               self.mat)
@@ -516,8 +740,11 @@ class _Unfold:
 
     @classmethod
     def poll(cls, context):
-        return (RUNNING is None
-                and context.active_object is not None
+        if RUNNING is not None:
+            return False
+        if any(it.obj is not None for it in context.scene.cbu.job):
+            return True
+        return (context.active_object is not None
                 and context.active_object.type == "MESH")
 
     def execute(self, context):
@@ -637,51 +864,72 @@ class _Unfold:
         Returns a Solve, or None after reporting why not. Kept apart from
         `apply` so the solve between them can run on a worker thread.
         """
-        obj, err = _active_mesh(context)
+        objs, err = job_objects(context)
         if err:
             self.report({"ERROR"}, err)
             return None
 
-        self.was_edit = context.mode == "EDIT_MESH"
-        if self.was_edit:
-            bpy.ops.object.mode_set(mode="OBJECT")
+        self.was_edit = object_mode(context, objs)
 
         s = context.scene.cbu
-        mat = material_from(s, obj)
         U, L, _ = _core()
         log = cbulog.get()
         T = cbulog.Timings()
         LAST_TIMINGS.clear()
-        self.obj_name = obj.name
-        self.mat = mat
+        names = [o.name for o in objs]
+        self.obj_name = names[0]
+        self.names = names
+        mats = [job_material(s, o, objs) for o in objs]
+        self.mat = mat = mats[0]
+        self.mats = dict(zip(names, mats))
         self.T = T
+        # read now, not when the solve lands: a long Optimise outlives edits
+        self.solved_with = unfold_settings(s, objs[0])
+        self.solved_with["objects"] = tuple(names)
+        if self.optimising:
+            # only an Optimise read it, so only then can it go stale
+            self.solved_with["board_bias"] = s.board_bias
         try:
             with cbulog.stage(T, "read mesh"):
-                pm = bridge.polymesh_from_object(
-                    obj, merge_coplanar=s.merge_coplanar,
+                pms = [bridge.polymesh_from_object(
+                    o, merge_coplanar=s.merge_coplanar,
                     mm_per_unit=s.mm_per_unit,
                     apply_transform=s.apply_transform, tol_deg=s.merge_tol)
-                if s.target_height > 0:
-                    pm = pm.scale_to_height(s.target_height)
-            log.info("mesh: %d face(s), %d vert(s), extents %s mm",
-                     len(pm.faces), len(pm.vertices), pm.extents.round(1))
+                    for o in objs]
+                k = size_factor(s, pms)
+                if k != 1.0:
+                    pms = [pm.scale(k) for pm in pms]
+            self.scale = k
+            for o, pm in zip(objs, pms):
+                log.info("%s: %d face(s), %d vert(s), extents %s mm", o.name,
+                         len(pm.faces), len(pm.vertices), pm.extents.round(1))
 
             with cbulog.stage(T, "check"):
-                problems = pm.check()
+                problems = [(f"{o.name}: {p}" if len(objs) > 1 else p)
+                            for o, pm in zip(objs, pms) for p in pm.check()]
             for p in problems:
                 log.warning("%s", p)
                 self.report({"WARNING"}, p)
-
-            cuts, folds = bridge.read_constraints(obj.data)
-            if cuts or folds:
-                log.info("constraints: %d forced cut(s), %d forced fold(s)",
-                         len(cuts), len(folds))
 
             limit = None
             if s.limit_to_bed:
                 pad = 2 * mat.tab_depth + 2 * mat.kerf
                 limit = (mat.usable_bed[0] - pad, mat.usable_bed[1] - pad)
                 log.debug("island size limit %.1f x %.1f mm", *limit)
+
+            members = []
+            for o, pm, m in zip(objs, pms, mats):
+                cuts, folds = bridge.read_constraints(o.data)
+                if cuts or folds:
+                    log.info("%s constraints: %d forced cut(s), %d forced "
+                             "fold(s)", o.name, len(cuts), len(folds))
+                members.append(Member(o.name, pm, dict(
+                    trials=s.trials, seed=s.seed, max_size=limit,
+                    forced_cuts=cuts, forced_folds=folds,
+                    splinter_width=m.splinter_width,
+                    mat=m if self.optimising else None, budget=s.budget,
+                    board_bias=s.board_bias if self.optimising else 0.0,
+                    flat_tol=m.flat_tol), m))
 
         except Exception as exc:                       # noqa: BLE001
             traceback.print_exc()
@@ -697,74 +945,75 @@ class _Unfold:
         # its own thread, so remember what it looked like and check on the way
         # back out. The solve itself is safe either way - it holds a PolyMesh
         # copy - but writing a net onto geometry that has moved is not.
-        self.fingerprint = overlay.geometry_fingerprint(obj.data)
-        return Solve(U, pm, dict(
-            trials=s.trials, seed=s.seed, max_size=limit,
-            forced_cuts=cuts, forced_folds=folds,
-            splinter_width=mat.splinter_width,
-            mat=mat if self.optimising else None, budget=s.budget),
-            L=L, mat=mat, timings=T)
+        self.fingerprints = {o.name: overlay.geometry_fingerprint(o.data)
+                             for o in objs}
+        return Solve(U, members[0].pm, members[0].kwargs, L=L, mat=mat,
+                     timings=T, members=members)
 
     def apply(self, context, job):
         """Everything that touches Blender data, after the solve."""
-        obj = bpy.data.objects.get(self.obj_name)
         s = context.scene.cbu
         mat = self.mat
-        _U, L, _ = _core()
         log = cbulog.get()
         T = self.T
         try:
-            if obj is None or obj.type != "MESH":
-                raise RuntimeError("the object went away while unfolding")
+            objs = [bpy.data.objects.get(n) for n in self.names]
+            if any(o is None or o.type != "MESH" for o in objs):
+                raise RuntimeError("an object went away while unfolding")
             if job.error is not None:
                 raise job.error
-            if overlay.geometry_fingerprint(obj.data) != self.fingerprint:
-                raise RuntimeError(
-                    "the mesh changed while unfolding - run Unfold again")
-            pm, islands, rep = job.pm, job.islands, job.rep
+            for o in objs:
+                if overlay.geometry_fingerprint(o.data) != self.fingerprints[o.name]:
+                    raise RuntimeError(f"{o.name} changed while unfolding - "
+                                       f"run Unfold again")
             if job.parts is None:
                 raise RuntimeError("the solve finished without packing - "
                                    "this is a bug, not a setting")
-            parts, sheets, oversized = job.parts, job.sheets, job.oversized
-            for isl in islands:
-                log.debug("island %d: %d face(s), %.0f x %.0f mm, %.0f mm2",
-                          isl.id, len(isl.faces), *isl.size(), isl.area())
+            sheets, oversized = job.sheets, job.oversized
+            group = tuple(self.names)
+            _regroup(group)
             with cbulog.stage(T, "write mesh"):
-                bridge.write_islands(obj.data, pm, islands)
-                # rows one usable-sheet wide, so the preview lines up with the
-                # bed reference drawn underneath it
-                # lay the net out exactly where packing put it, so the bed
-                # reference under it is the truth and not a decoration
-                bridge.write_net_uv(obj.data, pm, islands,
-                                    scale=bridge.uv_scale(*mat.bed),
-                                    placement={p.island_id: p for p in parts},
-                                    sheet_size=mat.bed)
-                overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
-                                       sheets=sheets)
-                publish_cuts(obj, parts, mat, pm, islands)
+                for o, m in zip(objs, job.members):
+                    for isl in m.islands:
+                        log.debug("%s island %d: %d face(s), %.0f x %.0f mm, "
+                                  "%.0f mm2", o.name, isl.id, len(isl.faces),
+                                  *isl.size(), isl.area())
+                    bridge.write_islands(o.data, m.pm, m.islands)
+                    _write_member(o, m.pm, m.islands, m.parts, sheets, mat,
+                                  group)
+                    _LAST[o.name] = (m.pm, m.islands, m.parts, sheets, m.rep)
+                    _SOLVED_WITH[o.name] = self.solved_with
                 try:
                     from .props import apply_blender_grid
                     apply_blender_grid(s, context)
                 except Exception:                       # noqa: BLE001
                     pass            # a view setting must never fail an unfold
 
-            _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             with cbulog.stage(T, "overlay"):
-                overlay.rebuild(obj, pm, islands, s.overlay_alpha)
+                for o, m in zip(objs, job.members):
+                    overlay.rebuild(o, m.pm, m.islands, s.overlay_alpha)
             LAST_TIMINGS.update(T)
             s.last_timings = T.report()
             log.info("timings: %s", s.last_timings)
 
-            s.last_islands = rep["islands"]
+            reps = [m.rep for m in job.members]
+            rep = reps[0]
+            n_isl = sum(r["islands"] for r in reps)
+            s.last_islands = n_isl
             s.last_sheets = sheets
+            flats = sum(r.get("flat_pieces", 0) for r in reps)
             s.last_report = (
-                f"{rep['islands']} island(s) - {sheets} sheet(s) - "
-                f"isometry {rep['isometry_error']:.0e} - "
-                f"{rep['trials_used']} trial(s), {rep['extra_cuts']} repair, "
-                f"{rep['size_splits']} bed split(s)")
-            warns = [w for p in parts for w in p.warnings]
+                (f"{len(objs)} objects - " if len(objs) > 1 else "")
+                + f"{n_isl} island(s) - {sheets} sheet(s) - "
+                f"isometry {max(r['isometry_error'] for r in reps):.0e} - "
+                f"{sum(r['trials_used'] for r in reps)} trial(s), "
+                f"{sum(r['extra_cuts'] for r in reps)} repair, "
+                f"{sum(r['size_splits'] for r in reps)} bed split(s)"
+                + (f" - {flats} flat piece(s)" if flats else "")
+                + (f" - scale x{self.scale:.4g}" if self.scale != 1.0 else ""))
+            warns = [w for p in job.parts for w in p.warnings]
             warns += [f"{len(oversized)} part(s) larger than the bed"] if oversized else []
-            warns += rep.get("notes", [])
+            warns += [n for r in reps for n in r.get("notes", [])]
             s.last_warnings = " | ".join(warns[:4])
             for w in warns[:6]:
                 self.report({"WARNING"}, w)
@@ -773,9 +1022,11 @@ class _Unfold:
             s.last_elapsed = job.elapsed
             if self.optimising:
                 n, m = rep.get("candidates"), rep.get("mended")
+                frac = rep.get("split_frac", 1.0)
                 s.last_detail = (
                     ("stopped early - " if job.stopping else "")
                     + f"best of {n} candidate(s), {m} mended"
+                    + (f", pieces {frac:.0%} of bed" if frac < 1.0 else "")
                     if n is not None else "")
             else:
                 s.last_detail = ""
@@ -794,6 +1045,67 @@ class _Unfold:
             if self.was_edit:
                 bpy.ops.object.mode_set(mode="EDIT")
         return {"FINISHED"}
+
+
+def _regroup(names) -> None:
+    """`names` are packed together now. Anything they were packed with
+    before and are not now keeps its own layout - still valid, its parts did
+    not move - but must stop re-packing them, or a Re-pack there would drag
+    them back onto its sheets."""
+    names = tuple(names)
+    for n in names:
+        for old in _GROUP.get(n, ()):
+            if old not in names:
+                rest = tuple(x for x in _GROUP.get(old, ()) if x not in names)
+                _GROUP[old] = rest or (old,)
+                overlay.set_companions(old, [x for x in rest if x != old])
+
+
+def _write_member(obj, pm, islands, parts, sheets, mat, group) -> None:
+    """Write one object's share of a packing back to it: the net UVs where
+    its parts landed on the shared sheets, the bed, and the cut outline."""
+    bridge.write_net_uv(obj.data, pm, islands,
+                        scale=bridge.uv_scale(*mat.bed),
+                        placement={p.island_id: p for p in parts},
+                        sheet_size=mat.bed)
+    overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
+                           sheets=sheets)
+    publish_cuts(obj, parts, mat, pm, islands)
+    _GROUP[obj.name] = tuple(group)
+    overlay.set_companions(obj.name, [n for n in group if n != obj.name])
+
+
+def pack_group(context, names, effort=0.0, progress=None, islands=None):
+    """Rebuild every member's parts from its islands and pack them all onto
+    one set of sheets - Re-pack, Refresh and a seam edit all go through here,
+    so editing one object never takes it off the sheets it shares.
+
+    `islands` overrides one member's islands ({name: islands}), for a seam
+    edit that has not been stored yet. Returns (sheets, oversized). The
+    caller has already left Edit Mode: UV data is empty there.
+    """
+    s = context.scene.cbu
+    _U, L, _ = _core()
+    objs = [bpy.data.objects.get(n) for n in names]
+    missing = [n for n, o in zip(names, objs)
+               if o is None or n not in _LAST]
+    if missing:
+        raise RuntimeError(f"{', '.join(missing)} changed or went away since "
+                           f"the unfold - run Unfold again")
+    held = []
+    for o in objs:
+        pm, isl, _parts, _sh, rep = _LAST[o.name]
+        isl = (islands or {}).get(o.name, isl)
+        m = job_material(s, o, objs)
+        held.append((o, pm, isl, rep, m, L.build_parts(isl, m)))
+    mat = held[0][4]
+    _regroup(names)
+    allparts = [p for h in held for p in h[5]]
+    sheets, oversized = L.pack(allparts, mat, effort=effort, progress=progress)
+    for o, pm, isl, rep, m, parts in held:
+        _write_member(o, pm, isl, parts, sheets, mat, names)
+        _LAST[o.name] = (pm, isl, parts, sheets, rep)
+    return sheets, oversized
 
 
 def _redraw_panels(context) -> None:
@@ -947,21 +1259,16 @@ class CBU_OT_edit_seam(bpy.types.Operator):
             return {"CANCELLED"}
 
         s = context.scene.cbu
-        mat = material_from(s, obj)
-        bpy.ops.object.mode_set(mode="OBJECT")
+        object_mode(context, [o for o in (bpy.data.objects.get(n)
+                                          for n in group_of(obj.name))
+                              if o is not None])
         try:
-            parts = L.build_parts(islands, mat)
-            sheets, _over = L.pack(parts, mat)
+            # The whole group re-packs: the sheets are shared, so packing
+            # this object alone would put it on top of the others' parts.
+            sheets, _over = pack_group(context, group_of(obj.name),
+                                       islands={obj.name: islands})
             bridge.write_islands(obj.data, pm, islands)
-            bridge.write_net_uv(obj.data, pm, islands,
-                                scale=bridge.uv_scale(*mat.bed),
-                                placement={p.island_id: p for p in parts},
-                                sheet_size=mat.bed)
-            _LAST[obj.name] = (pm, islands, parts, sheets, rep)
             overlay.rebuild(obj, pm, islands, s.overlay_alpha)
-            overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
-                                   sheets=sheets)
-            publish_cuts(obj, parts, mat, pm, islands)
         except Exception as exc:                        # noqa: BLE001
             traceback.print_exc()
             self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
@@ -969,11 +1276,11 @@ class CBU_OT_edit_seam(bpy.types.Operator):
         finally:
             bpy.ops.object.mode_set(mode="EDIT")
 
-        s.last_islands = len(islands)
+        s.last_islands = sum(len(_LAST[n][1]) for n in group_of(obj.name))
         s.last_sheets = sheets
         self.report({"INFO"},
-                    f"detached {done} piece(s) - {len(islands)} island(s), "
-                    f"{sheets} sheet(s)")
+                    f"{'detached' if self.mode == 'CUT' else 'welded'} "
+                    f"{done} - {len(islands)} island(s), {sheets} sheet(s)")
         return {"FINISHED"}
 
 
@@ -986,34 +1293,36 @@ class CBU_OT_repack(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
+        obj = job_ref(context)
         return obj is not None and obj.name in _LAST
 
     def execute(self, context):
-        obj = context.active_object
+        obj = job_ref(context)
         s = context.scene.cbu
-        mat = material_from(s, obj)
-        _, L, _ = _core()
-        pm, islands, _old, _sheets, rep = _LAST[obj.name]
 
-        was_edit = context.mode == "EDIT_MESH"
-        if was_edit:
-            bpy.ops.object.mode_set(mode="OBJECT")
+        was_edit = object_mode(
+            context, [o for o in (bpy.data.objects.get(n)
+                                  for n in group_of(obj.name)) if o is not None])
         try:
             # Rebuild from the islands rather than re-packing the packed
             # parts: Part.xform has to map island space to the sheet, and
             # packing an already-packed part would compose two placements and
-            # put the net somewhere it is not.
-            parts = L.build_parts(islands, mat)
-            sheets, oversized = L.pack(parts, mat)
-            bridge.write_net_uv(obj.data, pm, islands,
-                                scale=bridge.uv_scale(*mat.bed),
-                                placement={p.island_id: p for p in parts},
-                                sheet_size=mat.bed)
-            _LAST[obj.name] = (pm, islands, parts, sheets, rep)
-            overlay.set_net_bounds(obj.name, bridge.net_bounds(obj.data),
-                                   sheets=sheets)
-            publish_cuts(obj, parts, mat, pm, islands)
+            # put the net somewhere it is not. Every object packed with this
+            # one comes too - they share the sheets.
+            # Effort can mean a minute on a big net, on the main thread: at
+            # least show the count on the cursor while it works.
+            wm = context.window_manager
+            wm.progress_begin(0, 100)
+
+            def tick(done, total, _note):
+                wm.progress_update(int(100 * done / max(1, total)))
+                return True
+            try:
+                sheets, oversized = pack_group(context, group_of(obj.name),
+                                               effort=s.pack_effort,
+                                               progress=tick)
+            finally:
+                wm.progress_end()
         except Exception as exc:                       # noqa: BLE001
             traceback.print_exc()
             self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
@@ -1031,6 +1340,40 @@ class CBU_OT_repack(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CBU_OT_refresh(bpy.types.Operator):
+    bl_idname = "cbu.refresh"
+    bl_label = "Refresh"
+    bl_description = ("Rebuild the parts from the current net with the "
+                      "current settings - fingers, corner holes, tabs, relief, "
+                      "labels - and re-pack, without re-unfolding. Settings "
+                      "the unfold itself reads (bed, height, trials...) still "
+                      "need Unfold or Optimise; an Optimise was chosen with "
+                      "the settings it ran with, and Refresh keeps that net")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = job_ref(context)
+        return obj is not None and obj.name in _LAST and RUNNING is None
+
+    def execute(self, context):
+        res = bpy.ops.cbu.repack()
+        if "FINISHED" not in res:
+            return res
+        changed = unfold_settings_changed(job_ref(context),
+                                          context.scene.cbu)
+        if changed:
+            self.report({"WARNING"},
+                        f"Parts refreshed, but "
+                        f"{setting_labels(context.scene.cbu, changed)} changed "
+                        f"since the last solve - Unfold or Optimise to apply "
+                        f"{'it' if len(changed) == 1 else 'them'}")
+        else:
+            self.report({"INFO"}, f"Refreshed: {context.scene.cbu.last_sheets} "
+                                  f"sheet(s)")
+        return {"FINISHED"}
+
+
 class CBU_OT_export(bpy.types.Operator):
     bl_idname = "cbu.export"
     bl_label = "Export Sheets"
@@ -1038,18 +1381,34 @@ class CBU_OT_export(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return (context.active_object is not None
-                and context.active_object.name in _LAST)
+        obj = job_ref(context)
+        return obj is not None and obj.name in _LAST
 
     def execute(self, context):
-        obj = context.active_object
+        obj = job_ref(context)
         s = context.scene.cbu
         _, _, E = _core()
-        pm, islands, parts, sheets, rep = _LAST[obj.name]
+        group = group_of(obj.name)
+        missing = [n for n in group if n not in _LAST]
+        if missing:
+            self.report({"ERROR"},
+                        f"{', '.join(missing)} changed since the unfold - its "
+                        f"parts would be missing from the sheets. Unfold again")
+            return {"CANCELLED"}
+        # Every object packed onto these sheets, or the sheets are cut with
+        # holes where the others' parts were meant to go.
+        parts = [p for n in group for p in _LAST[n][2]]
+        _pm, _islands, _parts, sheets, rep = _LAST[obj.name]
+        if len(group) > 1:
+            rep = dict(rep, objects=list(group))
+        stem = obj.name.lower() if len(group) == 1 else (
+            bpy.path.display_name_from_filepath(bpy.data.filepath).lower()
+            or "job")
         try:
             out = bpy.path.abspath(s.out_dir)
             files = E.write_all(out, parts, material_from(s, obj), sheets, rep,
-                                dxf=s.write_dxf, stem=obj.name.lower())
+                                dxf=s.write_dxf, stem=stem,
+                                gcode=s.write_gcode)
         except Exception as exc:                       # noqa: BLE001
             traceback.print_exc()
             self.report({"ERROR"}, f"{type(exc).__name__}: {exc}")
@@ -1075,6 +1434,12 @@ class CBU_OT_pack_uv(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         s = context.scene.cbu
+        if len(group_of(obj.name)) > 1:
+            # It nests one mesh's UVs with Blender's packer; the other
+            # objects' parts are on other meshes, so it cannot see them.
+            self.report({"WARNING"}, "Nest Sheets works on one object - "
+                                     "Re-pack packs several together")
+            return {"CANCELLED"}
         mat = material_from(s, obj)
         _, L, _ = _core()
         pm, islands, old_parts, old_sheets, rep = _LAST[obj.name]
@@ -1355,12 +1720,158 @@ class CBU_OT_pack_uv(bpy.types.Operator):
 
 PLANAR_TOL = 1e-3      # same gate PolyMesh.check uses
 
+
+# ----------------------------------------------------- the list, the stick
+
+class CBU_OT_job_add(bpy.types.Operator):
+    bl_idname = "cbu.job_add"
+    bl_label = "Add Selected"
+    bl_description = ("Add the selected mesh objects to the list of what is "
+                      "cut together. Everything in the list is unfolded, "
+                      "scaled by one factor and packed onto shared sheets")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s = context.scene.cbu
+        have = {it.obj for it in s.job if it.obj is not None}
+        picked = [o for o in context.selected_objects if o.type == "MESH"]
+        if not picked and context.active_object is not None                 and context.active_object.type == "MESH":
+            picked = [context.active_object]
+        added = 0
+        for o in picked:
+            if o in have or o == s.yardstick:
+                continue
+            s.job.add().obj = o
+            have.add(o)
+            added += 1
+        s.job_index = max(0, len(s.job) - 1)
+        if not added:
+            self.report({"WARNING"}, "nothing new to add (the yardstick is "
+                                     "never cut)")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"{len(s.job)} object(s) cut together")
+        return {"FINISHED"}
+
+
+class CBU_OT_job_remove(bpy.types.Operator):
+    bl_idname = "cbu.job_remove"
+    bl_label = "Remove"
+    bl_description = "Take the highlighted object out of the list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.cbu.job) > 0
+
+    def execute(self, context):
+        s = context.scene.cbu
+        i = min(s.job_index, len(s.job) - 1)
+        s.job.remove(i)
+        s.job_index = max(0, min(i, len(s.job) - 1))
+        return {"FINISHED"}
+
+
+class CBU_OT_job_clear(bpy.types.Operator):
+    bl_idname = "cbu.job_clear"
+    bl_label = "Clear List"
+    bl_description = ("Empty the list: Unfold goes back to cutting just the "
+                      "active object")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.cbu.job) > 0
+
+    def execute(self, context):
+        context.scene.cbu.job.clear()
+        context.scene.cbu.job_index = 0
+        return {"FINISHED"}
+
+
+def world_z_mm(objs, mm_per_unit: float, apply_transform: bool):
+    """(lowest, highest) z over every vertex of `objs`, in mm - what Height
+    measures, without building a PolyMesh."""
+    lo, hi = np.inf, -np.inf
+    for o in objs:
+        me = o.data
+        co = np.empty(len(me.vertices) * 3)
+        me.vertices.foreach_get("co", co)
+        co = co.reshape(-1, 3)
+        if apply_transform:
+            M = np.array(o.matrix_world.to_4x4())
+            co = co @ M[:3, :3].T + M[:3, 3]
+        if len(co):
+            lo, hi = min(lo, co[:, 2].min()), max(hi, co[:, 2].max())
+    return lo * mm_per_unit, hi * mm_per_unit
+
+
+class CBU_OT_add_yardstick(bpy.types.Operator):
+    bl_idname = "cbu.add_yardstick"
+    bl_label = "Add Yardstick"
+    bl_description = ("Add a one-edge reference at the 3D cursor and size by "
+                      "it. Put its ends on a dimension you know - snap to "
+                      "vertices for an exact one - and type its real length. "
+                      "It is never cut")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s = context.scene.cbu
+        # Out of Edit Mode first: the stick becomes the active object, and a
+        # model left in Edit Mode behind it is one nothing can read.
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        objs, _err = job_objects(context)
+        # A yardstick means a saved job: once it is the active object (it is
+        # about to be, so it can be moved straight away), "the active object"
+        # would be the stick, and the model has to be named some other way.
+        if not len(s.job):
+            for o in objs:
+                s.job.add().obj = o
+        # Span the model along X, so it is visible and roughly the right size.
+        if objs:
+            xs = []
+            for o in objs:
+                for c in o.bound_box:
+                    xs.append((o.matrix_world @ Vector(c)).x)
+            span = max(xs) - min(xs) or 1.0
+        else:
+            span = 1.0
+        # Keep the size it had: the stick's length now, at the scale the
+        # model would get anyway, so switching to it changes nothing until a
+        # length is typed.
+        k = 1.0
+        if objs and s.size_mode == "HEIGHT" and s.target_height > 0:
+            lo, hi = world_z_mm(objs, s.mm_per_unit, s.apply_transform)
+            if hi - lo > 1e-9:
+                k = s.target_height / (hi - lo)
+
+        me = bpy.data.meshes.new("CBU Yardstick")
+        me.from_pydata([(-span / 2, 0, 0), (span / 2, 0, 0)], [(0, 1)], [])
+        stick = bpy.data.objects.new("CBU Yardstick", me)
+        stick.location = context.scene.cursor.location
+        stick.show_in_front = True          # inside a helmet it is otherwise hidden
+        stick.show_name = True
+        context.collection.objects.link(stick)
+        for o in context.selected_objects:
+            o.select_set(False)
+        stick.select_set(True)
+        context.view_layer.objects.active = stick
+        s.yardstick = stick
+        s.size_mode = "YARDSTICK"
+        s.yardstick_length = bridge.yardstick_mm(
+            stick, s.mm_per_unit, s.apply_transform) * k
+        self.report({"INFO"}, "Yardstick added: put its ends on a known "
+                              "dimension and type its real length")
+        return {"FINISHED"}
+
 classes = (CBU_OT_mark, CBU_OT_clear_marks, CBU_OT_select_marked,
            CBU_OT_lock, CBU_OT_clear_locks, CBU_OT_select_locked,
            CBU_OT_select_all_faces,
            CBU_OT_split_nonplanar, CBU_OT_unfold, CBU_OT_optimise,
            CBU_OT_edit_seam,
-           CBU_OT_repack, CBU_OT_export, CBU_OT_pack_uv)
+           CBU_OT_repack, CBU_OT_refresh, CBU_OT_export, CBU_OT_pack_uv,
+           CBU_OT_job_add, CBU_OT_job_remove, CBU_OT_job_clear,
+           CBU_OT_add_yardstick)
 
 
 def register():
@@ -1370,6 +1881,7 @@ def register():
 
 def unregister():
     _LAST.clear()
+    _GROUP.clear()
     LAST_TIMINGS.clear()
     for c in reversed(classes):
         bpy.utils.unregister_class(c)

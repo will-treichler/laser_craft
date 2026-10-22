@@ -63,8 +63,14 @@ try:
     before = Material().crush
     check(abs(before - 0.75) < 1e-9, f"crush default starts at 0.75 (got {before})")
 
+    b = sys.modules["cbu_blender.build"]
+    code0 = b.CODE
+    check(len(code0) == 8 and not b.stale(max_age=0.0),
+          f"build stamp is fresh at load ({b.stamp()})")
     target.write_bytes(original.replace(b"crush: float = 0.75",
                                         b"crush: float = 0.61"))
+    check(b.stale(max_age=0.0),
+          "the stamp sees an edit on disk that is not loaded yet")
     # without a reload the old value must still be live
     from cbu_blender.vendor.cardboard_unfolder.material import Material as M2
     check(abs(M2().crush - 0.75) < 1e-9,
@@ -72,6 +78,9 @@ try:
 
     ok, msg = dev.reload_all()
     check(ok, f"reload_all succeeded: {msg}")
+    b = sys.modules["cbu_blender.build"]
+    check(b.CODE != code0 and not b.stale(max_age=0.0),
+          "after reload the stamp names the new code and is not stale")
 
     import importlib
     mod = sys.modules["cbu_blender.vendor.cardboard_unfolder.material"]
@@ -87,6 +96,29 @@ finally:
 
 mod = sys.modules["cbu_blender.vendor.cardboard_unfolder.material"]
 check(abs(mod.Material().crush - 0.75) < 1e-9, "restored value after reload")
+
+# ------------------------------------- reload reaches every module in use
+# The edit test above only touches material.py, which was always on the
+# reload list - so it could not see that fingers.py and cost.py were NOT. A
+# Reload then re-imported layout, whose `from .fingers import place_fingers`
+# picked the STALE module straight back out of sys.modules: the user reloaded
+# after the lopsided-joint fix and kept cutting the old joints. Run both
+# solves first, so everything they import lazily is loaded too.
+bpy.context.scene.cbu.use_fingers = True
+bpy.ops.cbu.unfold()
+bpy.ops.cbu.optimise()
+listed = {f"cbu_blender.{m}" for m in dev.CORE_MODULES + dev.ADDON_MODULES}
+loaded = {n for n in sys.modules
+          if n.startswith("cbu_blender.") and sys.modules[n] is not None}
+check(loaded <= listed,
+      f"every loaded add-on module is reloaded (missed: "
+      f"{sorted(loaded - listed)})")
+old = sys.modules["cbu_blender.vendor.cardboard_unfolder.fingers"].place_fingers
+dev.reload_all()
+lay = sys.modules["cbu_blender.vendor.cardboard_unfolder.layout"]
+fin = sys.modules["cbu_blender.vendor.cardboard_unfolder.fingers"]
+check(lay.place_fingers is fin.place_fingers and lay.place_fingers is not old,
+      "after reload, layout calls the freshly loaded fingers code")
 
 # ------------------------------------------------- repeated reloads are safe
 t0 = time.time()

@@ -24,7 +24,12 @@ _net_bounds = {}       # object name -> (x0, y0, x1, y1) of the net, in mm
 _net_sheets = {}       # object name -> how many sheets the packing used
 _net_cuts = {}         # object name -> per-island outlines, island space
 _live_rings = {}       # object name -> resolved rings, sampled off the draw
+# object name -> the other objects packed onto the same sheets. Their cut
+# outlines and engraving are drawn with its own: the sheets are shared, and a
+# view of one object's parts alone shows empty space where the others are.
+_companions = {}
 _live_labels = {}      # object name -> resolved engraving, same treatment
+_live_scores = {}      # object name -> resolved fold score lines, same again
 _live_marks = {}       # object name -> forced marks in net UV space
 _fingerprints = {}     # object name -> geometry fingerprint at unfold time
 _bed_cache = {}        # draw key -> batch, so the grid is not rebuilt per frame
@@ -353,6 +358,7 @@ def set_net_cuts(name: str, groups) -> None:
         _net_cuts.pop(name, None)
     _live_rings.pop(name, None)
     _live_labels.pop(name, None)
+    _live_scores.pop(name, None)
     _live_marks.pop(name, None)
     _bed_cache.clear()
     _tag_redraw()
@@ -407,6 +413,7 @@ def refresh_live_cuts(*_args):
             if obj is None or obj.type != "MESH":
                 _live_rings.pop(name, None)
                 _live_labels.pop(name, None)
+                _live_scores.pop(name, None)
                 _live_marks.pop(name, None)
                 continue
             rings = live_cut_rings(obj, sc)
@@ -415,6 +422,7 @@ def refresh_live_cuts(*_args):
             before = _live_rings.get(name)
             _live_rings[name] = rings
             _live_labels[name] = live_label_strokes(obj, sc) or []
+            _live_scores[name] = live_score_lines(obj, sc) or []
             marks = live_mark_segments(obj, sc)
             if marks is not None:
                 _live_marks[name] = marks
@@ -520,6 +528,11 @@ def live_label_strokes(obj, scale: float):
     return _resolve(obj, scale, "labels")
 
 
+def live_score_lines(obj, scale: float):
+    """The fold score lines where the islands are now. Open polylines."""
+    return _resolve(obj, scale, "scores")
+
+
 def set_net_bounds(name: str, bounds, sheets: int | None = None) -> None:
     """Remember the net's extent, and how many sheets it is packed onto, so
     the bed reference draws exactly those sheets where the net put them."""
@@ -534,23 +547,38 @@ def set_net_bounds(name: str, bounds, sheets: int | None = None) -> None:
     _tag_redraw()
 
 
+def set_companions(name: str, others) -> None:
+    _companions[name] = tuple(others)
+    _bed_cache.clear()
+    _tag_redraw()
+
+
+def shown_with(name: str) -> tuple:
+    """The object and everything sharing its sheets, in that order."""
+    return (name,) + tuple(n for n in _companions.get(name, ()) if n != name)
+
+
 def clear(name: str | None = None) -> None:
     if name is None:
+        _companions.clear()
         _batches.clear()
         _net_bounds.clear()
         _net_sheets.clear()
         _net_cuts.clear()
         _live_rings.clear()
         _live_labels.clear()
+        _live_scores.clear()
         _live_marks.clear()
         _fingerprints.clear()
     else:
+        _companions.pop(name, None)
         _batches.pop(name, None)
         _net_bounds.pop(name, None)
         _net_sheets.pop(name, None)
         _net_cuts.pop(name, None)
         _live_rings.pop(name, None)
         _live_labels.pop(name, None)
+        _live_scores.pop(name, None)
         _live_marks.pop(name, None)
         _fingerprints.pop(name, None)
     _bed_cache.clear()
@@ -609,6 +637,7 @@ def _draw():
 SHEET_RGBA = (0.95, 0.62, 0.15, 0.85)      # sheet outline
 CUT_RGBA = (0.20, 0.85, 0.45, 0.95)        # what the laser actually follows
 LABEL_RGBA = (0.55, 0.78, 1.00, 0.95)      # engraved seam / fold / part marks
+SCORE_RGBA = (1.00, 0.30, 0.85, 0.95)      # fold score lines: magenta, nothing else is
 AXIS_RGBA = (0.95, 0.62, 0.15, 0.70)       # the mm ruler down the bed edges
 GRID_MINOR_RGBA = (0.80, 0.80, 0.80, 0.10)  # the mm grid inside each sheet
 GRID_MAJOR_RGBA = (0.85, 0.85, 0.85, 0.24)
@@ -701,7 +730,7 @@ def cut_segments(rings, scale: float):
     return verts, cols
 
 
-def stroke_segments(strokes, scale: float):
+def stroke_segments(strokes, scale: float, rgba=LABEL_RGBA):
     """Open polylines as line segments, in UV units. (verts, colours).
 
     Deliberately not cut_segments: that wraps the last point back to the first,
@@ -713,8 +742,8 @@ def stroke_segments(strokes, scale: float):
             a, b = st[i] * scale, st[i + 1] * scale
             verts.append((float(a[0]), float(a[1]), 0.0))
             verts.append((float(b[0]), float(b[1]), 0.0))
-            cols.append(LABEL_RGBA)
-            cols.append(LABEL_RGBA)
+            cols.append(rgba)
+            cols.append(rgba)
     return verts, cols
 
 
@@ -748,11 +777,12 @@ def _marks_batch(obj, scale: float):
 
 def _label_batch(obj, scale: float):
     """Same contract as _cut_batch: read the cache, never sample live UVs."""
-    strokes = _live_labels.get(obj.name)
+    strokes = [st for n in shown_with(obj.name)
+               for st in (_live_labels.get(n) or ())]
     line_s = _shaders()[1]
     if not strokes or line_s is None:
         return None
-    key = ("labels", obj.name, scale,
+    key = ("labels", shown_with(obj.name), scale,
            float(np.round(np.concatenate(
                [st.ravel() for st in strokes]).sum(), 4)))
     hit = _bed_cache.get(key)
@@ -767,6 +797,29 @@ def _label_batch(obj, scale: float):
     return hit
 
 
+def _score_batch(obj, scale: float):
+    """Same contract as _cut_batch: read the cache, never sample live UVs.
+    Its own colour: a fold score is neither a cut nor an engraving."""
+    lines = [st for n in shown_with(obj.name)
+             for st in (_live_scores.get(n) or ())]
+    line_s = _shaders()[1]
+    if not lines or line_s is None:
+        return None
+    key = ("scores", shown_with(obj.name), scale,
+           float(np.round(np.concatenate(
+               [st.ravel() for st in lines]).sum(), 4)))
+    hit = _bed_cache.get(key)
+    if hit is None:
+        verts, cols = stroke_segments(lines, scale, SCORE_RGBA)
+        hit = (batch_for_shader(line_s, "LINES", {"pos": verts, "color": cols})
+               if verts else None)
+        for k in [k for k in _bed_cache if isinstance(k, tuple)
+                  and k and k[0] == "scores"]:
+            del _bed_cache[k]
+        _bed_cache[key] = hit
+    return hit
+
+
 def _cut_batch(obj, scale: float):
     """Rebuilt whenever the islands have actually moved, not every frame.
 
@@ -774,11 +827,12 @@ def _cut_batch(obj, scale: float):
     Blender: bmesh.from_edit_mesh inside a draw handler frees customdata
     blocks out from under the draw.
     """
-    rings = _live_rings.get(obj.name)
+    rings = [r for n in shown_with(obj.name)
+             for r in (_live_rings.get(n) or ())]
     line_s = _shaders()[1]
     if not rings or line_s is None:
         return None
-    key = ("cuts", obj.name, scale,
+    key = ("cuts", shown_with(obj.name), scale,
            float(np.round(np.concatenate([r.ravel() for r in rings]).sum(), 4)))
     hit = _bed_cache.get(key)
     if hit is None:
@@ -1000,7 +1054,8 @@ def _draw_bed():
     # the bed off also hid the cut outline and the engraving, which is not what
     # the checkbox says.
     if s is None or not (s.show_bed or s.show_cut or s.show_net_labels
-                         or s.show_net_marks):
+                         or s.show_net_marks
+                         or (s.score_folds and s.show_net_scores)):
         return
     space = getattr(ctx, "space_data", None)
     if space is None or space.type != "IMAGE_EDITOR" or space.mode != "UV":
@@ -1044,7 +1099,7 @@ def _draw_bed():
             # tag and rebuilding them on every bed change is wasted work.
             for k in [k for k in _bed_cache
                       if not (isinstance(k, tuple) and k
-                              and k[0] in ("cuts", "labels"))]:
+                              and k[0] in ("cuts", "labels", "scores"))]:
                 del _bed_cache[k]
             _bed_cache[key] = _bed_batch(grid, s.bed_x * sc, s.bed_y * sc,
                                          s.margin * sc, sc, origins, ruler)
@@ -1088,6 +1143,12 @@ def _draw_bed():
             cuts = _cut_batch(obj, sc)
             if cuts is not None:
                 cuts.draw(line_s)
+        # Only while they are burned: a line drawn here that the laser will
+        # not follow is the kind of view that lies about the cut.
+        if s.score_folds and s.show_net_scores:
+            scores = _score_batch(obj, sc)
+            if scores is not None:
+                scores.draw(line_s)
         if s.show_net_labels:
             labels = _label_batch(obj, sc)
             if labels is not None:
@@ -1129,6 +1190,7 @@ def unregister():
     _net_cuts.clear()
     _live_rings.clear()
     _live_labels.clear()
+    _live_scores.clear()
     _live_marks.clear()
     _fingerprints.clear()
     _bed_cache.clear()

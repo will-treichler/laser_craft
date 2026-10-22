@@ -214,6 +214,33 @@ def polymesh_from_object(obj, merge_coplanar: bool = True,
     return pm
 
 
+def yardstick_mm(obj, mm_per_unit: float = 1000.0,
+                 apply_transform: bool = True) -> float:
+    """The yardstick's length in mm, measured exactly as the model is.
+
+    One edge and nothing else, so there is no question which dimension it
+    means - a box or a bar would leave its longest side, its diagonal and its
+    length along some axis all as candidates. With the object transform on it
+    is measured in the world, like the model; off, in its own coordinates,
+    like the model.
+    """
+    if obj is None:
+        raise ValueError("no yardstick")
+    me = obj.data
+    if getattr(obj, "type", "") != "MESH" or len(me.edges) != 1:
+        n = len(me.edges) if getattr(obj, "type", "") == "MESH" else 0
+        raise ValueError(f"the yardstick {obj.name!r} must be a single edge "
+                         f"(it has {n}) - Add Yardstick makes one")
+    a, b = me.edges[0].vertices
+    pa, pb = me.vertices[a].co.copy(), me.vertices[b].co.copy()
+    if apply_transform:
+        pa, pb = obj.matrix_world @ pa, obj.matrix_world @ pb
+    L = (pb - pa).length * mm_per_unit
+    if L < 1e-9:
+        raise ValueError(f"the yardstick {obj.name!r} has no length")
+    return float(L)
+
+
 # ----------------------------------------------------------------- write
 
 def write_islands(mesh, pm: PolyMesh, islands) -> None:

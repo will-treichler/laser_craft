@@ -315,6 +315,8 @@ def island_labels(isl: Island, plans, mat: Material, body=None) -> list[Label]:
     # --------------------------------------------------------- fold marks
     if mat.label_folds:
         for plan in plans:
+            if plan.style == "flat":
+                continue            # nothing to fold, so nothing to mark
             f = plan.fold
             txt = "M" if plan.is_mountain else "V"
             avail = min(f.length * mat.label_edge_frac,

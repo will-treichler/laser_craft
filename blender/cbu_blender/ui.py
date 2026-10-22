@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import bpy
 
-from . import bridge, deps, props, log as cbulog
+from . import bridge, build, deps, props, log as cbulog
 
 CAT = "Cardboard"
 
@@ -44,8 +44,10 @@ def draw_progress(lay, job) -> None:
     box = lay.box()
     # Each phase counts from zero, so without a step number the bar filling
     # and then starting again reads as the run having restarted.
+    # With several objects the note leads with whose search it is
+    # ("Helmet: searching trees"), so look for the phase, not at the start.
     step = next((i for i, (_k, key) in enumerate(PHASES)
-                 if (job.note or "").startswith(key)), None)
+                 if key in (job.note or "")), None)
     head = "Stopping..." if job.stopping else "Optimising..."
     if step is not None:
         head += f"  step {step + 1} of {len(PHASES)}"
@@ -69,6 +71,65 @@ class _Base:
     bl_category = CAT
 
 
+class CBU_UL_job(bpy.types.UIList):
+    """The saved list of objects cut together."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_prop, index=0, flt_flag=0):
+        o = item.obj
+        if o is None:
+            layout.label(text="(deleted)", icon="ERROR")
+            return
+        layout.label(text=o.name, icon="OUTLINER_OB_MESH")
+        from . import ops
+        if o.name in ops._LAST:
+            layout.label(text=f"{len(ops._LAST[o.name][1])} isl.")
+
+
+def draw_job(lay, context) -> None:
+    """What Unfold will cut: the saved list, or the active object.
+
+    A list rather than the selection: what goes on the sheets together is a
+    decision about the job, and re-selecting it before every Unfold is how
+    half a costume gets cut. Empty is the old behaviour - the active object.
+    """
+    s = context.scene.cbu
+    box = lay.box()
+    if len(s.job):
+        box.label(text=f"Cut together ({len(s.job)})", icon="GROUP")
+        row = box.row()
+        row.template_list("CBU_UL_job", "", s, "job", s, "job_index",
+                          rows=2)
+        side = row.column(align=True)
+        side.operator("cbu.job_add", text="", icon="ADD")
+        side.operator("cbu.job_remove", text="", icon="REMOVE")
+        side.separator()
+        side.operator("cbu.job_clear", text="", icon="X")
+    else:
+        obj = context.active_object
+        row = box.row()
+        row.label(text=f"Cutting: {obj.name}" if obj is not None
+                  and obj.type == "MESH" else "Cutting: (nothing)",
+                  icon="OUTLINER_OB_MESH")
+        row.operator("cbu.job_add", text="Add", icon="ADD")
+    # The size in one line, because it now depends on more than one box -
+    # and those are in Machine & Size, a closed panel. Short: at sidebar
+    # width a longer line truncated.
+    if s.size_mode == "YARDSTICK":
+        text = (f"Size: yardstick = {s.yardstick_length:.0f} mm"
+                if s.yardstick is not None else "Size: yardstick not set")
+    elif s.target_height > 0:
+        text = f"Size: {s.target_height:.0f} mm tall"
+    else:
+        text = "Size: real size"
+    box.label(text=text, icon="DRIVER_DISTANCE")
+
+
+def job_ref(context):
+    from . import ops
+    return ops.job_ref(context)
+
+
 class CBU_PT_main(_Base, bpy.types.Panel):
     bl_label = "Cardboard Unfolder"
     bl_idname = "CBU_PT_main"
@@ -87,8 +148,9 @@ class CBU_PT_main(_Base, bpy.types.Panel):
             box.label(text="Blender restart may be needed afterwards.")
             return
 
-        obj = context.active_object
-        if obj is None or obj.type != "MESH":
+        draw_job(lay, context)
+        obj = job_ref(context)
+        if obj is None:
             lay.label(text="Select a mesh object", icon="INFO")
             return
 
@@ -100,6 +162,21 @@ class CBU_PT_main(_Base, bpy.types.Panel):
         # which was saved with the scene, so once it had been switched on
         # every Unfold ran the slow path. Unfold is always the quick one.
         lay.operator("cbu.optimise", icon="MOD_ARRAY")
+        # Optimise's own setting, so it sits with Optimise: Unfold ignores it.
+        lay.prop(s, "board_bias", slider=True)
+        # Settings that only shape the parts apply to the net in hand; the
+        # ones the solve read need a new one, and say so here rather than in
+        # a report that has scrolled away.
+        col = lay.column(align=True)
+        col.operator("cbu.refresh", icon="FILE_REFRESH")
+        col.prop(s, "pack_effort", slider=True)
+        from . import ops as _ops
+        stale = _ops.unfold_settings_changed(obj, s)
+        if stale:
+            warn = lay.row()
+            warn.alert = True
+            warn.label(text="Needs Unfold: " + _ops.setting_labels(s, stale),
+                       icon="ERROR")
         job = _running()
         if job is not None:
             draw_progress(lay, job)
@@ -247,6 +324,7 @@ class CBU_PT_seams(_Base, bpy.types.Panel):
         sub = lay.column()
         sub.enabled = s.use_fingers
         sub.prop(s, "finger_width")
+        sub.prop(s, "finger_clearance")
         sub.prop(s, "finger_depth_override")
         row = sub.row()
         row.enabled = s.use_fingers and s.finger_depth_override
@@ -255,6 +333,7 @@ class CBU_PT_seams(_Base, bpy.types.Panel):
         else:
             # Show the number actually used, not a field that does nothing.
             row.label(text=f"Depth {s.thickness:.1f} mm (board thickness)")
+        lay.prop(s, "corner_hole")
         lay.separator()
         lay.prop(s, "use_tabs")
         sub = lay.column()
@@ -282,6 +361,7 @@ class CBU_PT_folds(_Base, bpy.types.Panel):
         lay.prop(s, "connect_ratio")
         lay.prop(s, "min_connect")
         lay.prop(s, "round_cut_ends")
+        lay.prop(s, "min_bend")
         lay.separator()
         lay.prop(s, "edge_offset")
         # Nothing buries a notch apex without an OUTWARD offset, so the corner
@@ -304,10 +384,16 @@ class CBU_PT_labels(_Base, bpy.types.Panel):
         s = context.scene.cbu
         lay = self.layout
         lay.use_property_split = True
-        obj = context.active_object
+        from . import ops
+        objs, _err = ops.job_objects(context)
         lay.prop(s, "model_id")
-        if not (s.model_id or "").strip():
-            eff = props.model_id_for(s, obj)
+        if len(objs) > 1:
+            # One id per object: island numbers restart for each, so the
+            # id is what tells their pieces apart on the shared sheets.
+            ids = [ops.job_material(s, o, objs).model_id or "-" for o in objs]
+            lay.label(text="using: " + ", ".join(ids), icon="INFO")
+        elif not (s.model_id or "").strip():
+            eff = props.model_id_for(s, objs[0] if objs else None)
             lay.label(text=f"using: {eff}" if eff else "no id available",
                       icon="INFO")
         lay.prop(s, "label_height")
@@ -332,8 +418,51 @@ class CBU_PT_machine(_Base, bpy.types.Panel):
         lay.prop(s, "part_gap")
         lay.separator()
         lay.prop(s, "mm_per_unit")
-        lay.prop(s, "target_height")
+        draw_size(lay, context)
         lay.prop(s, "apply_transform")
+
+
+class CBU_PT_laser(_Base, bpy.types.Panel):
+    bl_label = "Laser"
+    bl_parent_id = "CBU_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        s = context.scene.cbu
+        lay = self.layout
+        lay.prop(s, "laser_max")
+        lay.prop(s, "dynamic_power")
+        # power / speed / passes per operation, in the order they run
+        col = lay.column(align=True)
+        hdr = col.row(align=True)
+        for t in ("", "Power", "mm/min", "Passes"):
+            hdr.label(text=t)
+        for op, name in (("engrave", "Engrave"), ("score", "Score"),
+                         ("cut", "Cut")):
+            r = col.row(align=True)
+            if op == "score":
+                # off by default: the row says so and greys out
+                r.prop(s, "score_folds", text=name)
+                r = r.row(align=True)
+                r.enabled = s.score_folds
+            else:
+                r.label(text=name)
+            r.prop(s, f"{op}_power", text="")
+            r.prop(s, f"{op}_speed", text="")
+            r.prop(s, f"{op}_passes", text="")
+        lay.prop(s, "air_assist")
+        sub = lay.column()
+        sub.enabled = s.air_assist
+        r = sub.row(align=True)
+        r.prop(s, "engrave_air", toggle=True)
+        sc = r.row(align=True)
+        sc.enabled = s.score_folds
+        sc.prop(s, "score_air", toggle=True)
+        r.prop(s, "cut_air", toggle=True)
+        r = sub.row(align=True)
+        r.prop(s, "air_on")
+        r.prop(s, "air_off")
+        lay.prop(s, "write_gcode")
 
 
 class CBU_PT_solver(_Base, bpy.types.Panel):
@@ -349,6 +478,7 @@ class CBU_PT_solver(_Base, bpy.types.Panel):
         sub = lay.column()
         sub.enabled = s.merge_coplanar
         sub.prop(s, "merge_tol")
+        lay.prop(s, "flat_tol")
         lay.prop(s, "trials")
         lay.prop(s, "seed")
         # Only Optimise reads this; the button itself is on the main panel.
@@ -357,6 +487,7 @@ class CBU_PT_solver(_Base, bpy.types.Panel):
         lay.separator()
         lay.prop(s, "out_dir")
         lay.prop(s, "write_dxf")
+        lay.prop(s, "write_gcode")
 
 
 class CBU_PT_debug(_Base, bpy.types.Panel):
@@ -367,6 +498,19 @@ class CBU_PT_debug(_Base, bpy.types.Panel):
     def draw(self, context):
         s = context.scene.cbu
         lay = self.layout
+
+        # Which code is running - the first thing to rule out when a fix
+        # appears not to have worked (see build.py).
+        box = lay.box()
+        col = box.column(align=True)
+        first, *rest = build.stamp_lines()
+        col.label(text=first, icon="INFO")
+        for line in rest:
+            col.label(text=line, icon="BLANK1")
+        if build.stale():
+            warn = col.row()
+            warn.alert = True
+            warn.label(text="Changed on disk: Reload", icon="ERROR")
 
         col = lay.column(align=True)
         col.scale_y = 1.2
@@ -451,6 +595,9 @@ class CBU_PT_uv(bpy.types.Panel):
         sub.prop(s, "hide_blender_grid")
         col.prop(s, "show_cut")
         col.prop(s, "show_net_labels", text="Annotation")
+        sub = col.column(align=True)
+        sub.enabled = s.score_folds
+        sub.prop(s, "show_net_scores")
         col.prop(s, "show_net_marks")
 
         # UV Sync Selection defaults ON in Blender 5.x, and in that mode the UV
@@ -523,6 +670,7 @@ class CBU_PT_uv(bpy.types.Panel):
 
         lay.separator()
         col = lay.column(align=True)
+        col.prop(s, "pack_effort", slider=True)
         col.operator("cbu.repack", icon="MOD_ARRAY")
         col.operator("cbu.pack_uv", icon="UV_ISLANDSEL")
         lay.operator("cbu.export", icon="EXPORT")
@@ -533,9 +681,53 @@ class CBU_PT_uv(bpy.types.Panel):
         box.label(text="isometry and parts stop mating.")
 
 
-classes = (CBU_PT_main, CBU_PT_constraints, CBU_PT_material, CBU_PT_seams,
+def draw_size(lay, context) -> None:
+    """Size by height or by yardstick - one factor for everything cut
+    together, shown as the number it comes to so a typo is caught before an
+    Unfold rather than after a cut."""
+    from . import ops
+    s = context.scene.cbu
+    row = lay.row()
+    row.prop(s, "size_mode", expand=True)
+    objs, _err = ops.job_objects(context)
+    if s.size_mode == "HEIGHT":
+        lay.prop(s, "target_height", text="Height (world Z)")
+        if s.target_height <= 0:
+            lay.label(text="0 = the model's real size", icon="INFO")
+        elif objs:
+            lo, hi = ops.world_z_mm(objs, s.mm_per_unit, s.apply_transform)
+            if hi - lo > 1e-9:
+                lay.label(text=f"Scale x{s.target_height / (hi - lo):.4g}",
+                          icon="INFO")
+        return
+    row = lay.row(align=True)
+    row.prop(s, "yardstick", text="Yardstick")
+    row.operator("cbu.add_yardstick", text="", icon="ADD")
+    lay.prop(s, "yardstick_length")
+    if s.yardstick is None:
+        r = lay.row()
+        r.alert = True
+        r.label(text="Add or pick a yardstick", icon="ERROR")
+        return
+    try:
+        got = bridge.yardstick_mm(s.yardstick, s.mm_per_unit,
+                                  s.apply_transform)
+    except ValueError as exc:
+        r = lay.row()
+        r.alert = True
+        r.label(text=str(exc), icon="ERROR")
+        return
+    k = s.yardstick_length / got
+    lay.label(text=f"In scene {got:.4g} mm, scale x{k:.4g}", icon="INFO")
+    if objs:
+        lo, hi = ops.world_z_mm(objs, s.mm_per_unit, s.apply_transform)
+        lay.label(text=f"Height then {k * (hi - lo):.0f} mm", icon="INFO")
+
+
+classes = (CBU_UL_job, CBU_PT_main, CBU_PT_constraints, CBU_PT_material,
+           CBU_PT_seams,
            CBU_PT_folds,
-           CBU_PT_labels, CBU_PT_machine, CBU_PT_solver,
+           CBU_PT_labels, CBU_PT_machine, CBU_PT_laser, CBU_PT_solver,
            CBU_PT_debug, CBU_PT_uv)
 
 

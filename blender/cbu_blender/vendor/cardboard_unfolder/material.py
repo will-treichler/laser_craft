@@ -34,17 +34,26 @@ class Material:
     crush: float = 0.75             # Corrugated crushes, so the theoretical relief
                                     # width is conservative. 0.6 soft/recycled,
                                     # 1.0 stiff or double-wall. EMPIRICAL.
-    relief_threshold: float = 1.2   # mm. Below this computed width, just perforate;
-                                    # don't remove material.
+    relief_threshold: float = 1.2   # mm. Below this ADAPTIVE width, just perforate;
+                                    # don't remove material. A fixed width is
+                                    # cut as asked, however thin.
     max_relief: float = 12.0        # mm. Above this, warn - the fold is too sharp
                                     # for single-score and wants a double score.
+    min_bend: float = 1.0           # degrees. A fold bending less than this is
+                                    # left uncut - no score, no slot, no M/V -
+                                    # because board bends that far on its own.
+                                    # JUDGEMENT, not measured on board.
+    flat_tol: float | None = 3.0    # mm. A separate piece of the model within
+                                    # this of one plane is cut as the flat shape
+                                    # it is, not unfolded. The user's call.
 
     # --- relief width ---
     relief_adaptive: bool = True    # width from thickness and bend angle, as derived
                                     # above. Off uses relief_fixed for every fold,
                                     # which is what you want when cutting to a
                                     # known blade width rather than to the model.
-    relief_fixed: float = 3.0       # mm, used when relief_adaptive is off
+    relief_fixed: float = 3.0       # mm, used when relief_adaptive is off.
+                                    # Any width > 0 is a slot; 0 is none.
 
     # --- perforation ---
     perf_cut: float = 1.0           # mm of cut per dash
@@ -92,13 +101,25 @@ class Material:
 
     # Interlocking fingers along every cut seam: a box joint, so two panels
     # drop together and cannot slide while the tape or glue goes on. Width is
-    # a judgement about handling (EMPIRICAL); depth is the board thickness,
-    # because a finger has to pass through the board it mates with - so it
-    # follows `thickness` unless finger_depth_override says otherwise.
+    # a judgement about handling (EMPIRICAL); depth is the whole swing - half
+    # out past the mesh edge for a finger, half in for a notch, because the
+    # mesh is the board's mid-plane - and follows `thickness` unless
+    # finger_depth_override says otherwise.
     use_fingers: bool = False
     finger_width: float = 15.0      # mm per finger, stretched to fill the edge
     finger_depth_override: bool = False
     finger_depth: float = 3.0       # mm, used only when overridden
+    # Play between a finger and the walls of its notch, mm PER SIDE: the
+    # finger is cut this much narrower at each end, the notch is left as it
+    # is. The user's number after assembling the first model (2026-10-20):
+    # at 0 the joints went together too tight. EMPIRICAL.
+    finger_clearance: float = 0.05
+    # A round relief hole, one board across and CENTRED on the vertex, at
+    # every sharp concave corner where a seam ends - the apex of a slit. It
+    # takes out the point where the two boards would crush into each other as
+    # the slit closes, and lets the fingers run back to it instead of
+    # stopping at the corner. A judgement, so a switch.
+    corner_hole: bool = False
 
     # --- machine ---
     bed: tuple = (600.0, 400.0)     # mm
@@ -106,16 +127,48 @@ class Material:
     part_gap: float = 3.0           # mm between parts. Char halo sets this, not kerf.
                                     # 1mm will scorch the web between neighbours.
 
+    # --- laser (GRBL G-code) ---
+    # Power is GRBL's S value, 0..laser_max ($30); speed is mm/min. MEASURED
+    # by the user on their diode laser (2026-10-20): 3 mm board cuts at S1000
+    # F500, text engraves at S250 F1000.
+    #
+    # The fold score is OFF by default (the user's call): with it off no fold
+    # line reaches any output. At the cut setting its dashes are slits through
+    # the board. Switched on, it starts at the engrave setting - known not to
+    # cut through - and is UNTESTED as a score; tune it on scrap. Connected 0
+    # makes it one continuous line. Relief slots are holes in the cut and are
+    # not affected.
+    score_folds: bool = False
+    laser_max: float = 1000.0       # GRBL $30
+    dynamic_power: bool = True      # M4 (power follows speed at corners), else M3
+    cut_power: float = 1000.0
+    cut_speed: float = 500.0
+    cut_passes: int = 1
+    score_power: float = 250.0
+    score_speed: float = 1000.0
+    score_passes: int = 1
+    engrave_power: float = 250.0
+    engrave_speed: float = 1000.0
+    engrave_passes: int = 1
+    # Air assist, for when it is fitted: off by default. Each operation says
+    # whether it wants it; GRBL's coolant commands switch it.
+    air_assist: bool = False
+    cut_air: bool = True
+    score_air: bool = True
+    engrave_air: bool = False
+    air_on: str = "M8"
+    air_off: str = "M9"
+
     # --- nesting ---
     lock_grain: bool = False        # Flute-direction constraint. Off for costume work
                                     # where +/- a few mm doesn't matter. Turn on if a
                                     # part visibly racks, then creases must cross flutes.
 
-    # Engraved annotation. 4mm reads easily on board; 2mm is the floor - the
+    # Engraved annotation. 3mm reads easily on board; 2mm is the floor - the
     # stroke width of a defocused beam is a real fraction of the cell below
     # that and the character starts to burn closed. A label that cannot fit
     # its space at the floor is left off rather than shrunk into a smudge.
-    label_height: float = 4.0
+    label_height: float = 3.0       # the user's call after a first build
     label_min_height: float = 2.0
     # How much of an edge its own label may span. A number as long as the
     # edge it names reads as a label for the whole part; at a quarter it reads

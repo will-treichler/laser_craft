@@ -134,7 +134,9 @@ Two corrections theory alone doesn't give you:
 Below `relief_threshold` (1.2 mm) the fold is just perforated and the board is
 left to crush. Above it, a slot of width `w` is removed and **bridges** span it
 — those bridges are the hinge, and without them a 90° fold would cut the part
-in two. Or set a fixed cut width instead of the adaptive one.
+in two. Or set a fixed cut width instead of the adaptive one; a fixed width
+is cut exactly as set, however thin (the 1.2 mm threshold is for the adaptive
+width only), and 0 cuts no slot.
 
 ## Interlocking fingers
 

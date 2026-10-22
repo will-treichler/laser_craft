@@ -9,17 +9,18 @@ shipping-box cardboard, and costume-level tolerance (±0.5 mm is plenty).
 ```bash
 pip install -e ".[dev]"                 # core + pytest + matplotlib
 python -m cardboard_unfolder mesh.stl -o out/ --height 280 --flute B
+python -m cardboard_unfolder mesh.stl -o out/ --height 280 --bed 400x900     --cut 1000,500,2 --engrave 250,1000 --air   # .nc power,speed[,passes]
 
-python -m pytest tests -q               # 338 core invariants (~3 min)
+python -m pytest tests -q               # 429 core invariants (~7 min)
 python blender/watch.py                 # re-run core tests on save
 python blender/watch.py --addon         # also the Blender suites
 
 pip install bpy==4.5.13                 # Blender as a Python module, ~1 GB
-python blender/test_addon.py            # 329 checks, real Blender API
+python blender/test_addon.py            # 347 checks, real Blender API
 blender --background --factory-startup --python blender/test_addon.py
                                         # same suite against an installed
                                         # Blender, no 1 GB bpy wheel needed
-python blender/test_dev.py              # 29 checks on the debug tooling
+python blender/test_dev.py              # 34 checks on the debug tooling
 blender --factory-startup --python blender/gui_check.py -- out/gui
                                         # the one path no headless suite
                                         # reaches: a real click, screenshotted
@@ -56,6 +57,7 @@ numbers → kerf → split to bed → pack → layered SVG/DXF.
 | `fingers.py` | Interlocking box-joint fingers along cut seams |
 | `layout.py` | Parts, narrow-neck detection, the three packers (shelf, nest, raster), `tighten` |
 | `export.py` | Layered SVG + DXF + manifest |
+| `gcode.py` | GRBL G-code per sheet (LaserGRBL): power, speed, passes per operation |
 | `strokefont.py` | Single-stroke font for engraved labels |
 
 ## The optimiser, and how it is judged
@@ -338,6 +340,119 @@ quirk worth knowing: `Region.active_panel_category` is read-only from Python,
 so it moves the panels onto the tab already showing, for the screenshot only.
 It also has to skip `register()` when the installed add-on is enabled, or the
 second registration raises before anything runs.
+
+**Board is counted in sheet-equivalents, and the last sheet is packed low.**
+The user's goal: save the unused part of a last sheet for another job. So
+`layout.sheet_equivalents` counts every sheet but the last whole, and the
+last only as far along the bed's LONG axis as its parts reach (`long_axis`:
+x on a landscape bed, y on a portrait or square one - "take the ratio on the
+long dimension") - 3 sheets with the last 40% used is 2.4. What is beyond is
+one strip the full width of the short side. bench carries it as `sheet_eq`
+and `offcut` (% of the last sheet left free).
+
+Measured before anything changed, the packers left very little: the helmet's
+last sheet was a third full and reached 98% of the way up a 300 mm bed. Every
+packer is bottom-left for FITTING, which is not the same as staying low.
+`compact_last` is the fix, run at the end of `pack()`: it re-packs only the
+last sheet on the raster, each part where its FAR edge along the long axis
+ends lowest, over four part orders and three rotation sets (4, 8 and 12
+angles - more than the main packer, because here they can only help), and
+keeps the result only if `sheet_equivalents` improves. Full sheets are not
+touched: their layout cannot change how much board they used.
+
+Against the same code without it, on 300x300, 400x900 and 600x400 beds and
+`--optimise`: no row worse, no sheet count changed, the offcut up in 17 of 40
+rows - helmet 1.6 -> 24.1% (300), 5.4 -> 25.5% (400x900); pikachu 5.3 ->
+38.1% (400x900); torus 32.6 -> 49.2% (600x400). No measurable time. The
+baseline before it was taken from a scratch copy with the call removed:
+a bench started in the background while editing imports whatever is on disk
+when EACH process starts, so a multi-run job straddling an edit mixes code.
+
+**The Save board slider** (`board_bias`, Optimise only, default 0 = large
+islands, both the user's calls) moves two things, because weights alone
+cannot change island size - they only choose among nets the maximal bed
+split has already shaped:
+
+- `cost.board_weights(b)`: sheet x(1+4b), island x(1-0.8b), seam x(1-0.5b),
+  bed pressure x(1+b); splinter and oversize never move. Judgements.
+- `unfold.split_fractions(b)`: the best `SPLIT_FINALISTS` (3) finalists are
+  re-split at 85% of the island limit from b=0.25, 70% from 0.5, 50% from
+  0.84, and scored with the rest. The winner's fraction is in the report
+  (`split_frac`) and the Optimise detail line.
+
+The sheet term BLENDS from the whole-sheet count at 0 to sheet-equivalents at
+1. Scoring sheet-equivalents at 0 too was tried first and changed the
+default: icosphere2 8 -> 12 islands, pikachu 8 -> 9, trading pieces for
+offcut the user had not asked to trade. With the blend, b=0 is the old
+optimiser exactly (`--optimise --bias 0` against the run before: nothing
+moved). Measured, islands / sheet-equivalents, b = 0 -> 0.5 -> 1:
+
+| model | 0 | 0.5 | 1 |
+|---|---|---|---|
+| cylinder | 5 / 4.69 | 5 / 4.69 | 18 / 3.00 (5 -> 3 sheets, fill 46 -> 77%) |
+| icosphere2 | 8 / 3.94 | 15 / 2.89 | 37 / 2.69 (4 -> 3 sheets) |
+| helmet137 | 8 / 2.75 | 9 / 2.64 | 23 / 2.28 |
+| annulus | 36 / 10.83 | 50 / 9.75 | 53 / 9.75 (11 -> 10 sheets) |
+| pikachu | 8 / 1.88 | 11 / 1.75 | 11 / 1.69 |
+| torus | 53 / 19.94 | 90 / 19.75 | 89 / 19.87 |
+| capsule | 7 / 1.87 | 6 / 1.58 | 10 / 1.63 |
+
+Not monotone - torus and capsule do better at 0.5 than at 1, because the
+weights also change which candidates make the shortlist - and it costs
+time: the corpus is 267 s at 0, 344 s at 0.5, 409 s at 1 (torus 65 -> 122 s).
+No splinter count rose anywhere. Box and cone cannot move: every piece is
+already one face. The slider only stales a net after an Optimise
+(`_SOLVED_WITH` records it then), and it is compared with a tolerance -
+Blender stores 0.6 as 0.6000000238.
+
+**A tie in sheets went to whichever packer ran first.** `pack()` ranked by
+parts left off, then whole sheets - and on the helmet's 14 pieces (Save board
+1, its own 400x900 bed) all three packers needed 2, so shelf packing won by
+running first: sheet 1 at 41% with voids the user could see, 1.59 sheets of
+board where the raster packer used 1.26 (-20%). Each strategy now gets its
+last-sheet pass and ranks on sheet-equivalents third
+(`test_pack_breaks_a_sheet_tie_on_board_used`, which fails on the old key on
+the helmet). The user's question was whether more angles or more orders
+would fill the voids; on those same parts, measured, none of these moved
+past 1.26: 8 / 12 / 24 / 36 rotations (non-monotone - 24 was WORSE at 0.5),
+longest-side order, 30 random orders, 1 mm cells, a void-fill pass at 72
+angles and 1 mm, and 120 rounds of ruin-and-recreate (2-7 s a round). The
+pieces left on sheet 2 are larger than any void on sheet 1: shape, not
+search, as the pauldron note below already says.
+
+**Packing effort** (`pack(effort=)`, the add-on's slider beside Re-pack and
+Refresh; Unfold and Optimise pack at 0) adds up to `EFFORT_RESTARTS` (24)
+raster restarts, each with a rotation set from `COMPACT_ANGLE_SETS` and a
+jittered area order (`raster_pack(jitter=)`, seeded per restart), scored
+after the last-sheet pass alone; only the best is tightened, then it competes
+with the three on the same key. Nothing on the user's fingered helmet, but
+on the corpus at effort 1: torus 21 -> 20 sheets (300 mm bed), icosphere1
+2 -> 1 (400x900), helmet137 2.76 -> 2.45 sheet-eq, torus 7.86 -> 7.46
+(400x900), for 3x the time (108 -> 328 s). Rows whose offcut "drops" there
+saved a whole sheet - sheet-eq is the column to read.
+
+**Most of Optimise was scoring finalists, not searching.** Profiled per
+stage on the corpus: on torus the tree search and mending were ~6 s of 101 s
+in `optimise`; the rest was building and packing ten finalists just to count
+their sheets. Three fixes, each measured on and off, together 292 s -> 216 s
+over the `--optimise` corpus (torus 101 -> 62 s, capsule 18 -> 10 s), and
+**byte-identical** output - every net, cut, engraving and placement
+transform, all ten models, both paths, compared against a HEAD worktree:
+
+- `build_parts(..., annotate=False)` builds only the cut. Labels and
+  perforation were a third of each finalist build and the packer reads none
+  of it (`test_an_unannotated_part_has_exactly_the_annotated_cut`).
+  torus -9.6 s, pikachu -6.4 s.
+- `_convex_hull` runs its loop over Python floats, not numpy rows - indexing
+  a row per point was ~90% of it. Same float64 ops in the same order, so
+  the same bits (`test_the_convex_hull_is_unchanged_by_the_fast_path`).
+  torus -8.4 s, pikachu -4.3 s.
+- `raster_pack` transforms the sheet only after a part lands on it and keeps
+  each mask's transform (`mask_fft`). torus's pack 4.3 -> 2.7 s; nothing on
+  a two-sheet model. `tighten`'s `raster_spot` does not cache masks yet.
+
+`inscribed_width` is 41 s of a torus bench row - that is bench measuring its
+own table, not the pipeline, and it is easy to mistake for either.
 
 **Time columns are not comparable across sessions.** Chasing an apparent 2-4x
 slowdown after this work, the giveaway was `t_pack` tripling too - and nothing
@@ -1257,6 +1372,105 @@ Blender on the same .blend measured 3.000 mm. Restart Blender, or Debug ->
 Reload, and then Unfold again. Check the process start time against the
 commit before believing a regression.
 
+**Reload only reloads what is on its list, and the list was short.**
+`dev.CORE_MODULES` had no `fingers` or `cost`, so Reload re-imported
+`layout`, whose `from .fingers import place_fingers` bound the STALE module
+still in `sys.modules`. The user reloaded after the lopsided-joint fix and kept
+cutting the old joints - indistinguishable from the fix not working. The
+existing reload test only edited `material.py`, which was on the list.
+`test_dev` now asserts every loaded `cbu_blender.*` module is on it, after a
+real Unfold and Optimise so lazy imports are loaded too, and that `layout`
+calls the fresh `fingers` afterwards. A Blender started before this fix runs
+the OLD `dev.py`, so its Reload is still blind: restart it once.
+
+**Refresh rebuilds the parts, not the net.** `cbu.refresh`, under Optimise:
+the islands in hand, the current settings, `build_parts` and `pack` - so
+fingers, corner holes, tabs, relief and labels apply without a new solve,
+which on Optimise is minutes. `ops.UNFOLD_KEYS` names what the SOLVE reads
+(mesh build, height, bed-split limit including tab depth and kerf, the
+search); each solve records them as it starts (`_SOLVED_WITH`), and when any
+has moved the panel says "Needs Unfold: Bed X" in the panel's own labels and
+Refresh's report names them. One honest limit: Optimise packs its finalists
+with the parts settings it ran with, so a changed finger setting could in
+principle have picked a different net - Refresh keeps the one in hand, by
+design, and its tooltip says so.
+
+**Several objects are cut together from a saved list.** `CBUSettings.job`
+(a CollectionProperty of object pointers, `CBU_UL_job` on the main panel)
+is what Unfold, Optimise, Re-pack, Refresh and Export act on; empty means the
+active object, as before. A list rather than the selection was the user's
+call: what goes on the sheets together is a decision about the job. Each
+object unfolds on its own - they share no edge - as one `ops.Member` of a
+`Solve`, and only the packing is shared: every part onto one set of sheets,
+each object's UVs written where its parts landed, `_GROUP` remembering who
+was packed with whom so Re-pack, Refresh and a seam edit re-pack the whole
+group (`pack_group`). Packing one alone would put it on top of the others.
+`_regroup` drops an object from its old group when it is solved with others,
+so a later Re-pack there does not drag it back. The 2D view draws the
+companions' cut outlines and engraving with the active object's
+(`overlay.set_companions`), since a view of one object's parts alone shows
+empty space where the others are. Island ids restart per object, so
+`Part.model` carries the id into the manifest, and a typed Model ID gets a
+letter per object (HELMA, HELMB). Nest Sheets declines a group: it packs one
+mesh's UVs with Blender's packer and cannot see the others.
+
+**With a list, the active object need not be one being cut - so leaving
+Edit Mode on it is not enough.** Add Yardstick from Edit Mode made the stick
+active and left the model in Edit Mode behind it, where its mesh arrays read
+EMPTY: Optimise on the ESD gun died with "foreach_set(..) sequence length
+mismatch given 228, needed 0". `ops.object_mode` takes every listed object
+and the yardstick out of Edit Mode (Unfold, Optimise, Re-pack, Refresh, seam
+edits), and Add Yardstick leaves Edit Mode first. Regression: `Unfold reads a
+listed model left in Edit Mode`.
+
+**One scale for everything cut together, by Height or by Yardstick.** The
+user's ask: a border modelled to fit a helmet's rim must still fit after
+scaling, so `ops.size_factor` returns ONE factor. Height is world Z over all
+the objects together (it used to be the active object's alone; the label
+now says "world Z"). Yardstick is a mesh with exactly one edge
+(`cbu.add_yardstick` makes one at the cursor, spanning the model, in front
+and named), placed across a dimension the user knows - head width - with
+its real length typed in; `bridge.yardstick_mm` measures it exactly as the
+model is measured (same transform switch, same mm per unit). Adding one
+keeps the current size until a length is typed, and it is never cut, even
+when in the list. It is a solve input that is not a setting, so
+`_SOLVED_WITH` records `yardstick_mm` and `objects` beside `UNFOLD_KEYS`
+(`EXTRA_KEYS` names them for the "Needs Unfold" line).
+
+**A separate piece within `flat_tol` (3 mm, the user's number) of one plane
+is cut as the flat shape it is.** `unfold.flat_pieces`: a connected
+component of the dual graph - never part of a bigger piece - whose vertices
+all lie within the tolerance of a least-squares plane AND whose faces all
+face the same way within `FLAT_MAX_TILT_DEG` (45). The second test keeps a
+thin closed solid out: a 2 mm plate modelled as a box is within any flatness
+tolerance and its top, bottom and walls are not one sheet
+(`test_a_thin_closed_solid_is_not_a_flat_piece`). `flat_island` projects
+every face onto the plane in a right-handed frame - no tree, no search, no
+folds, its boundary as unpaired cuts - and `_unfold_with_flats` unfolds the
+rest as a sub-mesh sharing the vertex array, then maps face ids back, so the
+rest comes out exactly as it would alone
+(`test_flat_pieces_leave_the_rest_of_the_model_alone`). The Greek-wave
+border (22,304 triangles: the coplanar merge cannot build one face with a
+hole) went from more than 10 minutes and 22,303 zero-degree "folds" to
+21 s, one island, exact area, hole kept. `flat_tol=None` is the old unfold
+exactly; no corpus model has a flat piece. A piece that bends one way only
+(a curved band) is NOT flat and is unfolded as usual - recognising
+developable parts is open (below).
+
+**A fold that bends less than `min_bend` (1 degree, a judgement) is left
+uncut**: `plan_folds` gives it style "flat" - no score, no slot, no M/V.
+Measured before: the annulus caps had 56 zero-degree folds (flat rings the
+merge cannot rebuild, the same failure as the border) and each was scored;
+the helmet has 5 folds under 1 degree. `min_bend=0` restores the old
+behaviour, which is how the test proves the rule is what removes them.
+
+**The Debug panel says which code is running** (`build.py`): the git commit
+(`+dirty` for uncommitted edits to the add-on), a fingerprint of every add-on
+`.py` as loaded - vendored core included, which git cannot vouch for - and the
+load time, plus a red "Changed on disk: Reload" when the files no longer
+match. Ask for that line before chasing a regression report. On one line it
+truncated at sidebar width, so it is split (`stamp_lines`).
+
 **Hot reload purges `__pycache__` first.** Python validates a `.pyc` from
 source mtime in whole *seconds* plus size, so a same-second edit that doesn't
 change the length silently runs old code.
@@ -1270,6 +1484,13 @@ the one number that is empirical rather than derived — expect to tune it
 against real board. Below 1.2 mm computed width the fold is just perforated;
 above it a slot is removed with bridges spanning it, and those bridges are the
 hinge.
+
+**`relief_threshold` is for the ADAPTIVE width only.** It used to apply
+to a fixed width too, so a fixed 1 mm cut width quietly became a
+perforation - and with fold scoring off (the default), nothing at all: the
+user reported the width "can't be set down to 1mm". A fixed width is now
+cut as set, however thin; 0 cuts no slot
+(`test_a_fixed_relief_width_is_cut_however_thin`).
 
 Perforation dash period stays under a third of the flute pitch, or consecutive
 flutes get very different treatment.
@@ -1369,6 +1590,54 @@ round cap *beyond* the line end, so `_strip` pulls the ends in by the radius
 first - buffering the full segment turned a 50 mm fold into a 54 mm slot that
 ate into the panels either side.
 
+## G-code for LaserGRBL
+
+The user's laser runs GRBL 1.1 through LaserGRBL (`my_config.nc` in the repo
+root is their `$$` dump: `$30=1000`, `$32=1` laser mode, 410 x 910 mm
+travel, homing on). **LaserGRBL cannot use the layered SVG**: per its
+maintainer it loads an SVG "as is" with no layer management, every path at
+one power - so the scores would cut through, the labels cut out and the
+REF bed outline cut too. `gcode.write_gcode` writes one `.nc` per sheet
+beside the SVG instead, the user's call over two SVGs appended by hand.
+
+- **Order** is ENGRAVE, SCORE, CUT; within CUT, part by part (nearest
+  first), every pass of every hole before the first pass of its outline,
+  so a part never drops with a relief slot unfinished
+  (`test_gcode_cuts_every_hole_before_its_outline`). ENGRAVE and SCORE
+  repeat the whole layer per pass. Open paths run either way round,
+  nearest-neighbour; rings restart at their vertex nearest the head.
+- **Coordinates are the sheet's own mm, unflipped**: origin front-left, Y
+  away from you, which is how the packer lays a sheet out. The SVG flips Y
+  because SVG grows downward; G-code must not. A path off the bed is
+  refused, as is a power above `laser_max` ($30).
+- **M4** (dynamic power) by default; G0 travels are unlit only in laser
+  mode, which the header says. Passes are in the file, so LaserGRBL's own
+  passes counter stays at 1 - also in the header, with the burned length
+  and a laser-on time estimate per operation.
+- **Settings are MEASURED by the user** on 3 mm board (2026-10-20): cut
+  S1000 F500, engrave S250 F1000.
+- **The fold score is an option, off by default** (`score_folds`, the
+  user's call): at the cut setting its dashes are slits through the board,
+  so with it off no fold line reaches the SVG, DXF or G-code. On, it starts
+  at the engrave setting - known not to cut through - and is untested as a
+  score; Connected 0 makes it one continuous line. Relief slots are holes in
+  the cut and burn either way. In the UV editor the scores draw MAGENTA, and
+  only while the switch is on (a line the laser will not follow is not
+  drawn). Orange was tried first and read as the bed outline and ruler
+  beside it - a different tuple, the same colour to an eye - so the check
+  measures distance from every other overlay colour, not inequality.
+- Air assist is not fitted yet: off by default, per-operation
+  flags (cut and score on, engrave off), `M8`/`M9` configurable.
+- The tests drive the file through a small GRBL simulator (`_grbl`) and
+  compare the lit length per operation with the geometry times its passes,
+  plus every lit segment's distance from that geometry. Coordinates are
+  written to 0.001 mm, so the length tolerance is 1.5e-3 mm per segment.
+  Each was checked against a broken writer (outline first, Y flipped, lit
+  travel).
+
+A helmet sheet is ~56,000 lines, nearly all of it relief-slot arcs (avg
+0.15 mm segments); not simplified, since the geometry is exact as it is.
+
 ## Annotation
 
 Three engravings, and the net is not assemblable without the first:
@@ -1462,7 +1731,8 @@ matters, **72% of seam ids carry their number on BOTH halves**. Honest
 coverage on that net: 62% of seam edges, 84% of folds, 75% of islands, zero
 strays. The 78% figure this replaced was inflated by the 109 strays.
 
-**The height rule is cap, floor, or omit.** `label_height` 4 mm,
+**The height rule is cap, floor, or omit.** `label_height` 3 mm (4 until
+the user's first build, 2026-10-20; the measurements below were at 4),
 `label_min_height` 2 mm. Width is linear in height, so for an edge label the
 fitting height is one division - there is nothing to search (`fit_height`). A
 label that still will not fit is **left off**: a 1 mm character on corrugated
@@ -1585,18 +1855,71 @@ the panels cannot slide while the tape goes on. Depth is `finger_depth_used`
 - the board thickness, unless `finger_depth_override` is set. Off by default,
 like tabs: it changes every part outline, so it is a choice.
 
-**A finger adds nothing - the edge swings by ONE thickness.** The mesh edge
-is the outer corner, and each board lies inward of its own face, so at a
-right angle a panel cut to the edge already reaches the far face of the
-other panel: its end IS the finger, and the other panel, cut back one
-thickness, stops against its inner face. The first version also grew each
-finger outward by the depth, so the edge swung +/-3 mm - a 6 mm finger on
-3 mm board, standing a board's thickness proud of the assembled model. The
-user caught it from the numbers; the mating test had passed, because it
-tested the two halves against each other and never against the board.
-`test_a_finger_never_stands_proud_of_the_model` is the invariant that was
-missing: a fingered part never reaches past its unfingered outline, and the
-area it loses is exactly its notches.
+**The mesh is the board's MID-PLANE: a finger stands half the depth out, a
+notch goes half the depth in.** The user's model (2026-10-04), and the third
+one tried. The first grew each finger out a whole depth AND cut the notch a
+whole depth in: a 6 mm swing on 3 mm board, a board proud of the model. The
+second took the mesh as the OUTER surface, so a finger added nothing and the
+notch went a whole depth in - self-consistent, but on the helmet "as drawn
+the fingers will not intermesh": in the 2D view every notch faced a plain
+edge, and the user read each one as a joint on one side only. With the
+mid-plane each board spans t/2 either side of its face, so at a right angle
+a finger out by t/2 ends flush with the other board's outer face and a notch
+in by t/2 clears its inner face - exact there, approximate elsewhere, and the
+edge still swings by one depth in all. `finger_depth` (or the thickness) is
+that whole swing. Invariant:
+`test_a_finger_reaches_half_a_depth_past_the_edge_and_no_further` - a part
+gains exactly its fingers, loses exactly its notches, and nothing reaches
+past half a depth.
+
+**A finger stands out into the sheet, so it can hit the other half of a V.**
+In a slit inside one island the far side of the V closes in toward the apex,
+and a finger there would cross it - the laser fuses the two. A finger is kept
+only while a part gap of clearance round it, along the edge and out, meets no
+other board of its island and no other finger ("finger meets other board").
+That is what ENDS a joint short of a sharp corner; the seam runs plain from
+there to the point - the default.
+
+**`corner_hole` runs the joint back to the corner instead.** Off by default:
+a round hole one board across, CENTRED on the vertex (a first version set a
+teardrop just past it, and the user corrected both its place and its
+purpose), at every concave seam corner sharper than `folds.SHARP_OPENING`
+(90 degrees) - read by sampling a small circle against the body, not by angle
+arithmetic - and dropped wherever it would split the part. Then, at a seam
+end that has a hole:
+
+- segments start at the VERTEX, not at `corner_inset`, and the hole is one
+  finger depth across, so a notch's bottom - half a depth in - meets the
+  hole at a tangent. Starting at the hole's edge left the notch's end wall
+  cutting across the circle: a spike of board pointing at the vertex, in the
+  user's screenshot (`test_a_corner_hole_joins_the_notch_bottom_with_no_spike`).
+  The hole polygon CIRCUMSCRIBES the circle (`folds.hole_disc`), or the
+  tangent line stands a hair inside its chords and leaves a sliver; fingers
+  have the hole taken back out, because they are unioned after it is cut;
+  and within two radii of the vertex a notch is not clipped to its face, or
+  a fold running close beside the seam puts a step in the bottom just short
+  of the tangent;
+- in a slit, where both halves meet at the hole, each finger is clipped at
+  the V's centreline - the halves' fingers point at each other across a gap
+  that closes to nothing - and one clipped below half its size is refused;
+- the segment touching the hole holds its notch to its own face (clipped,
+  so it tapers into the hole) instead of to a wall from every edge, because
+  the face narrows to its corner there: the wall rule alone stopped seam 43
+  ~15 mm short of the hole for a whole segment, not just beside it;
+- a seam's own other half is exempt from notch-to-notch spacing: in a slit
+  it is across the slit, with no board between to tear. (Found by the same
+  trace: the round-distance fix below made that check see across the slit.)
+
+`place_fingers(..., trace=[])` collects (seam, segment, reason) for every
+refusal - the per-seam answer to "why does this joint stop short", which
+the `why` counts cannot give.
+
+**Notch-to-notch clearance must be the whole round distance.** It was tested
+with the same probe as a notch's own wall, which is clipped to that edge's
+side of the line - so a notch on another seam round a corner, past that line,
+was invisible to it. Latent at full depth; once notches were half as deep
+they fitted 2.05 mm apart on an annulus against a 3 mm wall, which
+`test_a_notch_keeps_a_wall_of_its_own_face` caught.
 
 **The depth is one thickness only at a right angle, and shallow seams need
 LESS.** With both board ends cut square to their faces, the depth one board
@@ -1613,6 +1936,15 @@ user declined it as overcomplicating the feature. It is too deep on a shallow
 helmet seam (the notch leaves a gap) and too shallow on a sharp one, and at
 costume tolerance the override is the answer for a model where that shows.
 Do not reopen it without new evidence from cut board.
+
+**Clearance comes off the finger, not the notch.** `finger_clearance`
+(0.05 mm per side, the user's number after assembling the first model -
+at 0 the joints were too tight) cuts each finger that much narrower at
+both ends. The notch, `root` and `reach` stay full width, so every check
+that decides whether a segment is jointed sees exactly what it saw at
+zero clearance and the same segments are jointed
+(`test_finger_clearance_zero_is_a_snug_fit_and_it_only_narrows_fingers`).
+Only the width: the depth is unchanged, so a finger still ends flush.
 
 **Complementary by construction, not by matching.** `build_islands` writes
 `Cut.a` / `Cut.b` in the SAME vertex order on both halves of a seam (v0 then
@@ -1658,6 +1990,24 @@ float noise: 240 of icosphere2's fingers refused, a third of the cone's. It
 tests a copy 1e-6 mm in from the edge, the way the notch probe always had
 (`test_a_finger_is_not_refused_over_float_noise_on_its_own_edge`).
 
+**A seam is jointed whole or not at all.** Segments are refused one at a
+time - a notch that would run into a relief slot, another notch, its own
+face's edge - so a seam could end with every surviving notch on ONE half: a
+lone notch in one panel, and nothing opposite it. That is not a joint, it is
+a hole, and it is what the user saw on the helmet "at the inside ends of
+folds", where fixed 2 mm relief slots crowd the seam ends: 6 of its 44
+cross-island seams, plus 4 slits inside one island. `place_fingers` now rolls
+the whole seam back to plain unless both halves carry a notch, refusing it as
+"notches on one half only". Every segment still sees the ones accepted
+before it, so nothing about which segments pass changed. Regressions:
+`test_a_fingered_seam_is_notched_on_both_halves` (also failed on cylinder
+and capsule at the defaults) and
+`test_the_helmet_has_no_lopsided_finger_joint_at_its_own_settings`. The
+existing mating test could not see it: it checks each placed joint against
+its partner, and a lone notch HAS a partner finger - it is just plain board.
+Halves are told apart by (island, face), never island alone, because both
+halves of a slit inside one island share an island.
+
 **Fingers before tabs.** A seam that interlocks needs no flap, and a flap
 along a fingered edge buries the fingers. `place_tabs` takes `skip` (the
 fingered seams), so tabs go only where fingers could not. Fingers no longer
@@ -1700,14 +2050,40 @@ Interlocking fingers).
   part count is small. Measured above: helps the helmet by a sheet, hurts
   torus if it replaced the 4-angle pass, can only tie or win as an extra.
 
-**Unexplained:** `spartan_helm.blend` (the user's file, untracked) reports an
-isometry error of 7e-02 mm through the add-on, where the same model from
-`spartan-helmet-low-poly_reduced.stl` through the CLI reports ~1.4e-05. Not
-the coplanar merge (unchanged at every `merge_tol` down to 0.01 degrees), and
-`split_nonplanar` finds nothing - every polygon is a triangle. Inside costume
-tolerance, but CLAUDE.md treats a failing isometry invariant as wrong code.
-Suspects: `bridge.polymesh_from_object` (object transform), WELD_TOL
-clustering, `planar_tol=None`.
+**Diagnosed, not yet fixed: the helmet's isometry error is two bent faces.**
+The reduced helmet is now `examples/spartan_helmet_reduced.stl`, in the core
+suite's `meshes()` and the bench as `helmet137`, and it fails six invariants
+that every primitive passes (planarity, isometry x3, flat area, one M mark
+off the middle of its fold - that last one not yet explained). Note
+`isometry_error` is RELATIVE edge-length error, not mm.
+
+- **STL / CLI, 1.4e-05.** `from_rings` runs the planarity gate BEFORE the
+  coplanar merge, where every STL ring is a triangle and trivially flat;
+  `merge_coplanar` then welds pairs up to `tol_deg` = 0.5 degrees apart and
+  nothing re-checks. Worst: two triangles 0.37 degrees apart, a quad 0.067 mm
+  out of plane at 200 mm. At `tol_deg` <= 0.05 every face is flat and the
+  error is 3.6e-12.
+- **The .blend, 7.3e-02.** It is NOT all triangles: polygon 129 is a quad, a
+  1.94 x 372 mm sliver 0.363 mm out of plane. Planarity is measured relative
+  to the LONGEST edge, so it reads 9.77e-4 against a 1e-3 gate and
+  `split_nonplanar` passes it. Flattening shortens the 1.94 mm edge by
+  0.142 mm - the 7.3%. Merging is irrelevant here (same error with it off),
+  which is why the earlier `merge_tol` sweep saw nothing.
+
+It then showed up in the 2D view: the user saw polygon 129 drawn beside its
+own cut outline. `PolyMesh.plane_map`, which `write_net_uv` pushes every
+polygon through, took the face's orientation from its FIRST edge - the
+1.94 mm one - and flattening a bent face shortens and turns that edge a
+little, so 372 mm along the sliver the face landed 11.8 mm away (measured on
+the user's latest .blend: every other face within 0.05 mm). `plane_map` is
+now a Procrustes fit to every corner, both handednesses tried: 0.0015 mm
+worst on that file, flat faces still exact
+(`test_plane_map_puts_a_bent_face_where_the_unfold_put_it`, 1.59 mm on the
+old code). That fixes the drawing, not the face: it is still bent.
+
+Proposed fix, awaiting the user: re-check planarity AFTER merging and split
+bent merges back into their triangles, with the gate in absolute mm rather
+than relative to the longest edge.
 
 Not done, roughly in value order:
 
@@ -1727,7 +2103,11 @@ Not done, roughly in value order:
 5. **Tab side assignment as 2-SAT** (currently greedy; skipped seams get taped).
    The same pass could choose which half of a seam takes the first finger -
    today it is simply the lower island id.
-6. **Flute-direction constraint.** Deliberately off (`Material.lock_grain`);
+6. **Parts that bend one way only.** A band or a cone section is
+   developable - it flattens exactly by unrolling - and could be cut as one
+   curved piece instead of many facets with scored folds. Not yet detected;
+   the user raised it (2026-10-14) as "eventually".
+7. **Flute-direction constraint.** Deliberately off (`Material.lock_grain`);
    costume tolerance doesn't need it. Turn on if a part visibly racks.
 
 ## Conventions
